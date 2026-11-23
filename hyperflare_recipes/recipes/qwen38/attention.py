@@ -335,7 +335,7 @@ class PreparedAttention:
                 session=session, workspace=workspace,
             )
             if (use_sharded and isinstance(workspace, ScratchArena) and workspace.overlap
-                and workspace is projection_workspace and (qsa_shard_mode == "group" or self.tokens <= 16)
+                and workspace is projection_workspace and qsa_shard_mode == "group"
                 and ParallelProjections.supports(
                     self.projections["qkv_proj"], self.projections["indexer.index_qk_proj"]
                 ))
@@ -413,9 +413,6 @@ class PreparedAttention:
                     source, projected_index, metadata, self.constants, self.workspace_bytes,
                 )
                 projected_qkv = self.projections["qkv_proj"](source)
-            projection_workspaces = None
-        elif self.parallel_projections is not None:
-            projected_qkv, projected_index = self.parallel_projections(source)
             projection_workspaces = None
         elif self.concurrent is None:
             projected_index = self.projections["indexer.index_qk_proj"](source)

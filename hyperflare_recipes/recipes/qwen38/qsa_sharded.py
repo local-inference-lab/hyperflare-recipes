@@ -678,7 +678,7 @@ class PreparedShardedQSA:
             k_descale=k_descale,
             v_descale=v_descale,
         )
-        # b12x.attention.qsa currently exposes no public dcp_size=1 selection-only entry, so
+        # b12x.attention.qsa exposes no public dcp_size=1 selection-only entry, so
         # validate the active selection operand ABI and scratch bounds before launching only the
         # four selection kernels (prepare_q, score, topk, stabilize) on select_plan.
         state = binding.state
@@ -1056,7 +1056,7 @@ class PreparedShardedQSA:
         device = source.device
         # 1) Update replicated compressed_k_cache and raw_k_ring on all ranks.
         # Keep cache_workspace, select_workspace, and attend_workspace disjoint in lifetime
-        # so the CUDA graph pool reuses one buffer instead of holding both simultaneously.
+        # so the CUDA graph pool reuses one buffer instead of holding them simultaneously.
         cache_workspace = torch.empty(full_workspace_bytes, dtype=torch.uint8, device=device)
         cache_reads = (
             [bindings[name] for name in self.cache_read_names]
