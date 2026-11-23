@@ -13,7 +13,7 @@ from .frontend import SAMPLING_DEFAULTS
 
 def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False,
             core_storage=None, ranks=None):
-    """Prepare Mini on one GPU or Small on four GPUs.
+    """Prepare Mini on 1, 2, or 4 GPUs or Small on four GPUs.
 
     With `ranks`, rank zero's multi-host rendezvous, each rank uses its own host's GPU 0.
     """
@@ -77,5 +77,13 @@ MINI_RECIPE = replace(RECIPE, name="inkling2_mini", served_model_name="inkling-2
     checkpoints=(Checkpoint(alias="inkling-2-mini", repository="thinkingmachines/Inkling-2-Mini",
         revision="ed40e7da625f594fc9c4990f5f66be24873c22d7", architecture="Inkling2LoopForConditionalGeneration",
         stored_bytes=19_525_870_752, device_bytes=20_263_810_112, draft_bytes=737_939_360),),
-    ranks=MappingProxyType({1: RankCosts(107_347_968, 2_621_440, 3 << 30)}),
-    plain_ranks=MappingProxyType({1: RankCosts(98_435_072, 2_097_152, 3 << 30)}))
+    ranks=MappingProxyType({
+        1: RankCosts(107_347_968, 2_621_440, 3 << 30),
+        2: RankCosts(54_329_344, 1_310_720, 3 << 30),
+        4: RankCosts(27_852_800, 655_360, 3 << 30),
+    }),
+    plain_ranks=MappingProxyType({
+        1: RankCosts(98_435_072, 2_097_152, 3 << 30),
+        2: RankCosts(49_872_896, 1_048_576, 3 << 30),
+        4: RankCosts(25_624_576, 524_288, 3 << 30),
+    }))

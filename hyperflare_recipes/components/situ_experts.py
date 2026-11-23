@@ -140,8 +140,9 @@ def _gemm_tile(tokens, nvfp4):
 
 
 class PreparedSiTUExperts:
-    def __init__(self, weights, *, tokens, top_k):
+    def __init__(self, weights, *, tokens, top_k, output_dtype=torch.bfloat16):
         self.weights, self.tokens, self.top_k = weights, tokens, top_k
+        self.output_dtype = output_dtype
         self.hidden, self.intermediate = weights.w2.shape[1], weights.w13.shape[1] // 2
         self.experts, self.rows = weights.w2.shape[0], tokens * top_k
         self.bm, self.bn, self.bk, self.num_warps = _gemm_tile(tokens, weights.nvfp4)
@@ -167,6 +168,10 @@ class PreparedSiTUExperts:
     def _execute(self, source, ids, weights, mock=None):
         w, h, i, r = self.weights, self.hidden, self.intermediate, self.rows
         fp4 = w.nvfp4
+        if mock is None and w.expert_offset is not None:
+            local_ids = ids - w.expert_offset
+            owned = (local_ids >= 0) & (local_ids < self.experts)
+            ids = local_ids.masked_fill(~owned, -1)
         def empty(shape, dtype):
             return mock(dtype) if mock else torch.empty(shape, dtype=dtype, device=source.device)
         counts = empty((self.experts,), torch.int32)
@@ -202,7 +207,8 @@ class PreparedSiTUExperts:
         if mock:
             return None
         output = output.view(self.tokens, self.top_k, h).float()
-        return torch.where((ids >= 0)[:, :, None], output, 0).sum(1).to(torch.bfloat16)
+        summed = torch.where((ids >= 0)[:, :, None], output, 0).sum(1)
+        return summed if self.output_dtype == torch.float32 else summed.to(self.output_dtype)
 
     def __call__(self, source, ids, weights):
         return self._execute(source, ids, weights)

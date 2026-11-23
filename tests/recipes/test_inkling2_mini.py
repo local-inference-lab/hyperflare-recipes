@@ -41,7 +41,9 @@ def snapshot():
 
 
 def test_mini_visits_and_cache_storage(mini_config_dir):
+    from hyperflare_recipes.components.parallel import TensorParallelShard
     from hyperflare_recipes.recipes.inkling2.pool import continuation_layout, RankGeometry, page_specs
+    from hyperflare_recipes.recipes.inkling2.recipe import MINI_RECIPE
     config = ModelConfig.load(mini_config_dir)
     t = config.text
     assert len(t.visits) == 48
@@ -57,6 +59,17 @@ def test_mini_visits_and_cache_storage(mini_config_dir):
     assert cache.global_layers == (5, 11, 17, 23, 29, 35, 41, 47)
     assert sum(s[0] for _, s in page_specs(cache, geometry)) == 2097152
     assert config.draft.taps == (5, 23, 41, 48)
+    for world_size in (1, 2, 4):
+        for rank in range(world_size):
+            config.validate_shard(TensorParallelShard(rank, world_size))
+        rank_geometry = RankGeometry.of(cache, world_size)
+        for speculation, draft in ((MINI_RECIPE.speculation, config.draft), (None, None)):
+            costs = MINI_RECIPE.costs(world_size, speculation)
+            assert costs.state_row_bytes == continuation_layout(cache, rank_geometry, draft).row_bytes
+            assert costs.page_bytes == sum(s[0] for _, s in page_specs(cache, rank_geometry, draft))
+    for bad_world in (3, 8):
+        with pytest.raises(ValueError, match="1, 2, or 4"):
+            config.validate_shard(TensorParallelShard(0, bad_world))
 
 
 def test_public_release_configuration(mini_config_dir):
@@ -262,3 +275,100 @@ def test_loop_histories_snapshot_branch_restore(snapshot, endpoint, drafting):
             assert torch.equal(cache[2], tails[name])
         assert not cache[3:].count_nonzero()
     graph.reset()
+
+
+@pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="requires assigned CUDA device")
+@pytest.mark.parametrize("layer", [0, 20])
+@pytest.mark.parametrize("world_size", [2, 4])
+@torch.no_grad()
+def test_expert_tp_sharding_matches_tp1(snapshot, layer, world_size):
+    from ignition import runtime_patches
+    runtime_patches.apply()
+    from hyperflare_recipes.components.parallel import TensorParallelShard
+    from hyperflare_recipes.components.situ_experts import PreparedSiTUExperts
+    from ignition.preparation.checkpoint import inspect_indexed_checkpoint
+    from hyperflare_recipes.recipes.inkling2.mini_weights import MiniWeightLoader
+    from hyperflare_recipes.recipes.inkling2.mini_experts import load_experts
+
+    manifest = inspect_indexed_checkpoint(snapshot)
+    with MiniWeightLoader(manifest, "cuda:0", shard=TensorParallelShard(0, 1), vision=False) as loader:
+        reference_weights = load_experts(loader, layer, shard=loader.shard)
+    assert reference_weights.expert_offset is None
+    sharded_weights = []
+    per_rank = 128 // world_size
+    for rank in range(world_size):
+        with MiniWeightLoader(manifest, "cuda:0", shard=TensorParallelShard(rank, world_size), vision=False) as loader:
+            experts = load_experts(loader, layer, shard=loader.shard)
+        assert experts.expert_offset is not None and int(experts.expert_offset.item()) == rank * per_rank
+        sharded_weights.append(experts)
+    for tokens in (1, 4, 64):
+        torch.manual_seed(420 + layer + world_size + tokens)
+        x = torch.randn(tokens, 2304, device="cuda", dtype=torch.bfloat16)
+        ids = torch.randint(0, 128, (tokens, 8), device="cuda", dtype=torch.int32)
+        # Ensure one token routes exclusively to rank 0 and another is inactive when tokens >= 4.
+        ids[0] = torch.arange(8, device="cuda", dtype=torch.int32)
+        if tokens >= 4:
+            ids[1] = torch.tensor([(k * per_rank + k) % 128 for k in range(8)], device="cuda", dtype=torch.int32)
+            ids[-1] = -1
+        routes = torch.softmax(torch.randn(tokens, 8, device="cuda"), -1) * 8
+        expected = PreparedSiTUExperts(reference_weights, tokens=tokens, top_k=8)(x, ids, routes)
+        partials = [PreparedSiTUExperts(w, tokens=tokens, top_k=8, output_dtype=torch.float32)(x, ids, routes)
+                    for w in sharded_weights]
+        reduced = sum(partials).to(torch.bfloat16)
+        assert torch.isfinite(reduced).all()
+        if tokens >= 4:
+            assert torch.count_nonzero(reduced[-1]) == 0
+        error = (reduced.float() - expected.float()).norm() / expected.float().norm()
+        assert error <= 1e-6
+
+
+@pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="requires assigned CUDA device")
+@pytest.mark.parametrize("layer", [0, 20])
+@torch.no_grad()
+def test_expert_tp_compiled_single_artifact_across_ranks(snapshot, tmp_path, layer):
+    from ignition import runtime_patches
+    runtime_patches.apply()
+    from hyperflare_recipes.components.parallel import TensorParallelShard
+    from hyperflare_recipes.components.situ_experts import PreparedSiTUExperts
+    from ignition.preparation.aot import ForwardCache
+    from ignition.preparation.checkpoint import inspect_indexed_checkpoint
+    from ignition.preparation.execution import GraphSignature
+    from hyperflare_recipes.recipes.inkling2.mini_weights import MiniWeightLoader
+    from hyperflare_recipes.recipes.inkling2.mini_experts import load_experts
+
+    manifest = inspect_indexed_checkpoint(snapshot)
+    with MiniWeightLoader(manifest, "cuda:0", shard=TensorParallelShard(0, 1), vision=False) as loader:
+        reference_weights = load_experts(loader, layer, shard=loader.shard)
+    torch.manual_seed(777 + layer)
+    source = torch.randn(4, 2304, dtype=torch.bfloat16, device="cuda")
+    ids = torch.tensor([
+        [0, 1, 2, 3, 64, 65, 66, 67],
+        [4, 5, 6, 7, 8, 9, 10, 11],
+        [70, 71, 72, 73, 74, 75, 76, 77],
+        [-1, -1, -1, -1, -1, -1, -1, -1],
+    ], dtype=torch.int32, device="cuda")
+    routes = torch.softmax(torch.randn(4, 8, device="cuda"), -1) * 8
+    expected = PreparedSiTUExperts(reference_weights, tokens=4, top_k=8)(source, ids, routes)
+
+    cache = ForwardCache(namespace={"model": "mini-experts-tp2", "layer": layer}, device="cuda:0",
+                         root=tmp_path, compile_workers=1)
+    signature = {"decode": GraphSignature("decode", 4, 1)}
+    partials = []
+    for rank in range(2):
+        with MiniWeightLoader(manifest, "cuda:0", shard=TensorParallelShard(rank, 2), vision=False) as loader:
+            weights = load_experts(loader, layer, shard=loader.shard)
+        operation = PreparedSiTUExperts(weights, tokens=4, top_k=8, output_dtype=torch.float32)
+        forward = ExpertForward(operation, source, ids, routes)
+        forward.output = torch.empty((4, 2304), dtype=torch.float32, device="cuda")
+        compiled = cache.prepare_many({"decode": forward}, signature, materialize=lambda: None)["decode"]
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            compiled()
+        graph.replay()
+        torch.cuda.synchronize()
+        partials.append(forward.output.clone())
+        graph.reset()
+    reduced = (partials[0] + partials[1]).to(torch.bfloat16)
+    assert torch.isfinite(reduced).all() and torch.count_nonzero(reduced[-1]) == 0
+    error = (reduced.float() - expected.float()).norm() / expected.float().norm()
+    assert error <= 1e-6

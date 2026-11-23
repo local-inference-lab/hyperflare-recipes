@@ -1657,9 +1657,14 @@ at revision `ed40e7da625f594fc9c4990f5f66be24873c22d7`.
 The public checkpoint declares `Inkling2LoopForConditionalGeneration` and
 `model_type: inkling2_loop`.
 Mini reads its per-layer NVFP4/MXFP8 formats from `hf_quant_config.json`.
-The recipe targets one SM120 or SM121 GPU (qualified on GB10 SM121; SM120 is
-untested) and prepares text, vision, and the bundled DSpark drafter.
-`--language-model-only` omits vision; `--no-mtp` omits drafting.
+The recipe targets 1, 2, or 4 SM120 or SM121 GPUs (TP1 and TP2 qualified on GB10
+SM121; SM120 and TP4 are untested) and prepares text, vision, and the bundled
+DSpark drafter. `--language-model-only` omits vision; `--no-mtp` omits drafting.
+At TP2 and TP4, Mini partitions whole routed experts across ranks (64 or 32
+experts per rank) rather than intermediate channels so each owned expert keeps
+the complete intermediate vector and its exact per-token NVFP4 four-or-six
+maxima and MXFP8 block scales. Attention heads, vocabulary rows, KV caches, and
+DSpark dense layers shard across ranks with the shared Inkling 2 collectives.
 
 Mini stores 24 target layers. Layers 6 through 17 execute three times, for 48
 layer visits. Each visit owns separate KV and short-convolution histories in

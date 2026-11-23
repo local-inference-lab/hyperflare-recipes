@@ -69,11 +69,11 @@ class PreparationConfig(BasePreparationConfig):
 
     def __post_init__(self):
         placements = tuple(zip(self.hosts or ("",) * len(self.devices), self.devices))
-        if (not isinstance(self.devices, tuple) or len(self.devices) not in (1, 4)
+        if (not isinstance(self.devices, tuple) or len(self.devices) not in (1, 2, 4)
                 or len(set(placements)) != len(self.devices)
                 or self.hosts is not None and (not isinstance(self.hosts, tuple) or len(self.hosts) != len(self.devices))
                 or any(type(d) is not int or d < 0 for d in self.devices)):
-            raise ValueError("Inkling 2 preparation requires 1 or 4 distinct GPUs")
+            raise ValueError("Inkling 2 preparation requires 1, 2, or 4 distinct GPUs")
         validate_host_topology(self.roce_ring, self.roce_chain, self.hosts)
         request_capacity(self.max_active)
         if not 1 <= self.max_active <= 32:
