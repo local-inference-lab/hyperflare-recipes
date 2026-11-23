@@ -302,7 +302,7 @@ def _mix_rows(
     ):
         raise ValueError("PCIe row reduction addend must match 16-byte aligned contiguous BF16 source rows")
     owner = layout.owner
-    ab = 2 if layout.rows <= 3 else (4 if layout.rows <= 20 else 8)
+    ab = 8
     if (
         layout.width == 7168
         and 1 <= layout.rows <= (64 if get_island_mix7168_wide_launcher is not None else 32)
@@ -974,9 +974,9 @@ class RowReductionTuning:
                             else f"kimi-row-normalization-{geometry.width}"
                         )
                         direct_fo_tag = (
-                            "sw4_grid_v9b"
+                            "sw4_ro1_v19"
                             if (geometry.residual_norm or geometry.width == 3584)
-                            else "sw4_grid_v14_mix"
+                            else "sw4_ro1_mix_v19"
                         )
                         resident_bytes = sum(item[3].nbytes for item in entries)
                         with session._tuning_clocks():
