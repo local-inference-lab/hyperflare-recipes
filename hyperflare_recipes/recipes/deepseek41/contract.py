@@ -26,7 +26,8 @@ VISION_FRONTEND = c.frontend(tools=p.DSML, tag_separator=" ", assistant_marker="
     image_preparation=p.DEEPSEEK_ROW_MAJOR_IMAGE_PREPARATION, image_layout=p.DEEPSEEK_ROW_MAJOR_IMAGE_LAYOUT)
 
 
-def prepare(signatures, buffers, pool, *, image_slots=4, page_tokens, draft_lag, rows=1, embedding_tables=(), regions=()):
+def prepare(signatures, buffers, pool, *, image_slots=4, page_tokens, draft_lag, rows=1, embedding_tables=(),
+            regions=(), terminal_prefill_min_tokens=None):
     regions = list(regions)
     for name, tensor in pool.pages.items():
         layer = int(name.split(".")[0].removeprefix("layer"))
@@ -41,10 +42,28 @@ def prepare(signatures, buffers, pool, *, image_slots=4, page_tokens, draft_lag,
     pending = c.state_view("request_pending_token", 8)
     graphs = c.graph_contracts(signatures, inputs, continuation=continuation, pending=pending,
         cursor=cursor, rows=rows, embedding_tables=embedding_tables)
+    terminal_prefill_kind = getattr(p, "TERMINAL_PREFILL", None)
+    supports_min_tokens = "terminal_prefill_min_tokens" in p.GraphContract.DESCRIPTOR.fields_by_name
+    emit_v4_terminal = (
+        terminal_prefill_kind is not None
+        and (supports_min_tokens or terminal_prefill_min_tokens is not None)
+        and any(graph["kind"] == terminal_prefill_kind for graph in graphs)
+    )
+    if emit_v4_terminal:
+        min_tokens = (
+            terminal_prefill_min_tokens if terminal_prefill_min_tokens is not None
+            else pool.config.text["sliding_window"] + 1
+        )
+        for graph in graphs:
+            if graph["kind"] == terminal_prefill_kind:
+                graph["terminal_prefill_min_tokens"] = min_tokens
     vision = any(s.kind == "vision" for s in signatures.values())
-    return c.model_contract(vocabulary=VOCABULARY, input_vocabulary=INPUT_VOCABULARY if vision else VOCABULARY,
+    result = c.model_contract(vocabulary=VOCABULARY, input_vocabulary=INPUT_VOCABULARY if vision else VOCABULARY,
         page_tokens=page_tokens, page_tables=[dict(buffer="page_tables", page_offset=0),
             *([dict(buffer="draft_page_tables", page_offset=1)] if "draft_page_tables" in buffers else [])],
         regions=[dict(kind=p.CONTINUATION_STATE, storage=continuation, tokens_per_record=1, window_tokens=0), *regions],
         graphs=graphs, vision={**VISION, "feature_slots": image_slots} if vision else TEXT_VISION,
         frontend=VISION_FRONTEND if vision else FRONTEND)
+    if emit_v4_terminal:
+        result["version"] = 4
+    return result
