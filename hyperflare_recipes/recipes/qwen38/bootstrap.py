@@ -453,7 +453,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                                          block_proposal_broadcast=True, shortlist_only=True)
                 else:
                     from .speculative_model import SpeculativePreparation
-                    draft_options = dict(mtp_weights=mtp_weights)
+                    draft_options = dict(mtp_weights=mtp_weights, result_runtime=result_collective)
 
                 speculation = SpeculativePreparation(weights=weights, **draft_options,
                     pool=state, requests=requests, inputs=inputs, scratch=scratch, workspaces=workspaces,
@@ -562,7 +562,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                     weights=weights, pool=state, requests=requests, inputs=inputs, scratch=scratch,
                     workspaces=workspaces, rotary=rotary, cache=cache, table=table, session=session,
                     completion=completion, frame=frame, sequence=sequence, max_cache_pages=planned_pages,
-                    collectives=collectives, sampling_workspace=sampling_workspace)
+                    collectives=collectives, result_runtime=result_collective, sampling_workspace=sampling_workspace)
                 for enabled, batch, width, prefill in config.mixed_shapes:
                     name = f"mixed{batch}x{width}p{prefill}" + ("" if enabled else "-no-mtp")
                     operation = PreparedMixedRound(mixed_owner, batch, width, prefill, name,

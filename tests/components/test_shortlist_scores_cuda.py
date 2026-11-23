@@ -211,3 +211,83 @@ def test_target_distributions_mask_unused_columns_beyond_token_limits(batch, wid
             assert torch.equal(actual.view(torch.int32), expected.view(torch.int32)), field
         else:
             assert torch.equal(actual, expected), field
+
+
+@pytest.mark.parametrize("batch,vocab", [(1, 257), (4, 10000)])
+@torch.no_grad()
+def test_block_broadcast_without_dense_write_matches_bind_logits_reference(batch, vocab):
+    """PreparedDraftBlockBroadcast with write_dense=False matches dense bind_logits proposals."""
+    from hyperflare_recipes.components.draft_sampling import (
+        PreparedDraftBlockBroadcast,
+        PreparedDraftDistribution,
+    )
+    from ignition.components.sampling import DeviceRequestState, RUNNING
+
+    device = torch.device("cuda:0")
+    generator = torch.Generator().manual_seed(613 + batch)
+    state = DeviceRequestState.allocate(device, vocab_size=vocab, capacity=max(4, batch))
+    state.generation.fill_(7)
+    state.status.fill_(RUNNING)
+    state.histogram.copy_(torch.randint(0, 3, state.histogram.shape, generator=generator, dtype=torch.int32))
+    state.parameters.copy_(torch.tensor([0.8, 0.9, 0.02, 1.15, 0.1, 0.05], device=device))
+    state.top_k.fill_(17)
+    state.grammar_mask.fill_(-1)
+    state.grammar_enabled.zero_()
+
+    slots = torch.arange(batch, dtype=torch.int32, device=device)
+    epochs = torch.full((batch,), 7, dtype=torch.int64, device=device)
+    live = torch.tensor([batch], dtype=torch.int32, device=device)
+    prefix_ids = torch.zeros((batch, 2), dtype=torch.int64, device=device)
+    source_logits = torch.randn((batch, vocab), generator=generator, dtype=torch.bfloat16).to(device)
+    source_bias = torch.randn((batch, vocab), generator=generator, dtype=torch.float32).to(device) * 0.25
+    staging = torch.empty((batch, 1, vocab), dtype=torch.float32, device=device)
+    seed = torch.arange(batch, dtype=torch.int64, device=device) + 409
+    offset = torch.zeros_like(seed)
+
+    ref_sampled = torch.zeros_like(seed)
+    ref = PreparedDraftDistribution(staging, state, slots, epochs, live, prefix_ids,
+        seed=seed, offset=offset, sampled=ref_sampled, prefix_offset=1)
+    ref.bind_logits(source_logits, source_bias)
+    ref.prepare()
+
+    cand_sampled = torch.zeros_like(seed)
+    cand = PreparedDraftDistribution(staging, state, slots, epochs, live, prefix_ids,
+        seed=seed, offset=offset, sampled=cand_sampled, prefix_offset=1)
+    cand.bind_logits(source_logits, source_bias)
+    cand.prepare()
+    drafts_ex = torch.zeros((batch, 1), dtype=torch.int64, device=device)
+    probs_ex = torch.zeros((batch, 1, vocab), dtype=torch.float32, device=device)
+    valid_ex = torch.zeros((batch, 1), dtype=torch.bool, device=device)
+    block = PreparedDraftBlockBroadcast((cand,), drafts_ex, probs_ex, valid_ex, cand_sampled,
+        runtime=None, session=None, coordinator=None, name="bind_logits_block")
+    cand.functional()
+
+    for mode in ("default", "ties", "token_zero", "inactive", "invalid"):
+        state.status.fill_(0 if mode == "invalid" else RUNNING)
+        live.fill_(batch // 2 if mode == "inactive" else batch)
+        if mode == "ties":
+            source_logits.zero_()
+            source_bias.zero_()
+        elif mode == "token_zero":
+            source_logits.fill_(-10.0)
+            source_logits[:, 0] = 2.0
+            source_logits[:, 3] = 1.0
+            source_bias.zero_()
+        ref()
+        scratch = {k: torch.empty(sh, dtype=dt, device=device) for k, (sh, dt) in cand.layout.items()}
+        bstate = block.begin(device)
+        scratch["support_ids"] = bstate["support_ids"][0]
+        scratch["support_probabilities"] = bstate["support_probabilities"][0]
+        cand.run(scratch, staging, source_logits=source_logits, source_bias=source_bias,
+                 candidates=prefix_ids, seed=seed, offset=offset, sampled=cand_sampled)
+        drafts_out = torch.zeros((batch, 1), dtype=torch.int64, device=device)
+        probs_out = torch.zeros((batch, 1, vocab), dtype=torch.float32, device=device)
+        valid_out = torch.zeros((batch, 1), dtype=torch.bool, device=device)
+        block.retain(bstate, 0, scratch, cand_sampled)
+        block.finish(bstate, drafts_out, probs_out, valid_out, cand_sampled,
+                     torch.ones(batch, dtype=torch.bool, device=device),
+                     torch.full((batch,), 2, dtype=torch.int32, device=device))
+        torch.cuda.synchronize()
+        assert torch.equal(cand_sampled, ref_sampled), mode
+        assert torch.equal(valid_out, ref.valid), mode
+        assert torch.equal(probs_out.view(torch.int32), ref.probabilities.view(torch.int32)), mode

@@ -216,7 +216,10 @@ class PreparedParallelDraftRound:
                             and self.shortlisted_selector.top_k <= DRAFT_CANDIDATES
                             and callable(getattr(self.shortlisted_selector, "score_shortlist", None)))
         if self.draft is not None and (proposals or fuse_markov):
-            if not getattr(self.draft, "shortlist_output", False):
+            if getattr(self.draft, "shortlist_output", False):
+                if not direct_shortlist or fuse_markov:
+                    raise ValueError("shortlist-only draft output requires direct shortlist proposal scoring")
+            else:
                 draft_logits_example = torch.empty(self.draft.logit_shape, dtype=self.draft.logit_dtype,
                                                    device=self.owner.requests.histogram.device)
             if self.shortlisted_selector is not None:

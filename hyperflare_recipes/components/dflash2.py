@@ -400,21 +400,30 @@ class PreparedDraft:
 
     def _shortlist_from_local_logits(self, local_logits):
         local_vocab = local_logits.shape[-1]
-        if local_vocab * self.world_size != self.vocabulary_size:
+        padded = local_vocab * self.world_size != self.vocabulary_size
+        valid_col = None
+        if padded:
             col_ids = torch.arange(local_vocab, device=local_logits.device, dtype=torch.int32) + self.vocab_offset
-            local_logits = torch.where((col_ids < self.vocabulary_size)[None, :], local_logits, -torch.inf)
+            valid_col = col_ids < self.vocabulary_size
         monotonic = self.multiplier > 0 and (self.softcap is None or self.softcap > 0)
         if monotonic:
+            if padded:
+                local_logits = torch.where(valid_col[None, :], local_logits, -torch.inf)
             local_vals, local_pos = local_logits.topk(self.top_k, dim=-1, sorted=False)
+            ids = local_pos.to(torch.int32) + self.vocab_offset
             unary = local_vals.float() * self.multiplier
             if self.softcap is not None:
                 unary = (unary / self.softcap).tanh() * self.softcap
+                if padded:
+                    unary = torch.where(ids < self.vocabulary_size, unary, -torch.inf)
         else:
             scores = local_logits.float() * self.multiplier
             if self.softcap is not None:
                 scores = (scores / self.softcap).tanh() * self.softcap
+            if padded:
+                scores = torch.where(valid_col[None, :], scores, -torch.inf)
             unary, local_pos = scores.topk(self.top_k, dim=-1, sorted=False)
-        ids = local_pos.to(torch.int32) + self.vocab_offset
+            ids = local_pos.to(torch.int32) + self.vocab_offset
         if self.shortlist_gather is not None:
             words_per_rank = self.shortlist_cols // 2
             if words_per_rank == 2 * self.top_k:
