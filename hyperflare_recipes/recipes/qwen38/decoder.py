@@ -240,7 +240,7 @@ class PreparedDecoder:
                  layer_outputs: torch.Tensor | None = None, embedding_injection=None,
                  max_cache_pages: int | None = None,
                  residual_output: torch.Tensor | None = None, verification: bool = False,
-                 gdn_records=None, gdn_in_place: bool = False, runtime=None, vocabulary_runtime=None,
+                 gdn_records=None, gdn_in_place: bool = False, runtime=None, barrier_runtime=None, vocabulary_runtime=None,
                  result_runtime=None, coordinator=None,
                  sampling_workspace=None, scoring=None):
         from hyperflare_recipes.components.embedding import PreparedEmbedding
@@ -314,7 +314,8 @@ class PreparedDecoder:
             {key: getattr(module, key).weight for key in ("key_proj", "value_proj")},
             scratch.residual, scratch.ple, state.pool.ple_convolution, state.ple, ple_table,
             mode=state.mode, session=session, name=f"{name}.ple", workspace=workspaces,
-            partitions=getattr(state, "ple_partitions", None), runtime=runtime, coordinator=coordinator)
+            partitions=getattr(state, "ple_partitions", None),
+            runtime=runtime if barrier_runtime is None else barrier_runtime, coordinator=coordinator)
         self.final_mixer = PreparedHyperconnection(language.hyper_connection_mixer,
             replace(scratch.hyperconnection, block_input=scratch.hidden), priming_state=scratch.residual,
             session=session, name=f"{name}.final_mixer", runtime=runtime, coordinator=coordinator)

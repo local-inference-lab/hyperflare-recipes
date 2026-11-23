@@ -27,6 +27,7 @@ from ignition.preparation.collectives import (
     CollectivePreparation,
     create_all_gather_runtime,
     create_all_reduce_runtime,
+    create_dma_all_reduce_runtime,
     create_result_broadcast_runtime,
     create_roce_runtime,
 )
@@ -68,6 +69,10 @@ from .state import (
 from .tuning import preparation_session
 from .vision import PreparedVision, VisionScratch
 from ignition.preparation.bootstrap import BasePreparationConfig
+
+
+# Prefill chunks of at least this many tokens all-reduce through the copy-engine ring.
+_DMA_PREFILL_TOKENS = 1024
 
 
 @dataclass(frozen=True)
@@ -338,7 +343,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                    if has_dflash else 0)
     coordinator = CollectivePreparation(group) if group is not None else None
     ipc = None if core_storage is None else core_storage.peer_storage
-    collective = vocabulary_collective = hidden_gather_collective = result_collective = shortlist_gather_collective = None
+    collective = prefill_collective = vocabulary_collective = hidden_gather_collective = result_collective = shortlist_gather_collective = None
     reduction_width = 10240 if config.shard_hyperconnections else 2560
     result_layouts = ()
     if group is not None:
@@ -365,7 +370,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
         # Ranks on separate Sparks reduce and gather through one RoCEnante runtime: decode rows
         # one-shot, prefill chunks through the pipelined two-shot path.
         result_bytes = max((packed_broadcast_layout(layout.values())[1] for layout in result_layouts), default=0)
-        collective = vocabulary_collective = result_collective = create_roce_runtime(group, device,
+        collective = prefill_collective = vocabulary_collective = result_collective = create_roce_runtime(group, device,
             max_tokens=max(config.request_capacity, vocabulary_rows, hidden_rows), pipe_tokens=config.token_capacity, hidden_size=reduction_width,
             gather_bytes=max(vocabulary_rows * (248320 // shard.world_size) * 2,
                              hidden_rows * (2560 // shard.world_size) * 2,
@@ -374,6 +379,10 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
         shortlist_gather_collective = collective if has_dflash else None
     elif group is not None:
         collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=max(config.token_capacity, draft_rows), hidden_size=reduction_width, ipc=ipc)
+        if config.prefill_chunk_size >= _DMA_PREFILL_TOKENS:
+            prefill_collective = create_dma_all_reduce_runtime(
+                group, device, max_tokens=config.prefill_chunk_size, hidden_size=reduction_width, ipc=ipc
+            )
         vocabulary_collective = create_all_gather_runtime(group, device, max_rows=vocabulary_rows, columns=248320, ipc=ipc)
         result_collective = create_result_broadcast_runtime(group, device, layouts=result_layouts, ipc=ipc)
         if has_dflash:
@@ -517,11 +526,16 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                                 inputs.row_slot_ids, inputs.row_generations, inputs.query_lengths, inputs.live_rows,
                                 s.embedding, rows=rows)
                             injection.prepare()
+                        decoder_collectives = (
+                            {**collectives, "runtime": prefill_collective, "barrier_runtime": collective}
+                            if prefill_collective is not None and mode == "prefill" and capacity >= _DMA_PREFILL_TOKENS
+                            else collectives
+                        )
                         decoder = PreparedDecoder(weights, s, metadata, cache, rotary, table, workspaces,
                             completion, frame, sequence, session=session, name=name,
                             embedding_injection=injection, max_cache_pages=planned_pages,
                             sampling_workspace=sampling_workspace, result_runtime=result_collective,
-                            scoring=scoring if kind == "scored_prefill" else None, **collectives)
+                            scoring=scoring if kind == "scored_prefill" else None, **decoder_collectives)
                         if enabled:
                             forward = speculation.prefill(decoder, name)
                             if has_mtp:
@@ -719,7 +733,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                 speculative_fixed_width=config.speculative_fixed_width)
         resources = (scoring, weights, table, session, state, requests, inputs, workspaces, rotary,
             cache, final_cache, admission, transfer, features, vision_inputs,
-            functions, compiled_functions, decoders, owners, stream, graph_pool, speculation, mtp_weights, draft_weights, draft_head, draft_config, collective, vocabulary_collective, hidden_gather_collective, result_collective, shortlist_gather_collective, coordinator)
+            functions, compiled_functions, decoders, owners, stream, graph_pool, speculation, mtp_weights, draft_weights, draft_head, draft_config, collective, prefill_collective, vocabulary_collective, hidden_gather_collective, result_collective, shortlist_gather_collective, coordinator)
         report(f"prepared {len(graphs)} graphs with {page_capacity} preparation KV pages")
         from .export import disposable_ranges
 
@@ -738,7 +752,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
             export_events=table.events(), core_data=table if rank == 0 else None,
             resources=resources, server_config=server_config, memory_report=memory, session=session,
             close_resources=(table, *((scoring,) if scoring is not None else ()),
-                             *tuple(runtime for runtime in (hidden_gather_collective, result_collective, shortlist_gather_collective)
+                             *tuple(runtime for runtime in (prefill_collective, hidden_gather_collective, result_collective, shortlist_gather_collective)
                                     if runtime is not None and runtime is not collective),
                              *((vocabulary_collective, collective) if collective is not None else ())))
     except BaseException:
