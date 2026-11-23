@@ -6,7 +6,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+import json
 from pathlib import Path
 from types import MappingProxyType
 
@@ -42,7 +43,7 @@ class Kimi3Parameters(RecipeParameters):
     expert_scale_compression: ExpertScaleCompressionParameters = ExpertScaleCompressionParameters()
     online_mxfp8: OnlineMXFP8Parameters = OnlineMXFP8Parameters(
         default_scope="all",
-        supported_scopes=("all", "kda-input"),
+        supported_scopes=("all", "kda-input", "kda-all"),
     )
     row_shard_prefill: bool = param(
         False,
@@ -60,6 +61,18 @@ class Kimi3Parameters(RecipeParameters):
     def __post_init__(self):
         if type(self.row_shard_prefill) is not bool:
             raise TypeError("row_shard_prefill must be a boolean")
+
+    def adjust_weights_bytes(self, weights_bytes: int, context: ParameterContext) -> int:
+        weights_bytes = super().adjust_weights_bytes(weights_bytes, context)
+        if not self.online_mxfp8.enabled or context.checkpoint is None or context.world_size is None:
+            return weights_bytes
+        savings = _exl3_scope_savings_for(context.checkpoint)
+        if not savings:
+            return weights_bytes
+        total_saving = savings.get(self.online_mxfp8.effective_scope, 0)
+        if total_saving > 0:
+            weights_bytes = max(0, weights_bytes - total_saving // context.world_size)
+        return weights_bytes
 
     def filter_world_sizes(self, world_sizes: tuple[int, ...], context: ParameterContext) -> tuple[int, ...]:
         sizes = super().filter_world_sizes(world_sizes, context)
@@ -81,6 +94,130 @@ class Kimi3Parameters(RecipeParameters):
                     )
             if any(gpu.capability == (10, 3) for gpu in context.gpus):
                 raise UsageError("--row-shard-prefill is not qualified on SM103; select SM120 or SM121 GPUs")
+
+
+def _exl3_quantization(metadata: Path) -> tuple[dict, dict] | None:
+    config_path = metadata / "config.json"
+    if not config_path.is_file():
+        return None
+    raw = json.loads(config_path.read_text())
+    if not isinstance(raw, dict):
+        raise ValueError("checkpoint configuration must be an object")
+    text = raw.get("text_config", {})
+    quant = text.get("quantization_config") if isinstance(text, dict) else None
+    if not isinstance(quant, dict) or quant.get("quant_method") != "exl3":
+        return None
+    if not isinstance(quant.get("exl3"), dict) or quant["exl3"].get("manifest") != "exl3-manifest.json":
+        raise ValueError("EXL3 requires exl3-manifest.json")
+    return raw, quant
+
+
+def _exl3_files(metadata: Path, quant: dict) -> tuple[str, ...]:
+    manifest_name = quant["exl3"]["manifest"]
+    manifest = json.loads((metadata / manifest_name).read_text())
+    if (not isinstance(manifest, dict) or manifest.get("schema") != "exl3-v1"
+            or manifest.get("kind") != "exl3-manifest"):
+        raise ValueError("unsupported EXL3 expert manifest")
+    layers = manifest.get("layers")
+    if not isinstance(layers, dict) or not layers:
+        raise ValueError("EXL3 manifest has no expert layers")
+    if not all(isinstance(ref, dict) for ref in layers.values()):
+        raise ValueError("EXL3 layer references must be objects")
+    files = tuple(ref.get("file") for ref in layers.values())
+    if any(not isinstance(name, str) or not name.endswith(".safetensors") or Path(name).name != name
+           for name in files):
+        raise ValueError("EXL3 expert filenames must be local safetensors basenames")
+    if len(set(files)) != len(files):
+        raise ValueError("EXL3 expert layer files must be distinct")
+    return files
+
+
+def _exl3_stored_bytes(metadata: Path, quant: dict, base_stored_bytes: int) -> int:
+    total = quant["exl3"].get("weight_file_bytes")
+    if total is not None:
+        if type(total) is not int or total <= base_stored_bytes:
+            raise ValueError("EXL3 weight_file_bytes must be an integer larger than safetensors total_size")
+        return total
+    index = json.loads((metadata / "model.safetensors.index.json").read_text())
+    files = set(index["weight_map"].values()) | set(_exl3_files(metadata, quant))
+    return sum((metadata / name).stat().st_size for name in files)
+
+
+def _exl3_mxfp8_savings(raw: dict) -> dict[str, int]:
+    """Estimate Kimi's aligned KDA/attention/shared projection savings by scope for EXL3 checkpoints."""
+    c = raw.get("text_config", {})
+    if not isinstance(c, dict):
+        return {}
+    hidden, layers = c["hidden_size"], c["num_hidden_layers"]
+    linear = c["linear_attn_config"]
+    kda_columns = linear["num_heads"] * 128
+    attention_columns = c["num_attention_heads"] * 128
+    kda_layers = len(linear["kda_layers"])
+    kda_input_elements = kda_layers * hidden * (4 * kda_columns + 128 + linear["num_heads"])
+    kda_all_elements = kda_input_elements + kda_layers * hidden * kda_columns
+    all_elements = hidden * (3 * kda_layers * kda_columns
+        + 2 * (kda_layers * kda_columns + (layers - kda_layers) * attention_columns)
+        + 3 * (layers - c["first_k_dense_replace"]) * c["num_shared_experts"] * c["moe_intermediate_size"])
+    return {
+        "kda-input": 2 * kda_input_elements * 7 // 16,
+        "kda-all": 2 * kda_all_elements * 7 // 16,
+        "all": 2 * all_elements * 3 // 8,
+    }
+
+
+def _replicated_dsa_indexer_bytes(raw: dict) -> int:
+    """Per-rank BF16 byte size of replicated DSA indexer weights, or 0 for non-DSA checkpoints."""
+    c = raw.get("text_config", {})
+    if not isinstance(c, dict) or not c.get("index_n_heads"):
+        return 0
+    linear = c.get("linear_attn_config", {})
+    kda_layers = len(linear.get("kda_layers", ())) if isinstance(linear, dict) else 0
+    dsa_layers = max(0, int(c["num_hidden_layers"]) - kda_layers)
+    heads, dim = int(c["index_n_heads"]), int(c["index_head_dim"])
+    hidden, q_lora = int(c["hidden_size"]), int(c["q_lora_rank"])
+    return dsa_layers * 2 * (heads * dim * q_lora + dim * hidden + heads * hidden + 2 * dim)
+
+
+_EXL3_SCOPE_SAVINGS: dict[tuple[str, str], dict[str, int]] = {}
+
+
+def _exl3_scope_savings_for(checkpoint: Checkpoint) -> dict[str, int]:
+    key = (checkpoint.repository, checkpoint.revision)
+    cached = _EXL3_SCOPE_SAVINGS.get(key)
+    if cached is not None:
+        return cached
+    repo_path = Path(checkpoint.repository)
+    if repo_path.is_dir():
+        parsed = _exl3_quantization(repo_path)
+        if parsed is not None:
+            savings = _exl3_mxfp8_savings(parsed[0])
+            _EXL3_SCOPE_SAVINGS[key] = savings
+            return savings
+    return {}
+
+
+def _inspect_exl3_replacement(metadata: Path, replacement: Checkpoint) -> Checkpoint | None:
+    """Size an unregistered Kimi EXL3 checkpoint and reject incompatible expert scale compression."""
+    parsed = _exl3_quantization(metadata)
+    if parsed is None:
+        return None
+    raw, quant = parsed
+    manifest_path = metadata / quant["exl3"]["manifest"]
+    if manifest_path.is_file():
+        _exl3_files(metadata, quant)
+    stored = _exl3_stored_bytes(metadata, quant, replacement.stored_bytes)
+    savings = _exl3_mxfp8_savings(raw)
+    _EXL3_SCOPE_SAVINGS[(replacement.repository, replacement.revision)] = savings
+    # Indexer tensors are replicated on every rank without sharding; stored counts one copy.
+    extra_replicated_indexer = 7 * _replicated_dsa_indexer_bytes(raw)
+    return replace(
+        replacement,
+        stored_bytes=stored,
+        device_bytes=stored + extra_replicated_indexer + replacement.draft_bytes,
+        mapped_host_bytes=0,
+        expansion_bytes=0,
+        scale_compressed_device_bytes={},
+    )
 
 
 def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False,
@@ -175,6 +312,7 @@ RECIPE = Recipe(
     max_images=4,
     image_bytes=32 << 20,
     verification_rows=0,
+    inspect_replacement=_inspect_exl3_replacement,
     # vLLM's Kimi K3 launch settings for b12x's PCIe all-reduce (island reduce-scatter, deferred slab
     # consumption, 256 threads), its decode context exchange and its small-M W4A16 experts.
     b12x_environment=MappingProxyType({

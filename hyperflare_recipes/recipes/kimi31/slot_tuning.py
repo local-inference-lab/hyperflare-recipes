@@ -245,21 +245,25 @@ def _measure_batch(fixtures, session, namespace):
         torch.cuda.empty_cache()
 
 
-def tune_local_slots(registry, session):
+def tune_local_slots(registry, session, *, transient=None):
     if not registry.slot_groups:
         return []
+    from contextlib import nullcontext
+
+    scope = nullcontext if transient is None else transient
     device = registry.context.shards.index.device
     coordinator = registry.context.coordinator
-    with trial_session(session, device=device, coordinator=coordinator) as trials:
-        grouped = {}
-        for geometry, bindings in registry.slot_groups.items():
-            for local, merge in bindings:
-                grouped.setdefault((geometry, merge.implementation), []).append((local, merge))
-        fixtures = [
-            (SlotTrial(registry.context, registry.reduction, geometry, control, trials, f"slot_trial.{index}",
-                       defer_patterns=True),
-             bindings)
-            for index, ((geometry, control), bindings) in enumerate(grouped.items())
-        ]
-        trials.tune(show_progress=False)
-        return _measure_batch(fixtures, trials, registry.cache_root)
+    with scope():
+        with trial_session(session, device=device, coordinator=coordinator) as trials:
+            grouped = {}
+            for geometry, bindings in registry.slot_groups.items():
+                for local, merge in bindings:
+                    grouped.setdefault((geometry, merge.implementation), []).append((local, merge))
+            fixtures = [
+                (SlotTrial(registry.context, registry.reduction, geometry, control, trials, f"slot_trial.{index}",
+                           defer_patterns=True),
+                 bindings)
+                for index, ((geometry, control), bindings) in enumerate(grouped.items())
+            ]
+            trials.tune(show_progress=False)
+            return _measure_batch(fixtures, trials, registry.cache_root)

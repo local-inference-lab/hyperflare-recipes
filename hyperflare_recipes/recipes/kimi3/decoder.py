@@ -11,6 +11,7 @@ import triton
 
 from ignition.components.collectives import (
     ConcurrentAllReduce,
+    ConcurrentChunkedAllReduce,
     ConcurrentGatherShards,
     ConcurrentReduceScatter,
     PreparedChunkedAllGather,
@@ -28,7 +29,7 @@ from hyperflare_recipes.components.column_pair_gather import PreparedColumnPairG
 from hyperflare_recipes.components.recurrent import DeltaMetadata, _commit_convolution
 from hyperflare_recipes.components.vocabulary import PreparedVocabularyProjection
 from hyperflare_recipes.components.kda_speculation import KDARecords, PreparedKDAReplay
-from ignition.preparation.examples import declaration_tensor
+from .examples import declaration_tensor
 from ignition.preparation.persistent import persistent_copy, persistent_zeros
 from ignition.preparation.tensor_metadata import record_numeric_tensor
 from ignition.preparation.tuning import register_finalizer
@@ -476,10 +477,14 @@ class PreparedLatentMoE:
                 self.concurrent_expert_rs = ConcurrentReduceScatter(
                     self._concurrent_expert_rs_op, workspace=workspace, session=session,
                     parallel_plans=self.all_plans)
-            else:
+            elif len(self.expert_reduce.parts) == 1:
                 self.concurrent_expert_reduce = ConcurrentAllReduce(
                     self.expert_reduce.parts[0], workspace=workspace, session=session,
                     parallel_plans=self.all_plans)
+            else:
+                self.concurrent_expert_reduce = ConcurrentChunkedAllReduce(
+                    self.expert_reduce.parts, self.expert_reduce.bounds, workspace=workspace,
+                    session=session, parallel_plans=self.all_plans)
         if self.expert_reduce is not None:
             self.expert_reduce.functional(session=session)
         if self.concurrent_expert_reduce is not None:
@@ -618,7 +623,8 @@ class PreparedDecoder:
                     and half % step == 0
                     and max_route_rows > 0
                     and half % min(half, max_route_rows) == 0
-                    and half * latent <= step * hidden):
+                    and (half * latent <= step * hidden
+                         or (step * hidden % latent == 0 and half % (step * hidden // latent) == 0))):
                 pipeline_chunk = half
                 reduce_step = step
         self.pipeline_chunk = pipeline_chunk
@@ -705,7 +711,7 @@ class PreparedDecoder:
             else:
                 mlp = PreparedLatentMoE(w, source, config, weights.shard, runtime=runtime,
                     router_runtime=router_runtime, route_runtime=route_runtime if mode != "prefill" else None,
-                    prefill_route_runtime=prefill_route_runtime if mode == "prefill" else None,
+                    prefill_route_runtime=prefill_route_runtime if (mode == "prefill" or tokens > ROUTE_ROWS) else None,
                     coordinator=coordinator, session=session, name=prefix + ".moe", workspace=workspace, storage=buffers,
                     examples=examples, chunk_rows=pipeline_chunk, row_shard_prefill=self.row_shard_prefill,
                     expert_rs_runtime=rs_runtime if self.row_shard_prefill else None, split_moe=use_split_moe)
@@ -822,8 +828,11 @@ class PreparedDecoder:
                 for local_plan in next_in_plans:
                     workspace.register_parallel(cr.reduce.plan, local_plan)
             if isinstance(prev_mlp, PreparedLatentMoE) and prev_mlp.concurrent_expert_reduce is not None:
-                for local_plan in next_in_plans:
-                    workspace.register_parallel(prev_mlp.concurrent_expert_reduce.reduce.plan, local_plan)
+                prev_er = prev_mlp.concurrent_expert_reduce
+                er_plans = [p.reduce.plan for p in prev_er.parts] if hasattr(prev_er, "parts") else [prev_er.reduce.plan]
+                for er_plan in er_plans:
+                    for local_plan in next_in_plans:
+                        workspace.register_parallel(er_plan, local_plan)
         self.row_mixes = None
         if 1 <= tokens <= 64 and hidden == 7168 and buffers.row_tuning is not None:
             from .row_reductions import hidden_row_choices
@@ -1419,7 +1428,11 @@ class PreparedDecoder:
                     routes = mlp.router(full_logits)
                     partial = mlp.experts(latent, routes.ids, routes.weights)
 
-                    latent_sum_0 = mlp.expert_reduce.parts[0](partial[:h], dependencies=(att_1, latent_1))
+                    latent_sum_0 = (
+                        mlp.expert_reduce.parts[0](partial[:h], dependencies=(att_1, latent_1))
+                        if len(mlp.expert_reduce.parts) == 1
+                        else mlp.expert_reduce(partial[:h], dependencies=(att_1, latent_1))
+                    )
                     p_er_1 = er.start(partial[h:], dependencies=(latent_sum_0,))
                     out_0 = mlp.post_moe(latent_sum_0, shared_0)
                     latent_sum_1 = er.finish(p_er_1, out_0)

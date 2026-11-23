@@ -25,6 +25,7 @@ from hyperflare_recipes.parameters import (
 from hyperflare_recipes.recipes.kimi3.recipe import (
     Kimi3Parameters,
     RECIPE as KIMI3,
+    _inspect_exl3_replacement,
     prepare as prepare_kimi,
     usage,
 )
@@ -44,11 +45,12 @@ class Kimi31Parameters(Kimi3Parameters):
     )
     online_mxfp8: OnlineMXFP8Parameters = OnlineMXFP8Parameters(
         default_scope="kda-input",
-        supported_scopes=("all", "kda-input"),
+        supported_scopes=("all", "kda-input", "kda-all"),
     )
     draft_quantization: DraftQuantizationParameters = DraftQuantizationParameters(
         draft_head_choices=("mxfp8", "nvfp4"),
         draft_body_choices=("mxfp8",),
+        draft_body_methods=("dflash2", "dspark"),
         markov_head_choices=("fp8",),
     )
 
@@ -72,8 +74,9 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
     params = plan.parameters
     if not params.context_parallel.enabled:
         raise ValueError("Kimi K3.1 preparation requires context parallelism")
-    if params.context_parallel.effective_size(plan.world_size) not in (4, 8, 16):
-        raise ValueError("Kimi K3.1 TP16 supports DCP4, DCP8 or DCP16")
+    eff_cp = params.context_parallel.effective_size(plan.world_size)
+    if eff_cp not in (4, 8, 16) or eff_cp > plan.world_size:
+        raise ValueError("Kimi K3.1 supports DCP4, DCP8 or DCP16 within its tensor-parallel size")
     if plan.speculation is not None and plan.speculation.method == "dflash2":
         from .dflash_config import REPOSITORY, REVISION
 
@@ -135,21 +138,28 @@ RECIPE = Recipe(
     verification_rows=0,
     max_images=4,
     image_bytes=32 << 20,
+    inspect_replacement=_inspect_exl3_replacement,
     speculative_methods=MappingProxyType({
         "dflash2": SpeculativeMethod(MappingProxyType({
+            8: RankCosts(state_row_bytes=68_710_400, page_bytes=2_174_976, graph_bytes=3 << 29, page_tokens=128 * 8),
             16: RankCosts(state_row_bytes=35_450_112, page_bytes=2_174_976, graph_bytes=9 << 29, page_tokens=128 * 16),
         }), draft_bytes=5_569_622_016),
         "dspark": SpeculativeMethod(MappingProxyType({
+            8: RankCosts(state_row_bytes=68_055_296, page_bytes=2_174_976, graph_bytes=3 << 29, page_tokens=128 * 8),
             16: RankCosts(state_row_bytes=35_122_432, page_bytes=2_174_976, graph_bytes=9 << 29, page_tokens=128 * 16),
         }), draft_bytes=7_625_920_512),
     }),
-    benchmark_world_sizes=(16,),
+    benchmark_world_sizes=(8, 16),
     b12x_environment=MappingProxyType({
         **KIMI3.b12x_environment, "B12X_PCIE_DCP_THREADS": "0", "B12X_PCIE_DCP_BLOCK_LIMIT": "0",
     }),
     # Graph storage is a planning allowance; actual graph memory is reported after preparation.
-    ranks=MappingProxyType({16: RankCosts(state_row_bytes=33_238_272, page_bytes=2_912_256,
-                                          graph_bytes=9 << 29, page_tokens=128 * 16)}),
-    plain_ranks=MappingProxyType({16: RankCosts(state_row_bytes=30_275_328, page_bytes=2_174_976,
-                                                graph_bytes=9 << 29, page_tokens=128 * 16)}),
+    ranks=MappingProxyType({
+        8: RankCosts(state_row_bytes=63_181_056, page_bytes=2_912_256, graph_bytes=3 << 29, page_tokens=128 * 8),
+        16: RankCosts(state_row_bytes=33_238_272, page_bytes=2_912_256, graph_bytes=9 << 29, page_tokens=128 * 16),
+    }),
+    plain_ranks=MappingProxyType({
+        8: RankCosts(state_row_bytes=58_361_088, page_bytes=2_174_976, graph_bytes=3 << 29, page_tokens=128 * 8),
+        16: RankCosts(state_row_bytes=30_275_328, page_bytes=2_174_976, graph_bytes=9 << 29, page_tokens=128 * 16),
+    }),
 )

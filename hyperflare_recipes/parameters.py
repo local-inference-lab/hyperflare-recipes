@@ -325,15 +325,16 @@ class OnlineMXFP8Parameters(ParameterGroup):
             ("online_mxfp8_scope", ParameterScope.TARGET_WEIGHT, eff_scope),
         ]
         root = context.root
+        draft_quant = None if root is None else getattr(root, "draft_quantization", None)
+        body_methods = ("dflash2", "dfly2") if draft_quant is None else draft_quant.draft_body_methods
         if (
             self.inherit_dflash2_draft_body
             and root is not None
             and root.speculation is not None
-            and root.speculation.method == "dflash2"
+            and root.speculation.method in body_methods
             and self.enabled
             and eff_scope == "all"
         ):
-            draft_quant = getattr(root, "draft_quantization", None)
             explicit_body = None if draft_quant is None else draft_quant.draft_body_quantization
             if explicit_body is None:
                 entries.append(("speculation.draft_body_quantization", ParameterScope.DRAFT_WEIGHT, "mxfp8"))
@@ -399,6 +400,7 @@ class DraftQuantizationParameters(ParameterGroup):
     )
     draft_head_choices: tuple[str, ...] = ()
     draft_body_choices: tuple[str, ...] = ()
+    draft_body_methods: tuple[str, ...] = ("dflash2", "dfly2")
     markov_head_choices: tuple[str, ...] = ()
 
     def validate(self, context: ParameterContext) -> None:
@@ -418,8 +420,9 @@ class DraftQuantizationParameters(ParameterGroup):
                 if label == "--draft-body-quantization":
                     raise UsageError("draft body quantization requires positive learned draft depth")
                 raise UsageError("draft head quantization requires positive learned draft depth")
-        if self.draft_body_quantization is not None and spec is not None and spec.method not in ("dflash2", "dfly2"):
-            raise UsageError("--draft-body-quantization requires --speculative-method dflash2 or dfly2")
+        if self.draft_body_quantization is not None and spec is not None and spec.method not in self.draft_body_methods:
+            methods = " or ".join(self.draft_body_methods)
+            raise UsageError(f"--draft-body-quantization requires --speculative-method {methods}")
 
     def manifest_parameters(self, context: ParameterContext) -> list[tuple[str, ParameterScope, Any]]:
         if context.root is None or context.root.speculation is None:
