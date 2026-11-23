@@ -675,17 +675,15 @@ class ParallelProjections:
         if self.outputs is None:
             return tuple(outputs)
 
-    def start(self, source):
-        """Launch both projections across main and auxiliary streams without joining."""
+    def allocate_runtime(self, source):
+        """Allocate disjoint output and workspace tensors for fused projection overlap."""
         outputs, workspaces = self.outputs, self.workspaces
         if outputs is None:
             outputs = [torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
                        for shape, stride, dtype in self.output_layouts]
             workspaces = [torch.empty(size, dtype=torch.uint8, device=source.device)
                           for size in self.workspace_sizes]
-        _parallel_mx_projections(source, self.values, self.scales, outputs,
-                                workspaces, self.plans, self.stream_handle, False)
-        return tuple(outputs), tuple(workspaces)
+        return list(outputs), list(workspaces)
 
     def functional(self, *, session):
         """Allocate disjoint branch buffers while preserving the prepared fork and join."""

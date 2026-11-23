@@ -359,50 +359,70 @@ def _fake_qsa_attend_selected(reads, output, workspace, handle):
 
 @torch.library.custom_op(
     "flare::qsa_group_select_async",
-    mutates_args=("cache_writes", "aux_workspace", "aux_buffers", "selected_positions"),
+    mutates_args=(
+        "cache_writes", "aux_workspace", "aux_buffers",
+        "selected_positions", "proj_outputs", "proj_workspaces",
+    ),
 )
 def _qsa_group_select_async_op(
     source: torch.Tensor,
+    projected_index_read: torch.Tensor | None,
     cache_reads: list[torch.Tensor],
     cache_writes: list[torch.Tensor],
     select_reads: list[torch.Tensor],
     aux_workspace: torch.Tensor,
     aux_buffers: list[torch.Tensor],
     selected_positions: torch.Tensor,
+    proj_values: list[torch.Tensor],
+    proj_scales: list[torch.Tensor],
+    proj_outputs: list[torch.Tensor],
+    proj_workspaces: list[torch.Tensor],
+    proj_plans: list[int],
     cache_ws_bytes: int,
     handle: int,
     stream_handle: int,
-    fork_from_main: bool,
 ) -> None:
     _SHARDED_CONTEXTS[handle].run_group_select_async(
-        cache_reads, cache_writes, select_reads, aux_workspace, aux_buffers,
-        selected_positions, cache_ws_bytes, stream_handle, fork_from_main,
+        source, projected_index_read, cache_reads, cache_writes, select_reads,
+        aux_workspace, aux_buffers, selected_positions,
+        proj_values, proj_scales, proj_outputs, proj_workspaces, proj_plans,
+        cache_ws_bytes, stream_handle,
     )
 
 
 @_qsa_group_select_async_op.register_fake
 def _fake_qsa_group_select_async(
-    source, cache_reads, cache_writes, select_reads, aux_workspace, aux_buffers,
-    selected_positions, cache_ws_bytes, handle, stream_handle, fork_from_main,
+    source, projected_index_read, cache_reads, cache_writes, select_reads,
+    aux_workspace, aux_buffers, selected_positions,
+    proj_values, proj_scales, proj_outputs, proj_workspaces, proj_plans,
+    cache_ws_bytes, handle, stream_handle,
 ):
     pass
 
 
-@torch.library.custom_op("flare::qsa_attend_joined", mutates_args=("output", "workspace"))
+@torch.library.custom_op(
+    "flare::qsa_attend_joined",
+    mutates_args=("output", "selected_positions", "workspace"),
+)
 def _qsa_attend_joined_op(
     reads: list[torch.Tensor],
     keepalive: list[torch.Tensor],
     output: torch.Tensor,
+    selected_positions: torch.Tensor,
     workspace: torch.Tensor,
     cache_ws_bytes: int,
     handle: int,
     stream_handle: int,
 ) -> None:
-    _SHARDED_CONTEXTS[handle].run_attend_joined(reads, output, workspace, cache_ws_bytes, stream_handle)
+    _SHARDED_CONTEXTS[handle].run_attend_joined(
+        reads, output, selected_positions, workspace, cache_ws_bytes, stream_handle,
+    )
 
 
 @_qsa_attend_joined_op.register_fake
-def _fake_qsa_attend_joined(reads, keepalive, output, workspace, cache_ws_bytes, handle, stream_handle):
+def _fake_qsa_attend_joined(
+    reads, keepalive, output, selected_positions, workspace, cache_ws_bytes, handle, stream_handle,
+):
     pass
 
 
@@ -833,33 +853,48 @@ class PreparedShardedQSA:
         _run_attention(binding, query=query, request_ids=request_ids, query_positions=query_positions)
 
     def run_group_select_async(
-        self, cache_reads, cache_writes, select_reads, aux_workspace, aux_buffers,
-        selected_positions, cache_ws_bytes, stream_handle, fork_from_main,
+        self, source, projected_index_read, cache_reads, cache_writes, select_reads,
+        aux_workspace, aux_buffers, selected_positions,
+        proj_values, proj_scales, proj_outputs, proj_workspaces, proj_plans,
+        cache_ws_bytes, stream_handle,
     ):
+        from hyperflare_recipes.components import sm103_projection
+
+        main = torch.cuda.current_stream(aux_workspace.device)
         auxiliary = torch.cuda.ExternalStream(stream_handle, device=aux_workspace.device)
-        if fork_from_main:
-            auxiliary.wait_stream(torch.cuda.current_stream(aux_workspace.device))
+        # Always synchronize the fork after all metadata and temporary allocations exist on main,
+        # preventing Inductor from sinking metadata writes or buffer reuses past the fork.
+        auxiliary.wait_stream(main)
         (
             main_k, main_v, comp_k, raw_k_ring, raw_pos, raw_rope, raw_anchor,
             index_q_norm, index_k_norm, rope_cos, rope_sin, k_descale, v_descale,
-            comp_table, out_buf, index_query, request_ids, query_positions,
+            comp_table, out_buf, request_ids, query_positions,
             rope_positions, sequence_lengths,
         ) = select_reads
         half_table, local_pos, local_seq_len, global_eligible, send, gathered = aux_buffers[:6]
         half_width = self.table_width // self.world_size
         block_t = 256
         tiles = triton.cdiv(half_width, block_t)
+        projected_index = proj_outputs[1] if proj_plans else projected_index_read
+        index_query = projected_index[:, :512].view(self.tokens, 4, 128)
+        raw_index_key = projected_index[:, 512:]
         count = len(self.cache_read_names)
+        dummy_query = cache_reads[count]
         full_cache_reads = (
             list(cache_reads[:count])
-            + [out_buf, selected_positions]
-            + list(cache_reads[count:])
+            + [out_buf, selected_positions, dummy_query, index_query, raw_index_key]
+            + list(cache_reads[count + 1:])
         )
         common_constants = [
             main_k, main_v, comp_k, raw_k_ring, raw_pos, raw_rope, raw_anchor,
             index_q_norm, index_k_norm, rope_cos, rope_sin, k_descale, v_descale,
         ]
         with torch.cuda.stream(auxiliary):
+            if proj_plans:
+                sm103_projection.packed_out_workspace(
+                    source, proj_values[1], proj_scales[1], None, None, proj_outputs[1],
+                    proj_workspaces[1], "none", None, proj_plans[1], "any",
+                )
             self.run_cache_only(full_cache_reads, cache_writes, aux_workspace[:cache_ws_bytes])
             _prepare_group_inputs_kernel[(self.batch * tiles + 1,)](
                 comp_table, half_table, request_ids, query_positions, sequence_lengths,
@@ -899,42 +934,62 @@ class PreparedShardedQSA:
                     SELECTION_WIDTH=SELECTION_WIDTH, BLOCK_W=triton.next_power_of_2(SELECTION_WIDTH),
                     num_warps=8,
                 )
+        if proj_plans:
+            sm103_projection.packed_out_workspace(
+                source, proj_values[0], proj_scales[0], None, None, proj_outputs[0],
+                proj_workspaces[0], "none", None, proj_plans[0], "any",
+            )
 
-    def run_attend_joined(self, reads, output, workspace, cache_ws_bytes, stream_handle):
+    def run_attend_joined(self, reads, output, selected_positions, workspace, cache_ws_bytes, stream_handle):
         main = torch.cuda.current_stream(output.device)
         main.wait_stream(torch.cuda.ExternalStream(stream_handle, device=output.device))
         if not self.selection_only:
-            self.run_attend(reads, output, workspace[:cache_ws_bytes])
+            full_reads = [*reads[:-3], selected_positions, *reads[-3:]]
+            self.run_attend(full_reads, output, workspace[:cache_ws_bytes])
 
     def start_group_selection(
         self, source, projected_index, metadata, constants, full_workspace_bytes,
-        *, fork_from_main: bool, projection_workspaces=(),
+        *, parallel_projections=None,
     ):
         device = source.device
         attended = torch.empty((self.tokens, self.q_heads, 256), dtype=source.dtype, device=device)
         selected = torch.empty((self.tokens, SELECTION_WIDTH), dtype=torch.int32, device=device)
         # Transient query buffer satisfies b12x cache_only's non-aliasing ABI check without touching qkv_proj.
         dummy_query = torch.empty((self.tokens, self.q_heads, 256), dtype=source.dtype, device=device)
-        index_query = projected_index[:, :512].view(self.tokens, 4, 128)
-        raw_index_key = projected_index[:, 512:]
+        if parallel_projections is not None:
+            proj_outputs, proj_workspaces = parallel_projections.allocate_runtime(source)
+            proj_values = parallel_projections.values
+            proj_scales = parallel_projections.scales
+            proj_plans = parallel_projections.plans
+            projected_qkv, projected_index_live = proj_outputs[0], proj_outputs[1]
+            projected_index_read = None
+        else:
+            proj_values = []
+            proj_scales = []
+            proj_outputs = []
+            proj_workspaces = []
+            proj_plans = []
+            projected_qkv = None
+            projected_index_live = projected_index
+            projected_index_read = projected_index
         bindings = {
             **constants,
             "main_block_table": metadata.main_block_table,
             "compressed_block_table": metadata.compressed_block_table,
             "raw_state_slot_ids": metadata.raw_state_slot_ids,
         }
-        dynamic_fields = {
-            "query": dummy_query,
-            "index_query": index_query,
-            "raw_index_key": raw_index_key,
-            **{name: getattr(metadata, name) for name in (
-                "request_ids", "query_positions", "rope_positions", "sequence_lengths",
-                "query_start_loc", "num_accepted_tokens", "is_prefilling",
-            )},
-        }
         cache_reads = (
             [bindings[name] for name in self.cache_read_names]
-            + [dynamic_fields[name] for name in _FULL_DYNAMIC_FIELDS]
+            + [
+                dummy_query,
+                metadata.request_ids,
+                metadata.query_positions,
+                metadata.rope_positions,
+                metadata.sequence_lengths,
+                metadata.query_start_loc,
+                metadata.num_accepted_tokens,
+                metadata.is_prefilling,
+            ]
         )
         cache_writes = [bindings[name] for name in _CACHE_MUTABLE_FIELDS]
         common_constants = [
@@ -946,7 +1001,7 @@ class PreparedShardedQSA:
             bindings["k_descale"], bindings["v_descale"],
         ]
         select_reads = common_constants + [
-            metadata.compressed_block_table, attended, index_query,
+            metadata.compressed_block_table, attended,
             metadata.request_ids, metadata.query_positions, metadata.rope_positions,
             metadata.sequence_lengths,
         ]
@@ -965,22 +1020,34 @@ class PreparedShardedQSA:
         if self.world_size != 2:
             aux_buffers.append(torch.empty((self.tokens, GROUP_BUDGET), dtype=torch.int32, device=device))
         _qsa_group_select_async_op(
-            source, cache_reads, cache_writes, select_reads,
-            aux_workspace, aux_buffers, selected, full_workspace_bytes,
-            self.handle, self.stream_handle, fork_from_main,
+            source, projected_index_read, cache_reads, cache_writes, select_reads,
+            aux_workspace, aux_buffers, selected,
+            proj_values, proj_scales, proj_outputs, proj_workspaces, proj_plans,
+            full_workspace_bytes, self.handle, self.stream_handle,
         )
-        keepalive = [source, projected_index, dummy_query, *projection_workspaces, *aux_buffers]
-        return (attended, selected, aux_workspace, common_constants, keepalive)
+        keepalive = [
+            source,
+            projected_index_live,
+            dummy_query,
+            metadata.rope_positions,
+            metadata.sequence_lengths,
+            metadata.query_start_loc,
+            metadata.num_accepted_tokens,
+            metadata.is_prefilling,
+            *proj_workspaces,
+            *aux_buffers,
+        ]
+        return projected_qkv, (attended, selected, aux_workspace, common_constants, keepalive)
 
     def finish_group_selection(self, pending, query, metadata, full_workspace_bytes):
         attended, selected, aux_workspace, common_constants, keepalive = pending
         attend_reads = common_constants + [
             metadata.main_block_table, metadata.compressed_block_table,
-            metadata.raw_state_slot_ids, selected,
+            metadata.raw_state_slot_ids,
             query, metadata.request_ids, metadata.query_positions,
         ]
         _qsa_attend_joined_op(
-            attend_reads, keepalive, attended, aux_workspace,
+            attend_reads, keepalive, attended, selected, aux_workspace,
             full_workspace_bytes, self.handle, self.stream_handle,
         )
         return attended, selected

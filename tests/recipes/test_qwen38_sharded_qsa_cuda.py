@@ -72,6 +72,27 @@ def _make_rotary(context: int, device: torch.device):
     return RotaryTables.allocate(cfg, context, device)
 
 
+def _derived_metadata_forward(attn, src, meta):
+    from hyperflare_recipes.recipes.qwen38.attention import QSAMetadata
+
+    # Compute derived metadata inside the compiled forward (matching PreparedDecoder.begin_runtime)
+    # so TorchInductor schedules metadata kernels and temporary buffer lifetimes across the fork/join.
+    derived = QSAMetadata(
+        main_block_table=meta.main_block_table + 0,
+        compressed_block_table=meta.compressed_block_table + 0,
+        raw_state_slot_ids=meta.raw_state_slot_ids + 0,
+        request_ids=meta.request_ids + 0,
+        query_positions=meta.query_positions + 0,
+        rope_positions=meta.rope_positions + 0,
+        sequence_lengths=meta.sequence_lengths + 0,
+        query_start_loc=meta.query_start_loc + 0,
+        num_accepted_tokens=meta.num_accepted_tokens + 0,
+        is_prefilling=meta.is_prefilling.clone(),
+        slot_mapping=meta.slot_mapping + 0,
+    )
+    return attn(src, derived)
+
+
 def _tp2_sharded_qsa_worker(rank: int, world: int, port: int, mode: str, cache_dir: str, error_queue):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
@@ -102,7 +123,8 @@ def _tp2_sharded_qsa_worker(rank: int, world: int, port: int, mode: str, cache_d
         page_size = 64
         num_pages = 512
         mxfp8 = mode == "group_mxfp8"
-        shard_mode = "group" if mxfp8 else mode
+        overlap = mode in ("group", "group_mxfp8")
+        shard_mode = "row" if mode == "row" else "group"
         if shard_mode == "row":
             tokens, batch = 512, 1
             gather_rt = create_all_gather_runtime(group, device, max_rows=tokens // world, columns=1024 * world)
@@ -124,7 +146,7 @@ def _tp2_sharded_qsa_worker(rank: int, world: int, port: int, mode: str, cache_d
         module = _make_dummy_qsa_module(device)
         weights = _make_weights(device, q_heads=12, kv_heads=1, seed=41, mxfp8=mxfp8)
         rotary = _make_rotary(context, device)
-        arena = ScratchArena(device, overlap=(shard_mode == "group"))
+        arena = ScratchArena(device, overlap=overlap)
         session.register_scratch(arena)
 
         # Prepare BOTH unsharded reference and sharded candidate using identical weights & initial 1-page pools.
@@ -150,7 +172,7 @@ def _tp2_sharded_qsa_worker(rank: int, world: int, port: int, mode: str, cache_d
 
         session.tune(show_progress=False)
 
-        assert shd_attn.sharded.overlap is (shard_mode == "group")
+        assert shd_attn.sharded.overlap is overlap
         assert (shd_attn.parallel_projections is not None) is mxfp8
 
         # PreparedShardedQSA must not retain per-layer persistent dummy output/query/position buffers.
@@ -171,9 +193,15 @@ def _tp2_sharded_qsa_worker(rank: int, world: int, port: int, mode: str, cache_d
 
         # Compile sharded forward through ForwardCache on rank 0 and bind+warm on both ranks
         # via prepare_many(coordinator=...) to verify AOT cross-rank sharing without rank guards.
+        # For overlapped group modes, derive QSAMetadata inside the compiled forward (matching
+        # PreparedDecoder.begin_runtime) to exercise Inductor scheduling and keepalive lifetimes.
         run_source = torch.zeros((tokens, 2560), dtype=torch.bfloat16, device=device)
         run_meta = QSAMetadata.allocate(tokens=tokens, batch=batch, context=context, device=device)
-        shd_fwd = partial(shd_attn, run_source, run_meta)
+        shd_fwd = (
+            partial(_derived_metadata_forward, shd_attn, run_source, run_meta)
+            if overlap
+            else partial(shd_attn, run_source, run_meta)
+        )
         fwd_cache = ForwardCache(
             namespace=f"test_sharded_qsa_{mode}",
             device=device,
@@ -225,6 +253,7 @@ def _tp2_sharded_qsa_worker(rank: int, world: int, port: int, mode: str, cache_d
 
             run_source.copy_((torch.randn((tokens, 2560), generator=gen) * 0.5).bfloat16().to(device))
             run_meta.main_block_table.fill_(-1)
+            run_meta.compressed_block_table.fill_(-1)
             run_meta.raw_state_slot_ids.fill_(-1)
             run_meta.request_ids.fill_(-1)
             run_meta.query_positions.fill_(-1)
@@ -275,6 +304,8 @@ def _tp2_sharded_qsa_worker(rank: int, world: int, port: int, mode: str, cache_d
                     )
                     offset += live_w
                     run_meta.query_start_loc[b_idx + 1] = offset
+
+            run_meta.compressed_block_table.copy_(run_meta.main_block_table)
 
             dist.barrier(group)
             with torch.cuda.stream(stream):
@@ -330,7 +361,7 @@ def _tp2_sharded_qsa_worker(rank: int, world: int, port: int, mode: str, cache_d
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("mode", ["row", "group", "group_mxfp8"])
+@pytest.mark.parametrize("mode", ["row", "group_serial", "group", "group_mxfp8"])
 def test_qwen38_sharded_qsa_matches_unsharded_and_shares_aot_binary_tp2(mode):
     """Sharded QSA selection matches unsharded reference and shares one AOT forward across TP2 ranks."""
     _requires_tp2()

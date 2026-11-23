@@ -403,16 +403,14 @@ class PreparedAttention:
         pending_sharded = None
         if self.sharded is not None and self.sharded.overlap:
             if self.parallel_projections is not None:
-                (projected_qkv, projected_index), projection_workspaces = self.parallel_projections.start(source)
-                pending_sharded = self.sharded.start_group_selection(
-                    source, projected_index, metadata, self.constants, self.workspace_bytes,
-                    fork_from_main=False, projection_workspaces=projection_workspaces,
+                projected_qkv, pending_sharded = self.sharded.start_group_selection(
+                    source, None, metadata, self.constants, self.workspace_bytes,
+                    parallel_projections=self.parallel_projections,
                 )
             else:
                 projected_index = self.projections["indexer.index_qk_proj"](source)
-                pending_sharded = self.sharded.start_group_selection(
+                _, pending_sharded = self.sharded.start_group_selection(
                     source, projected_index, metadata, self.constants, self.workspace_bytes,
-                    fork_from_main=True,
                 )
                 projected_qkv = self.projections["qkv_proj"](source)
             projection_workspaces = None
