@@ -357,7 +357,7 @@ def test_qwen38_decoder_routes_ple_barrier_to_barrier_runtime(monkeypatch):
     import hyperflare_recipes.recipes.qwen38.ple as ple_mod
     import ignition.components.collectives as collectives_mod
 
-    seen = {"hc": [], "reduce": [], "ple": []}
+    seen = {"hc": [], "reduce": [], "ple": [], "attn": []}
 
     class DummyOp:
         def __init__(self, *args, **kwargs):
@@ -379,9 +379,13 @@ def test_qwen38_decoder_routes_ple_barrier_to_barrier_runtime(monkeypatch):
         seen["ple"].append(kwargs.get("runtime"))
         return DummyOp()
 
+    def fake_attn(*args, **kwargs):
+        seen["attn"].append((kwargs.get("qsa_gather_runtime"), kwargs.get("qsa_shard_mode")))
+        return DummyOp()
+
     monkeypatch.setattr(embedding_mod, "PreparedEmbedding", DummyOp)
     monkeypatch.setattr(hc_mod, "PreparedHyperconnection", fake_hc)
-    monkeypatch.setattr(attention_mod, "PreparedAttention", DummyOp)
+    monkeypatch.setattr(attention_mod, "PreparedAttention", fake_attn)
     monkeypatch.setattr(gdn_mod, "PreparedGDN", DummyOp)
     monkeypatch.setattr(moe_mod, "PreparedQwenMoe", DummyOp)
     monkeypatch.setattr(ple_mod, "PreparedPLE", fake_ple)
@@ -449,15 +453,18 @@ def test_qwen38_decoder_routes_ple_barrier_to_barrier_runtime(monkeypatch):
     dma_rt = object()
     pcie_rt = object()
     vocab_rt = object()
+    qsa_gather_rt = object()
 
     decoder_mod.PreparedDecoder(
         weights, scratch, state, qsa_states, None, None, None,
         None, None, None, session=None, name="prefill1024", verification=True,
         runtime=dma_rt, barrier_runtime=pcie_rt, vocabulary_runtime=vocab_rt,
+        qsa_gather_runtime=qsa_gather_rt, qsa_shard_mode="row",
     )
     assert seen["ple"] == [pcie_rt]
     assert len(seen["reduce"]) == 96 and all(rt is dma_rt for rt in seen["reduce"])
     assert len(seen["hc"]) == 97 and all(rt is dma_rt for rt in seen["hc"])
+    assert seen["attn"] == [(qsa_gather_rt, "row")] * 12
 
     for bucket in seen.values():
         bucket.clear()
@@ -468,6 +475,7 @@ def test_qwen38_decoder_routes_ple_barrier_to_barrier_runtime(monkeypatch):
     )
     assert seen["ple"] == [pcie_rt]
     assert len(seen["reduce"]) == 96 and all(rt is pcie_rt for rt in seen["reduce"])
+    assert seen["attn"] == [(None, None)] * 12
 
 
 def _tp2_dma_and_barrier_worker(rank, world, port, error_queue):

@@ -28,10 +28,11 @@ class SpeculativePreparation:
     def __init__(self, *, weights, mtp_weights, pool, requests, inputs, scratch,
                  workspaces, rotary, cache, table, session, completion, frame, sequence,
                  context, prefill_capacity, max_cache_pages,
-                 runtime=None, vocabulary_runtime=None, result_runtime=None, coordinator=None, verification_width=8,
-                 sampling_workspace=None):
+                 runtime=None, vocabulary_runtime=None, result_runtime=None, qsa_gather_runtime=None,
+                 coordinator=None, verification_width=8, sampling_workspace=None):
         self.collectives = dict(runtime=runtime, vocabulary_runtime=vocabulary_runtime, coordinator=coordinator)
         self.result_runtime = result_runtime
+        self.qsa_gather_runtime = qsa_gather_runtime
         self.weights, self.mtp_weights, self.pool, self.requests = weights, mtp_weights, pool, requests
         self.inputs, self.scratch, self.workspaces, self.rotary = inputs, scratch, workspaces, rotary
         self.cache, self.table, self.session = cache, table, session
@@ -184,12 +185,20 @@ class PreparedSpeculativeRound:
         scratch = owner.scratch.rows(batch * width, batch * width)
         self.target_residual = (owner.verification_residual[:batch * width]
                                 if residual_output is None else residual_output)
+        qsa_shard = (
+            dict(qsa_gather_runtime=owner.qsa_gather_runtime, qsa_shard_mode="group")
+            if (residual_output is None
+                and getattr(owner, "qsa_gather_runtime", None) is not None
+                and batch * width <= 128
+                and owner.context % (64 * owner.weights.shard.world_size) == 0)
+            else {}
+        )
         self.decoder = decoder_factory(owner.weights, scratch, self.state, owner.cache, owner.rotary,
             owner.table, owner.workspaces, owner.completion, owner.frame, owner.sequence,
             session=owner.session, name=f"{name}.target", max_cache_pages=owner.max_cache_pages,
             residual_output=self.target_residual, verification=True,
             gdn_records=owner.gdn_records if width > 1 else None,
-            gdn_in_place=width == 1 and owner.gdn_records is not None, **owner.collectives)
+            gdn_in_place=width == 1 and owner.gdn_records is not None, **qsa_shard, **owner.collectives)
         owner.decoders.append(getattr(self.decoder, "forward", self.decoder))
         self.draft_metadata = owner.draft_metadata(batch, batch)
         self.draft = owner.mtp(self.draft_metadata, f"{name}.draft") if width > 1 else None

@@ -17,12 +17,13 @@ from transformers.models.qwen4_exp.modeling_qwen4_exp import apply_rotary_pos_em
 
 from hyperflare_recipes.components import sm103
 from hyperflare_recipes.components.sm103_sparse_attention import PARTIAL_ROWS, SPLIT_ROWS, PreparedSparseAttention
-from hyperflare_recipes.components.linear import QuantizedProjection, UnquantizedProjection
+from hyperflare_recipes.components.linear import ParallelProjections, QuantizedProjection, UnquantizedProjection
 from hyperflare_recipes.fixtures import qsa as qsa_fixtures
 from ignition.preparation.scratch import ScratchArena, planned_scratch, prime_owners
 from ignition.preparation.tuning import declare, register_finalizer
 
 from .attention_overlap import ConcurrentAttention, FunctionalQSA
+from .qsa_sharded import PreparedShardedQSA, sharded_score_workspace_bytes
 from ignition.preparation.persistent import persistent_copy, persistent_empty, persistent_zeros
 
 
@@ -201,7 +202,9 @@ class PreparedAttention:
                  rotary: RotaryTables, *, session: PreparationSession, name: str,
                  draft_tokens: int = 0, workspace: ScratchArena | torch.Tensor | None = None,
                  projection_workspace: ScratchArena | torch.Tensor | None = None,
-                 max_cache_pages: int | None = None, cache_only: bool = False) -> None:
+                 max_cache_pages: int | None = None, cache_only: bool = False,
+                 shard=None, qsa_gather_runtime=None, qsa_shard_mode: str | None = None,
+                 coordinator=None) -> None:
         self.q_heads, self.kv_heads = scratch.query.shape[1], scratch.key.shape[1]
         self.cache_only = cache_only
         self.module, self.scratch, self.state = module, scratch, state
@@ -218,9 +221,17 @@ class PreparedAttention:
         if type(cache_pages) is not int or cache_pages < state.main_k_cache.shape[0]:
             raise ValueError("planned QSA page capacity must cover the bound page pools")
         self.cache_page_capacity = cache_pages
-        # On SM103 one score workspace covers every representative group of a
-        # prefill chunk, so selection makes a single pass instead of one per 128 MiB.
-        score_workspace = self.tokens * (context // 4) * 4 if sm103.is_sm103(source.device) else None
+        use_sharded = (
+            not cache_only
+            and qsa_gather_runtime is not None
+            and qsa_shard_mode is not None
+            and shard is not None
+            and shard.world_size > 1
+        )
+        # When selection runs through PreparedShardedQSA, self.plan only performs cache_only
+        # updates and sparse GQA, so it keeps the default 128 MiB score workspace. Otherwise,
+        # size score_workspace_bytes to avoid excessive chunked score passes during prefill.
+        score_workspace = None if use_sharded else sharded_score_workspace_bytes(self.tokens, context, source.device)
         caps = qsa.Caps(device=source.device, max_batch=batch, kv_dtype=state.main_k_cache.dtype,
                         max_raw_state_slots=state.raw_k_ring.shape[0], max_q_rows=self.tokens,
                         max_seq_len=context, num_main_cache_pages=cache_pages,
@@ -230,7 +241,7 @@ class PreparedAttention:
                         q_heads=self.q_heads, kv_heads=self.kv_heads,
                         mrope_sections=(11, 11, 10), mrope_interleaved=True,
                         rms_norm_eps=module.config.rms_norm_eps,
-                        score_workspace_bytes=max(score_workspace, 128 << 20) if score_workspace else None)
+                        score_workspace_bytes=score_workspace)
         if rotary.cos.shape[0] < context:
             raise ValueError("rotary table capacity must cover the admitted context")
         self.projections = {}
@@ -299,14 +310,29 @@ class PreparedAttention:
         # overlaps QKV production, keep b12x's attention. Without stream overlap those rows
         # run the same kernels serially.
         self.sparse = None
-        if (not cache_only and not concurrent and sm103.is_sm103(source.device)
+        if (not cache_only and (use_sharded or not concurrent) and sm103.is_sm103(source.device)
                 and (self.tokens > _SPARSE_ATTENTION_MIN_ROWS or self.tokens <= SPLIT_ROWS)):
             self.sparse = PreparedSparseAttention(scratch.query, state.main_k_cache, state.main_v_cache,
                 scratch.selected_positions, metadata.main_block_table, metadata.request_ids,
                 metadata.query_positions, scratch.attended, partial=scratch.partial,
                 partial_lse=scratch.partial_lse)
+        self.sharded = (
+            PreparedShardedQSA(
+                self, mode=qsa_shard_mode, rank=shard.rank, world_size=shard.world_size,
+                gather_runtime=qsa_gather_runtime, coordinator=coordinator,
+                session=session, name=name, workspace=workspace,
+            )
+            if use_sharded else None
+        )
+        self.parallel_projections = (
+            ParallelProjections(
+                self.projections["qkv_proj"], self.projections["indexer.index_qk_proj"],
+                session=session, workspace=workspace,
+            )
+            if use_sharded and concurrent and workspace.overlap else None
+        )
         self.concurrent = (ConcurrentAttention(self, session=session, workspace=workspace)
-                           if concurrent and workspace.overlap else None)
+                           if not use_sharded and concurrent and workspace.overlap else None)
 
     def dynamic(self) -> dict:
         return {"query": self.scratch.query, "index_query": self.index_query,
@@ -335,15 +361,21 @@ class PreparedAttention:
             self.state = state
             return
         self.binding = qsa.bind(self.plan, scratch=self.workspace, **self.binding_kwargs)
+        if self.sharded is not None:
+            self.sharded.rebind_pages_for_preparation(state)
         self.write_kwargs.update(k_cache=state.main_k_cache, v_cache=state.main_v_cache)
         self.state = state
 
     def functional(self, *, session):
-        self.functional_qsa = FunctionalQSA(self)
+        self.functional_qsa = None if self.sharded is not None else FunctionalQSA(self)
         for projection in self.projections.values():
             projection.functional(session=session)
+        if self.parallel_projections is not None:
+            self.parallel_projections.functional(session=session)
         if self.concurrent is not None:
             self.concurrent.functional(session=session)
+        if self.sharded is not None:
+            self.sharded.functional(session=session)
         if self.sparse is not None:
             self.sparse.functional(session=session)
         register_finalizer(session, self._finalize_functional)
@@ -358,7 +390,10 @@ class PreparedAttention:
         self.binding = self.binding_kwargs = self.write_kwargs = self.workspace = None
 
     def __call__(self, source: torch.Tensor, metadata) -> torch.Tensor | None:
-        if self.concurrent is None:
+        if self.parallel_projections is not None:
+            projected_qkv, projected_index = self.parallel_projections(source)
+            projection_workspaces = None
+        elif self.concurrent is None:
             projected_index = self.projections["indexer.index_qk_proj"](source)
             projected_qkv = self.projections["qkv_proj"](source)
             projection_workspaces = None
@@ -387,7 +422,9 @@ class PreparedAttention:
             "raw_index_key": projected_index[:, 512:], **{name: getattr(metadata, name) for name in
                 ("request_ids", "query_positions", "rope_positions", "sequence_lengths", "query_start_loc",
                  "num_accepted_tokens", "is_prefilling")}}
-        if self.concurrent is None:
+        if self.sharded is not None:
+            self.sharded(source, bindings, dynamic, self.workspace_bytes)
+        elif self.concurrent is None:
             workspace = torch.empty(self.workspace_bytes, dtype=torch.uint8, device=source.device)
             self.functional_qsa(source, bindings, dynamic, workspace)
         else:

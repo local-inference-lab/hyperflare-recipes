@@ -344,6 +344,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
     coordinator = CollectivePreparation(group) if group is not None else None
     ipc = None if core_storage is None else core_storage.peer_storage
     collective = prefill_collective = vocabulary_collective = hidden_gather_collective = result_collective = shortlist_gather_collective = None
+    qsa_decode_gather_collective = qsa_prefill_gather_collective = None
     reduction_width = 10240 if config.shard_hyperconnections else 2560
     result_layouts = ()
     if group is not None:
@@ -392,6 +393,18 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
             shortlist_cols = ((shortlist_top_k * 4 + 63) // 64) * 64
             shortlist_gather_collective = create_all_gather_runtime(group, device,
                 max_rows=draft_rows, columns=shortlist_cols * shard.world_size, ipc=ipc)
+        if shard.world_size in (2, 4):
+            qsa_decode_max_rows = min(128, max(config.request_capacity, sample_rows))
+            if config.context % (64 * shard.world_size) == 0 and qsa_decode_max_rows > 0:
+                qsa_decode_gather_collective = create_all_gather_runtime(
+                    group, device, max_rows=qsa_decode_max_rows, columns=2048 * shard.world_size, ipc=ipc
+                )
+            if config.prefill_chunk_size >= 512 and config.prefill_chunk_size % (32 * shard.world_size) == 0:
+                qsa_prefill_gather_collective = create_all_gather_runtime(
+                    group, device,
+                    max_rows=config.prefill_chunk_size // shard.world_size,
+                    columns=1024 * shard.world_size, ipc=ipc,
+                )
     collectives = dict(runtime=collective, vocabulary_runtime=vocabulary_collective, coordinator=coordinator)
     session = preparation_session(
         compile_workers=config.compile_workers, collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
@@ -459,10 +472,12 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                     draft_options = dict(draft_weights=draft_weights, draft_config=draft_config, draft_head=draft_head,
                                          draft_embedding=draft_embedding, gather_runtime=hidden_gather_collective,
                                          result_runtime=result_collective, shortlist_runtime=shortlist_gather_collective,
+                                         qsa_gather_runtime=qsa_decode_gather_collective,
                                          block_proposal_broadcast=True, shortlist_only=True)
                 else:
                     from .speculative_model import SpeculativePreparation
-                    draft_options = dict(mtp_weights=mtp_weights, result_runtime=result_collective)
+                    draft_options = dict(mtp_weights=mtp_weights, result_runtime=result_collective,
+                                         qsa_gather_runtime=qsa_decode_gather_collective)
 
                 speculation = SpeculativePreparation(weights=weights, **draft_options,
                     pool=state, requests=requests, inputs=inputs, scratch=scratch, workspaces=workspaces,
@@ -529,8 +544,17 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                         decoder_collectives = (
                             {**collectives, "runtime": prefill_collective, "barrier_runtime": collective}
                             if prefill_collective is not None and mode == "prefill" and capacity >= _DMA_PREFILL_TOKENS
-                            else collectives
+                            else dict(collectives)
                         )
+                        if (mode == "prefill" and qsa_prefill_gather_collective is not None
+                                and capacity >= 512 and capacity % (32 * shard.world_size) == 0):
+                            decoder_collectives.update(
+                                qsa_gather_runtime=qsa_prefill_gather_collective, qsa_shard_mode="row"
+                            )
+                        elif mode == "decode" and qsa_decode_gather_collective is not None and capacity <= 128:
+                            decoder_collectives.update(
+                                qsa_gather_runtime=qsa_decode_gather_collective, qsa_shard_mode="group"
+                            )
                         decoder = PreparedDecoder(weights, s, metadata, cache, rotary, table, workspaces,
                             completion, frame, sequence, session=session, name=name,
                             embedding_injection=injection, max_cache_pages=planned_pages,
@@ -733,7 +757,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                 speculative_fixed_width=config.speculative_fixed_width)
         resources = (scoring, weights, table, session, state, requests, inputs, workspaces, rotary,
             cache, final_cache, admission, transfer, features, vision_inputs,
-            functions, compiled_functions, decoders, owners, stream, graph_pool, speculation, mtp_weights, draft_weights, draft_head, draft_config, collective, prefill_collective, vocabulary_collective, hidden_gather_collective, result_collective, shortlist_gather_collective, coordinator)
+            functions, compiled_functions, decoders, owners, stream, graph_pool, speculation, mtp_weights, draft_weights, draft_head, draft_config, collective, prefill_collective, vocabulary_collective, hidden_gather_collective, result_collective, shortlist_gather_collective, qsa_decode_gather_collective, qsa_prefill_gather_collective, coordinator)
         report(f"prepared {len(graphs)} graphs with {page_capacity} preparation KV pages")
         from .export import disposable_ranges
 
@@ -752,7 +776,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
             export_events=table.events(), core_data=table if rank == 0 else None,
             resources=resources, server_config=server_config, memory_report=memory, session=session,
             close_resources=(table, *((scoring,) if scoring is not None else ()),
-                             *tuple(runtime for runtime in (prefill_collective, hidden_gather_collective, result_collective, shortlist_gather_collective)
+                             *tuple(runtime for runtime in (prefill_collective, hidden_gather_collective, result_collective, shortlist_gather_collective, qsa_decode_gather_collective, qsa_prefill_gather_collective)
                                     if runtime is not None and runtime is not collective),
                              *((vocabulary_collective, collective) if collective is not None else ())))
     except BaseException:

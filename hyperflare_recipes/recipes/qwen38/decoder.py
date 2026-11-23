@@ -241,8 +241,8 @@ class PreparedDecoder:
                  max_cache_pages: int | None = None,
                  residual_output: torch.Tensor | None = None, verification: bool = False,
                  gdn_records=None, gdn_in_place: bool = False, runtime=None, barrier_runtime=None, vocabulary_runtime=None,
-                 result_runtime=None, coordinator=None,
-                 sampling_workspace=None, scoring=None):
+                 result_runtime=None, qsa_gather_runtime=None, qsa_shard_mode: str | None = None,
+                 coordinator=None, sampling_workspace=None, scoring=None):
         from hyperflare_recipes.components.embedding import PreparedEmbedding
         from hyperflare_recipes.components.linear import UnquantizedProjection
 
@@ -289,7 +289,9 @@ class PreparedDecoder:
                 attention = PreparedAttention(module.self_attn, layer_weights.attention, source,
                     scratch.qsa, qsa_states[index], state.qsa, rotary, session=session, name=f"{prefix}.qsa",
                     workspace=workspaces, projection_workspace=workspaces,
-                    max_cache_pages=max_cache_pages, draft_tokens=state.pool.layout.speculative_tokens)
+                    max_cache_pages=max_cache_pages, draft_tokens=state.pool.layout.speculative_tokens,
+                    shard=getattr(weights, "shard", None), qsa_gather_runtime=qsa_gather_runtime,
+                    qsa_shard_mode=qsa_shard_mode, coordinator=coordinator)
             else:
                 attention = PreparedGDN(module.linear_attn, layer_weights.attention, source,
                     scratch.gdn, state.pool.gdn[index], state.gdn, mode=state.mode,
