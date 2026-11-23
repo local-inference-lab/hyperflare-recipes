@@ -95,10 +95,15 @@ def _orderable(scores):
 
 
 @triton.jit
-def _candidate_keys(score, group):
+def _candidate_keys_from_ordered(ord_score, group):
     # Higher score first, then lower global group ID; missing (-1) sorts below every present entry.
-    keys = (_orderable(score).to(tl.int64) << 32) | (2147483647 - group)
+    keys = (ord_score.to(tl.int64) << 32) | (2147483647 - group)
     return tl.where(group >= 0, keys, -9223372036854775808)
+
+
+@triton.jit
+def _candidate_keys(score, group):
+    return _candidate_keys_from_ordered(_orderable(score), group)
 
 
 @triton.jit
@@ -161,30 +166,12 @@ def _pack_group_candidates_kernel(
     )
     keys = tl.sort(_candidate_keys(sc, global_id), descending=True)
     present = keys != -9223372036854775808
-    out_sc = _orderable((keys >> 32).to(tl.int32)).to(tl.float32, bitcast=True)
+    # Store the lossless 32-bit orderable score directly so cross-rank merge preserves all FP32 bits.
+    out_ord = (keys >> 32).to(tl.int32)
     out_id = (2147483647 - (keys & 4294967295)).to(tl.int32)
     out_base = Packed + row * (TOPK * 2)
-    tl.store(out_base + idx, tl.where(present, out_sc, -float("inf")).to(tl.int32, bitcast=True))
+    tl.store(out_base + idx, tl.where(present, out_ord, -2147483648))
     tl.store(out_base + TOPK + idx, tl.where(present, out_id, -1))
-
-
-@triton.jit
-def _merge_group_candidates_2_kernel(Gathered, OutIds, TOPK: tl.constexpr):
-    # Exact 1-step bitonic merge of two descending 512-element lists, then ascending group-ID sort.
-    row = tl.program_id(0)
-    idx = tl.arange(0, TOPK)
-    rev = TOPK - 1 - idx
-    base0 = Gathered + row * (4 * TOPK)
-    base1 = base0 + 2 * TOPK
-    s0 = tl.load(base0 + idx).to(tl.float32, bitcast=True)
-    i0 = tl.load(base0 + TOPK + idx).to(tl.int64)
-    s1 = tl.load(base1 + rev).to(tl.float32, bitcast=True)
-    i1 = tl.load(base1 + TOPK + rev).to(tl.int64)
-    keys = tl.maximum(_candidate_keys(s0, i0), _candidate_keys(s1, i1))
-    present = keys != -9223372036854775808
-    gid = tl.where(present, (2147483647 - (keys & 4294967295)).to(tl.int32), 2147483647)
-    sorted_gid = tl.sort(gid, descending=False)
-    tl.store(OutIds + row * TOPK + idx, tl.where(sorted_gid < 2147483647, sorted_gid, -1))
 
 
 @triton.jit
@@ -199,11 +186,11 @@ def _merge_and_expand_group_candidates_2_kernel(
     rev = TOPK - 1 - idx
     base0 = Gathered + row.to(tl.int64) * (4 * TOPK)
     base1 = base0 + 2 * TOPK
-    s0 = tl.load(base0 + idx).to(tl.float32, bitcast=True)
+    o0 = tl.load(base0 + idx)
     i0 = tl.load(base0 + TOPK + idx).to(tl.int64)
-    s1 = tl.load(base1 + rev).to(tl.float32, bitcast=True)
+    o1 = tl.load(base1 + rev)
     i1 = tl.load(base1 + TOPK + rev).to(tl.int64)
-    keys = tl.maximum(_candidate_keys(s0, i0), _candidate_keys(s1, i1))
+    keys = tl.maximum(_candidate_keys_from_ordered(o0, i0), _candidate_keys_from_ordered(o1, i1))
     present = keys != -9223372036854775808
     gid = tl.where(present, (2147483647 - (keys & 4294967295)).to(tl.int32), 2147483647)
     sorted_gid = tl.sort(gid, descending=False)
@@ -240,16 +227,17 @@ def _merge_and_expand_group_candidates_2_kernel(
 
 @triton.jit
 def _merge_group_candidates_n_kernel(Gathered, OutIds, WORLD: tl.constexpr, TOPK: tl.constexpr):
-    # General WORLD-way exact merge (WORLD=4 -> 2048 candidates).
+    # General WORLD-way exact merge (WORLD=4 -> 2048 candidates), preserving score-descending,
+    # group-ID-ascending order to match unsharded b12x stable selection.
     row = tl.program_id(0)
     total: tl.constexpr = WORLD * TOPK
     idx = tl.arange(0, total)
     rank_idx = idx // TOPK
     local_idx = idx % TOPK
     base = Gathered + row * (total * 2) + rank_idx * (2 * TOPK)
-    s = tl.load(base + local_idx).to(tl.float32, bitcast=True)
+    o = tl.load(base + local_idx)
     i = tl.load(base + TOPK + local_idx).to(tl.int64)
-    keys = tl.sort(_candidate_keys(s, i), descending=True)
+    keys = tl.sort(_candidate_keys_from_ordered(o, i), descending=True)
     present = (idx < TOPK) & (keys != -9223372036854775808)
     gid = tl.where(present, (2147483647 - (keys & 4294967295)).to(tl.int32), -1)
     tl.store(OutIds + row * TOPK + idx, gid, mask=idx < TOPK)
@@ -476,22 +464,6 @@ class PreparedShardedQSA:
             ex_table = torch.full((self.batch, select_table_width), -1, dtype=torch.int32, device=self.device)
             ex_main_table = ex_table
 
-        self._select_output_dummy = persistent_copy(
-            torch.empty((self.local_rows, attention.q_heads, 256), dtype=torch.bfloat16, device=self.device)
-        )
-        self._select_positions_dummy = persistent_copy(
-            torch.full((self.local_rows, SELECTION_WIDTH), -1, dtype=torch.int32, device=self.device)
-        )
-        self._select_query_dummy = persistent_copy(
-            torch.empty((self.local_rows, attention.q_heads, 256), dtype=torch.bfloat16, device=self.device)
-        )
-        if mode == "row":
-            self._select_raw_k_dummy = persistent_copy(
-                torch.empty((self.local_rows, 128), dtype=torch.bfloat16, device=self.device)
-            )
-        else:
-            self._select_raw_k_dummy = None
-
         select_binding_kwargs = {
             **{field: getattr(attention.state, field) for field in attention.state.__dataclass_fields__},
             "main_block_table": ex_main_table,
@@ -515,15 +487,18 @@ class PreparedShardedQSA:
             invocation=qsa.invocation_from_tensors(select_caps, **select_operands),
             override=qsa.QsaConfig(backend="cutedsl", sparse_gqa_direct_kv_warps=2),
         )
+        # Preparation reuses slices of the transient QSAScratch buffers instead of allocating
+        # per-layer persistent dummy tensors; runtime reuses slices of bindings["output"] and
+        # bindings["selected_positions"], which run_select never writes.
         select_binding_kwargs.update(
-            output=self._select_output_dummy,
-            selected_positions=self._select_positions_dummy,
+            output=attention.scratch.attended[:self.local_rows],
+            selected_positions=attention.scratch.selected_positions[:self.local_rows],
             k_descale=attention.binding_kwargs["k_descale"],
             v_descale=attention.binding_kwargs["v_descale"],
         )
         self.select_binding_kwargs = select_binding_kwargs
         self._select_dynamic_ex = {
-            "query": self._select_query_dummy,
+            "query": attention.scratch.query[:self.local_rows],
             "index_query": ex_index_q,
             "raw_index_key": ex_raw_k,
             "request_ids": ex_req,
@@ -601,9 +576,8 @@ class PreparedShardedQSA:
         (
             main_k, main_v, comp_k, raw_k_ring, raw_pos, raw_rope, raw_anchor,
             index_q_norm, index_k_norm, rope_cos, rope_sin, k_descale, v_descale,
-            main_table, comp_table,
-            index_query, raw_index_key, request_ids, query_positions, rope_positions,
-            sequence_lengths, query_start_loc, num_accepted_tokens, is_prefilling,
+            main_table, comp_table, out_buf, sel_buf,
+            index_query, request_ids, query_positions, rope_positions, sequence_lengths,
         ) = reads
         binding = qsa.bind(
             self.select_plan,
@@ -622,16 +596,53 @@ class PreparedShardedQSA:
             index_k_norm_weight=index_k_norm,
             rope_cos=rope_cos,
             rope_sin=rope_sin,
-            output=self._select_output_dummy,
-            selected_positions=self._select_positions_dummy,
+            output=out_buf[:self.local_rows],
+            selected_positions=sel_buf[:self.local_rows],
             k_descale=k_descale,
             v_descale=v_descale,
         )
-        # Invoke only the 4 selection kernels (prepare_q, score, topk, stabilize) directly on the
-        # prepared select_plan, skipping the no-op cache updates and unused position expansion.
+        # b12x.attention.qsa currently exposes no public dcp_size=1 selection-only entry, so
+        # validate the active selection operand ABI and scratch bounds before launching only the
+        # four selection kernels (prepare_q, score, topk, stabilize) on select_plan.
         state = binding.state
         caps = state.caps
-        support = None if state.programs is None else state.programs.support
+        if state.programs is None:
+            raise RuntimeError("sharded QSA selection requires retained native b12x programs")
+        support = state.programs.support
+        abi_operands = state.abi["operands"]
+        for name, tensor in (
+            ("index_query", index_query),
+            ("request_ids", request_ids),
+            ("rope_positions", rope_positions),
+        ):
+            descriptor = abi_operands[name]
+            expected_strides = descriptor["strides"]
+            if (
+                tensor.device != caps.device
+                or tensor.dtype != getattr(torch, descriptor["dtype"])
+                or tensor.ndim != len(expected_strides)
+                or any(
+                    size != 1 and stride != planned
+                    for size, stride, planned in zip(tensor.shape, tensor.stride(), expected_strides, strict=True)
+                )
+            ):
+                raise ValueError(
+                    f"sharded QSA {name} ABI ({tensor.dtype}, {tensor.stride()}) differs from prepared {descriptor}"
+                )
+        if (
+            query_positions.device != caps.device
+            or query_positions.dtype != torch.int64
+            or query_positions.shape != (self.local_rows,)
+            or not query_positions.is_contiguous()
+        ):
+            raise ValueError("sharded QSA query_positions must be contiguous int64 [local_rows]")
+        if (
+            sequence_lengths.device != caps.device
+            or sequence_lengths.dtype != torch.int32
+            or sequence_lengths.shape != (self.batch,)
+            or not sequence_lengths.is_contiguous()
+        ):
+            raise ValueError("sharded QSA sequence_lengths must be contiguous int32 [batch]")
         work_rows = int(state.workspace_q_rows)
         group_budget = int(caps.group_budget)
         score_chunk_groups = int(state.score_chunk_groups)
@@ -650,6 +661,9 @@ class PreparedShardedQSA:
         thresholds = _scratch_view(workspace, offset_bytes=stable_offset, shape=(work_rows,), dtype=torch.float32)
         stable_offset += work_rows * torch.float32.itemsize
         greater_totals = _scratch_view(workspace, offset_bytes=stable_offset, shape=(work_rows,), dtype=torch.int32)
+        stable_offset += work_rows * torch.int32.itemsize
+        if stable_offset > workspace.numel():
+            raise ValueError("sharded QSA scratch workspace is smaller than the prepared stable-topk layout")
 
         launch_prepare_index_query(
             index_query=index_query,
@@ -787,7 +801,6 @@ class PreparedShardedQSA:
         ]
         if self.mode == "row":
             local_index_q = dynamic["index_query"].index_select(0, self.row_indices)
-            local_raw_k = self._select_raw_k_dummy
             local_req = dynamic["request_ids"].index_select(0, self.row_indices)
             local_pos = dynamic["query_positions"].index_select(0, self.row_indices)
             local_rope = dynamic["rope_positions"].index_select(0, self.row_indices)
@@ -818,7 +831,6 @@ class PreparedShardedQSA:
                 PAGE_GROUPS=COMPRESSED_PAGE_SIZE, WORLD=self.world_size, num_warps=4,
             )
             local_index_q = dynamic["index_query"]
-            local_raw_k = dynamic["raw_index_key"]
             local_req = dynamic["request_ids"]
             local_rope = dynamic["rope_positions"]
             main_table = half_table
@@ -828,12 +840,11 @@ class PreparedShardedQSA:
         select_workspace = torch.empty(self.select_workspace_bytes, dtype=torch.uint8, device=device)
         send = torch.empty(self.send_shape, dtype=torch.bfloat16, device=device)
         select_reads = common_constants + [
-            main_table, comp_table,
-            local_index_q, local_raw_k, local_req, local_pos, local_rope,
-            local_seq_len, dynamic["query_start_loc"],
-            dynamic["num_accepted_tokens"], dynamic["is_prefilling"],
+            main_table, comp_table, bindings["output"], bindings["selected_positions"],
+            local_index_q, local_req, local_pos, local_rope, local_seq_len,
         ]
         _qsa_select_sharded_op(select_reads, send, select_workspace, self.handle)
+        del select_workspace
 
         # 4) Gather sharded selection across TP ranks.
         gathered = self.gather(send)

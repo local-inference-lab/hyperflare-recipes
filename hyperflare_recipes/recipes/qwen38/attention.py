@@ -23,7 +23,7 @@ from ignition.preparation.scratch import ScratchArena, planned_scratch, prime_ow
 from ignition.preparation.tuning import declare, register_finalizer
 
 from .attention_overlap import ConcurrentAttention, FunctionalQSA
-from .qsa_sharded import PreparedShardedQSA, sharded_score_workspace_bytes
+from .qsa_sharded import PreparedShardedQSA
 from ignition.preparation.persistent import persistent_copy, persistent_empty, persistent_zeros
 
 
@@ -229,9 +229,14 @@ class PreparedAttention:
             and shard.world_size > 1
         )
         # When selection runs through PreparedShardedQSA, self.plan only performs cache_only
-        # updates and sparse GQA, so it keeps the default 128 MiB score workspace. Otherwise,
-        # size score_workspace_bytes to avoid excessive chunked score passes during prefill.
-        score_workspace = None if use_sharded else sharded_score_workspace_bytes(self.tokens, context, source.device)
+        # updates and sparse GQA, so it keeps the default 128 MiB score workspace. Unsharded
+        # SM103 sizes score_workspace_bytes to cover the full context; unsharded SM120 keeps
+        # b12x's default 128 MiB score workspace.
+        score_workspace = (
+            None if use_sharded
+            else max(self.tokens * (context // 4) * 4, 128 << 20) if sm103.is_sm103(source.device)
+            else None
+        )
         caps = qsa.Caps(device=source.device, max_batch=batch, kv_dtype=state.main_k_cache.dtype,
                         max_raw_state_slots=state.raw_k_ring.shape[0], max_q_rows=self.tokens,
                         max_seq_len=context, num_main_cache_pages=cache_pages,

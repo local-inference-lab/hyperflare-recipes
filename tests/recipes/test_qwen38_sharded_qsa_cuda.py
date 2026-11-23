@@ -85,6 +85,7 @@ def _tp2_sharded_qsa_worker(rank: int, world: int, port: int, mode: str, cache_d
     from ignition.preparation.tuning import RecordedPreparationSession
 
     gather_rt = session = None
+    session_entered = False
     try:
         coordinator = CollectivePreparation(group)
         shard = TensorParallelShard(rank, world)
@@ -107,6 +108,7 @@ def _tp2_sharded_qsa_worker(rank: int, world: int, port: int, mode: str, cache_d
             autotune_effort="off",
         )
         session.__enter__()
+        session_entered = True
 
         module = _make_dummy_qsa_module(device)
         weights = _make_weights(device, q_heads=12, kv_heads=1, seed=41)
@@ -136,6 +138,16 @@ def _tp2_sharded_qsa_worker(rank: int, world: int, port: int, mode: str, cache_d
         ).functional(session=session)
 
         session.tune(show_progress=False)
+
+        # PreparedShardedQSA must not retain per-layer persistent dummy output/query/position buffers.
+        retained_bytes = sum(
+            val.nbytes for val in vars(shd_attn.sharded).values()
+            if isinstance(val, torch.Tensor)
+        )
+        assert retained_bytes <= 64 * 1024, f"unexpected persistent tensor retention: {retained_bytes} bytes"
+
+        # Unsharded SM120 prefill keeps b12x's default 128 MiB score workspace.
+        assert ref_attn.plan.query.score_workspace_bytes is None
 
         # Exercise page rebinding from 1-page preparation pool to final multi-page pool.
         final_ref = state_ref.resize_pages_for_preparation(num_pages)
@@ -273,7 +285,6 @@ def _tp2_sharded_qsa_worker(rank: int, world: int, port: int, mode: str, cache_d
                 max_diff = (shd_out.float() - ref_out.float()).abs().max().item()
                 assert max_diff <= 2e-2, f"{scenario[0]}: max diff {max_diff}"
                 # Also verify outputs are bitwise identical across TP2 ranks (given identical weights & caches).
-                peer = torch.empty_like(shd_out.cpu())
                 local_cpu = shd_out.cpu()
                 gathered = [torch.empty_like(local_cpu) for _ in range(world)]
                 dist.all_gather(gathered, local_cpu, group=group)
@@ -296,6 +307,8 @@ def _tp2_sharded_qsa_worker(rank: int, world: int, port: int, mode: str, cache_d
         error_queue.put((rank, repr(exc)))
         raise
     finally:
+        if session_entered:
+            session.__exit__(None, None, None)
         if session is not None:
             session.close()
         if gather_rt is not None:
@@ -317,37 +330,87 @@ def test_qwen38_sharded_qsa_matches_unsharded_and_shares_aot_binary_tp2(mode):
         assert errors.empty(), errors.get()
 
 
-def test_qwen38_sharded_qsa_group_exact_tie_breaking_positions():
-    """Group-split merge selects the exact same top-512 global group set as single-rank stable selection."""
+@pytest.mark.parametrize("world", [2, 4])
+def test_qwen38_sharded_qsa_group_exact_tie_breaking_positions(world):
+    """Production group-split pack, merge, and expand kernels preserve exact FP32 score order and tie-breaking."""
     if os.environ.get("FLARE_RUN_CUDA_TESTS") != "1":
         pytest.skip("requires FLARE_RUN_CUDA_TESTS=1")
+    import triton
+
     from hyperflare_recipes.recipes.qwen38.qsa_sharded import (
         COMPRESSED_PAGE_SIZE,
+        COMPRESS_RATIO,
         GROUP_BUDGET,
-        _merge_group_candidates_2_kernel,
+        SELECTION_WIDTH,
+        _expand_groups_kernel,
+        _merge_and_expand_group_candidates_2_kernel,
+        _merge_group_candidates_n_kernel,
         _pack_group_candidates_kernel,
     )
 
     device = torch.device("cuda:0")
-    rows, world = 6, 2
-    total_groups = 1200
-    gen = torch.Generator(device="cpu").manual_seed(123)
-    # Construct scores with heavy ties right at the 512th cutoff across even and odd pages.
-    scores = torch.randint(0, 8, (rows, total_groups), generator=gen).float().to(device)
-    scores[0] = 1.0  # pure tie: lowest 512 global group IDs (0..511) must win!
+    rows = 8
+    total_groups = 1280
+    gen = torch.Generator(device="cpu").manual_seed(123 + world)
+
+    # Row 0: pure tie -> lowest 512 global group IDs (0..511) must win.
+    # Row 1: heavy integer ties across ranks.
+    # Row 2: 1-ULP positive FP32 differences above 2.0 (where numeric int32->fp32 drops 7 mantissa bits):
+    #        give higher group IDs a +1 ULP bump over lower group IDs so lossy packing would invert them.
+    # Row 3: 1-ULP positive FP32 differences above 16.0 across alternating pages.
+    # Row 4: negative FP32 scores including 1-ULP gaps and -0.0 vs +0.0.
+    # Row 5: short context (eligible = 25 < 512) with partial 3-token tail.
+    # Row 6: long context with partial 2-token tail.
+    # Row 7: inactive row (request_id = -1) -> all -1 positions.
+    scores = torch.randint(0, 8, (rows, total_groups), generator=gen).float()
+    scores[0] = 1.0
+    base_2 = torch.full((total_groups,), 2.0, dtype=torch.float32)
+    bump_2 = torch.nextafter(base_2, torch.full_like(base_2, float("inf")))
+    scores[2] = base_2
+    # Higher group IDs [total_groups - 512 :] have score 2.0 + 1 ULP, strictly beating [0 : 512] at 2.0.
+    scores[2, total_groups - GROUP_BUDGET:] = bump_2[total_groups - GROUP_BUDGET:]
+
+    base_16 = torch.full((total_groups,), 16.0, dtype=torch.float32)
+    step = base_16.clone()
+    for _ in range(16):
+        step = torch.nextafter(step, torch.full_like(step, float("inf")))
+    # Assign subtly different sub-64-ULP positive values across pages so cross-rank comparisons decide the cutoff.
+    g_idx = torch.arange(total_groups)
+    scores[3] = torch.where((g_idx // COMPRESSED_PAGE_SIZE) % world == world - 1, step, base_16)
+
+    neg_base = torch.linspace(-4.0, -0.5, total_groups, dtype=torch.float32)
+    scores[4] = neg_base
+    scores[4, 17] = -0.0
+    scores[4, 33] = 0.0
+    scores[4, 50] = torch.nextafter(torch.tensor(-1.0, dtype=torch.float32), torch.tensor(0.0, dtype=torch.float32))
+    scores[4, 51] = -1.0
+
+    global_eligible = torch.tensor(
+        [total_groups, total_groups, total_groups, total_groups, total_groups, 25, total_groups, 0],
+        dtype=torch.int32, device=device,
+    )
+    request_ids = torch.tensor([0, 1, 2, 3, 4, 5, 6, -1], dtype=torch.int64, device=device)
+    query_positions = torch.tensor(
+        [total_groups * 4 - 1, total_groups * 4 - 1, total_groups * 4 - 1, total_groups * 4 - 1,
+         total_groups * 4 - 1, 25 * 4 + 2, total_groups * 4 + 1, -1],
+        dtype=torch.int64, device=device,
+    )
 
     packed_ranks = []
     for r in range(world):
-        # Gather rank r's pages (page % world == r)
-        local_gids = [g for g in range(total_groups) if (g // COMPRESSED_PAGE_SIZE) % world == r]
-        local_scores_full = scores[:, local_gids]
-        # Stable top-512 on rank r (higher score first, lower local index first)
-        order = torch.argsort(
-            (-local_scores_full.double()) * 1e6 + torch.arange(len(local_gids), device=device)[None, :].double(),
-            dim=-1,
-        )[:, :GROUP_BUDGET]
-        l_ids = order.to(torch.int32).contiguous()
-        l_sc = local_scores_full.gather(-1, order).contiguous()
+        l_ids = torch.full((rows, GROUP_BUDGET), -1, dtype=torch.int32, device=device)
+        l_sc = torch.full((rows, GROUP_BUDGET), -float("inf"), dtype=torch.float32, device=device)
+        for row in range(rows):
+            elig = int(global_eligible[row].item())
+            local_gids = [g for g in range(elig) if (g // COMPRESSED_PAGE_SIZE) % world == r]
+            if not local_gids:
+                continue
+            local_scores = scores[row, local_gids]
+            # Exact Python reference sort: higher FP32 score first, then lower local group index.
+            ranked = sorted(range(len(local_gids)), key=lambda i: (-float(local_scores[i].item()), i))[:GROUP_BUDGET]
+            k = len(ranked)
+            l_ids[row, :k] = torch.tensor(ranked, dtype=torch.int32, device=device)
+            l_sc[row, :k] = local_scores[ranked].to(device)
         packed = torch.empty((rows, GROUP_BUDGET * 2), dtype=torch.int32, device=device)
         _pack_group_candidates_kernel[(rows,)](
             l_ids, l_sc, packed, torch.tensor([r], dtype=torch.int64, device=device),
@@ -356,13 +419,44 @@ def test_qwen38_sharded_qsa_group_exact_tie_breaking_positions():
         packed_ranks.append(packed)
 
     gathered = torch.cat(packed_ranks, dim=-1).contiguous()
-    out_ids = torch.empty((rows, GROUP_BUDGET), dtype=torch.int32, device=device)
-    _merge_group_candidates_2_kernel[(rows,)](gathered, out_ids, TOPK=GROUP_BUDGET, num_warps=8)
+    selected = torch.empty((rows, SELECTION_WIDTH), dtype=torch.int32, device=device)
+    if world == 2:
+        _merge_and_expand_group_candidates_2_kernel[(rows,)](
+            gathered, global_eligible, request_ids, query_positions, selected, selected.stride(0),
+            TOPK=GROUP_BUDGET, COMPRESS_RATIO=COMPRESS_RATIO, SELECTION_WIDTH=SELECTION_WIDTH,
+            num_warps=8,
+        )
+    else:
+        merged_ids = torch.empty((rows, GROUP_BUDGET), dtype=torch.int32, device=device)
+        _merge_group_candidates_n_kernel[(rows,)](
+            gathered, merged_ids, WORLD=world, TOPK=GROUP_BUDGET, num_warps=16,
+        )
+        _expand_groups_kernel[(rows,)](
+            merged_ids, global_eligible, request_ids, query_positions, selected,
+            merged_ids.stride(0), selected.stride(0),
+            GROUP_BUDGET=GROUP_BUDGET, COMPRESS_RATIO=COMPRESS_RATIO,
+            SELECTION_WIDTH=SELECTION_WIDTH, BLOCK_W=triton.next_power_of_2(SELECTION_WIDTH),
+            num_warps=8,
+        )
     torch.cuda.synchronize()
+    selected_cpu = selected.cpu()
 
     for row in range(rows):
-        ref_order = torch.argsort(
-            (-scores[row].double()) * 1e6 + torch.arange(total_groups, device=device).double()
-        )[:GROUP_BUDGET]
-        ref_sorted = torch.sort(ref_order.to(torch.int32)).values
-        assert torch.equal(out_ids[row], ref_sorted), f"row {row} tie-breaking mismatch"
+        expected = torch.full((SELECTION_WIDTH,), -1, dtype=torch.int32)
+        if request_ids[row].item() >= 0:
+            elig = int(global_eligible[row].item())
+            pos = int(query_positions[row].item())
+            ranked_gids = sorted(
+                range(elig),
+                key=lambda g: (-float(scores[row, g].item()), g),
+            )[:GROUP_BUDGET]
+            if world == 2:
+                ranked_gids.sort()
+            expanded_groups = [g * COMPRESS_RATIO + lane for g in ranked_gids for lane in range(COMPRESS_RATIO)]
+            tail_start = ((pos + 1) // COMPRESS_RATIO) * COMPRESS_RATIO
+            tail = list(range(tail_start, pos + 1))
+            full_positions = expanded_groups + tail
+            expected[:len(full_positions)] = torch.tensor(full_positions, dtype=torch.int32)
+        assert torch.equal(selected_cpu[row], expected), (
+            f"world={world} row={row} selection mismatch"
+        )
