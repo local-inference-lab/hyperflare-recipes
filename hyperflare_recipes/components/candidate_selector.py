@@ -77,9 +77,12 @@ class PreparedCandidateSelector:
 
     def score_shortlist(self, predecessor, position, selector_features, unary, ids):
         coded = self.weights["predecessor"][predecessor] * selector_features[:, position]
-        successors = self.weights["successor"][ids[:, position]]
+        row_ids = ids[:, position]
+        vocab = self.weights["successor"].shape[0]
+        valid = (row_ids >= 0) & (row_ids < vocab)
+        successors = self.weights["successor"][row_ids.clamp(0, vocab - 1)]
         correction = torch.bmm(successors, coded.unsqueeze(-1)).squeeze(-1)
-        return unary[:, position] + correction.float()
+        return torch.where(valid, unary[:, position] + correction.float(), -torch.inf)
 
     def _functional_correct(self, logits, predecessor, position, selector_features, unary, ids):
         coded = self.weights["predecessor"][predecessor] * selector_features

@@ -228,13 +228,13 @@ class PreparedParallelDraftRound:
                                                 dtype=torch.int64, device=device)
                 if direct_shortlist:
                     shortlist_scores_example = torch.empty(
-                        (b, self.draft_inputs.shape[1], self.shortlisted_selector.top_k),
+                        (b, self.shortlisted_selector.top_k),
                         dtype=torch.float32, device=device)
         for index, proposal in enumerate(proposals):
             bias = (None if self.markov is None else torch.empty((b, o.requests.vocab_size),
                 dtype=torch.float32, device=self.owner.requests.histogram.device))
             if direct_shortlist:
-                proposal.bind_shortlist_scores(shortlist_scores_example[:, index + o.logit_offset],
+                proposal.bind_shortlist_scores(shortlist_scores_example,
                                                shortlist_example[:, index + o.logit_offset])
             elif self.shortlisted_selector is not None and self.shortlisted_selector.top_k <= DRAFT_CANDIDATES:
                 proposal.bind_shortlist(shortlist_example[:, index + o.logit_offset])
@@ -490,7 +490,7 @@ class PreparedParallelDraftRound:
                 bias = self.markov(markov_token) if self.markov is not None else None
                 shortlist_scores = None
                 source_logits = None if draft_logits is None else draft_logits[:, position]
-                if sampler.has_shortlist_scores:
+                if getattr(sampler, "has_shortlist_scores", False):
                     proposal_logits = None
                     shortlist_scores = self.shortlisted_selector.score_shortlist(
                         markov_token, position, selector_features, unary, shortlist_ids)
@@ -513,9 +513,9 @@ class PreparedParallelDraftRound:
                     scratch["support_probabilities"] = block_state["support_probabilities"][i]
                 proposal_probabilities = sampler.run(scratch, proposal_logits,
                     source_logits=source_logits if sampler.has_source_logits else None,
-                    shortlist_scores=shortlist_scores,
                     shortlist_ids=None if shortlist_ids is None else shortlist_ids[:, position],
                     candidates=drafts, seed=seed, offset=base_offset + 4 * i, sampled=sampled,
+                    **({"shortlist_scores": shortlist_scores} if shortlist_scores is not None else {}),
                     **({"source_bias": bias} if sampler.has_source_logits and bias is not None else {}))
                 drafts[:, i].copy_(sampled)
                 if block_state is None:

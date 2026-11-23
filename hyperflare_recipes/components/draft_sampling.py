@@ -318,7 +318,7 @@ def _draft_scores_finish(BlockMax, Candidates, Slots, Generations, LiveRows, Gen
     tl.store(PackedTopP + row, tl.load(Params + safe * 6 + 1))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["candidate_stride", "score_stride", "id_stride"])
 def _draft_shortlist_score_candidates(
     ShortlistScores, ShortlistIds, Histogram, PrefixIds, Slots, Generations, LiveRows,
     Generation, Status, TopK, Params, GrammarMask, GrammarEnabled,

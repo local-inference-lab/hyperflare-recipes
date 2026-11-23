@@ -421,3 +421,140 @@ def test_parallel_draft_rejects_shortlist_output_without_direct_shortlist(select
     )
     with pytest.raises(ValueError, match="direct shortlist proposal scoring"):
         round_op.prepare()
+
+
+def test_score_shortlist_clamps_padded_out_of_bounds_ids():
+    """Padded out-of-vocabulary shortlist IDs do not index past successor weights and score as -inf."""
+    from hyperflare_recipes.components.candidate_selector import PreparedCandidateSelector
+    from hyperflare_recipes.components.dflash2 import PreparedDraft
+
+    batch, block, top_k, vocab, local_vocab, world, rank_dim = 2, 2, 16, 100, 64, 2, 8
+    tokens = batch * block
+    gen = torch.Generator().manual_seed(411)
+    # Row 0 has only 4 finite real logits and row 1 is entirely -inf, so padded columns (id >= vocab)
+    # tie at -inf and enter the merged top-k shortlist.
+    padded = torch.full((tokens, local_vocab * world), -torch.inf, dtype=torch.bfloat16)
+    padded[0, :4] = torch.tensor([1.5, -0.5, 2.0, 0.25], dtype=torch.bfloat16)
+    padded[2, :2] = torch.tensor([0.75, -1.25], dtype=torch.bfloat16)
+    shards = padded.chunk(world, dim=-1)
+    words_per_rank = ((top_k * 4 + 63) // 64) * 64 // 2
+
+    def make_draft(rank, gather):
+        draft = object.__new__(PreparedDraft)
+        draft.shortlist_output = True
+        draft.top_k, draft.world_size = top_k, world
+        draft.block_size, draft.vocabulary_size = block, vocab
+        draft.multiplier, draft.softcap = 1.0, None
+        draft.vocab_offset = torch.tensor(rank * local_vocab, dtype=torch.int32)
+        draft.shortlist_cols = words_per_rank * 2
+        draft.shortlist_gather = gather
+        return draft
+
+    packets = []
+    for rank in range(world):
+        captured = []
+        draft = make_draft(rank, lambda pkt, c=captured: (c.append(pkt.clone()), torch.cat((pkt, pkt), dim=-1))[1])
+        draft._shortlist_from_local_logits(shards[rank])
+        packets.append(captured[0])
+    unary, ids = make_draft(0, _FixedGather(torch.cat(packets, dim=-1)))._shortlist_from_local_logits(shards[0])
+    assert bool((ids >= vocab).any())
+
+    selector = object.__new__(PreparedCandidateSelector)
+    selector.top_k = top_k
+    selector.weights = {
+        "predecessor": torch.randn((vocab, rank_dim), generator=gen, dtype=torch.bfloat16),
+        "successor": torch.randn((vocab, rank_dim), generator=gen, dtype=torch.bfloat16),
+    }
+    features = torch.randn((batch, block, rank_dim), generator=gen, dtype=torch.bfloat16)
+    predecessor = torch.tensor([3, 7], dtype=torch.int64)
+    # Include an explicit negative ID as well as padded IDs >= vocab.
+    ids_with_neg = ids.clone()
+    ids_with_neg[1, 1, 0] = -1
+    got = selector.score_shortlist(predecessor, 1, features, unary, ids_with_neg)
+
+    row_ids = ids_with_neg[:, 1]
+    in_bounds = (row_ids >= 0) & (row_ids < vocab)
+    assert bool((~in_bounds).any())
+    assert torch.all(got[~in_bounds] == -torch.inf)
+    coded = selector.weights["predecessor"][predecessor] * features[:, 1]
+    for b_idx in range(batch):
+        for k_idx in range(top_k):
+            if in_bounds[b_idx, k_idx]:
+                tok = int(row_ids[b_idx, k_idx])
+                expected = unary[b_idx, 1, k_idx] + torch.dot(
+                    selector.weights["successor"][tok], coded[b_idx]
+                ).float()
+                assert torch.equal(got[b_idx, k_idx], expected)
+
+
+def test_parallel_draft_prepare_binds_2d_shortlist_scores_example(monkeypatch):
+    """Direct shortlist preparation binds a contiguous 2D score example matching score_shortlist output."""
+    from hyperflare_recipes.components import draft_sampling, parallel_draft
+    from ignition.components.sampling import DeviceRequestState
+
+    device = torch.device("cpu")
+    batch, width, block, top_k, vocab = 2, 3, 8, 12, 128
+    state = DeviceRequestState.allocate(device, vocab_size=vocab, capacity=2)
+    bound = []
+
+    class FakeProposal:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def bind_shortlist_scores(self, scores, ids):
+            bound.append((tuple(scores.shape), tuple(scores.stride()), tuple(ids.shape), tuple(ids.stride())))
+
+        def prepare(self):
+            pass
+
+        def functional(self, **kwargs):
+            return self
+
+    monkeypatch.setattr(parallel_draft, "PreparedDraftDistribution", FakeProposal)
+    monkeypatch.setattr(parallel_draft, "prepare_sampling_broadcasts", lambda *args, **kwargs: None)
+
+    round_op = object.__new__(parallel_draft.PreparedParallelDraftRound)
+    round_op.operations = None
+    round_op.vocabulary_parallel = False
+    round_op.proposal_only = True
+    round_op.generate_proposals = True
+    round_op.batch, round_op.width = batch, width
+    round_op.name = "test"
+    round_op.draft = SimpleNamespace(shortlist_output=True)
+    selector = SimpleNamespace(top_k=top_k, score_shortlist=lambda *args: None)
+    round_op.selector = round_op.shortlisted_selector = selector
+    round_op.markov = None
+    round_op.context = None
+    round_op.full_proposal = None
+    round_op.proposal_block = None
+    round_op.validator = SimpleNamespace(functional=lambda: None)
+    round_op.validation = SimpleNamespace(functional=lambda **kwargs: None)
+    round_op.draft.release_outputs = lambda: None
+    round_op.draft_inputs = torch.zeros((batch, block), dtype=torch.int64, device=device)
+    round_op.drafts = torch.zeros((batch, width - 1), dtype=torch.int64, device=device)
+    round_op.logits = torch.zeros((batch, 1, vocab), dtype=torch.float32, device=device)
+    round_op.seed = torch.zeros(batch, dtype=torch.int64, device=device)
+    round_op.offset = torch.zeros(batch, dtype=torch.int64, device=device)
+    round_op.sampled = torch.zeros(batch, dtype=torch.int64, device=device)
+    round_op.owner = SimpleNamespace(
+        requests=state,
+        session=None,
+        logit_offset=1,
+        collectives={"runtime": None, "vocabulary_runtime": None, "coordinator": None},
+        weights=SimpleNamespace(draft=SimpleNamespace()),
+        inputs=SimpleNamespace(
+            row_slot_ids=torch.zeros(batch, dtype=torch.int32, device=device),
+            row_generations=torch.zeros(batch, dtype=torch.int64, device=device),
+            live_rows=torch.zeros(1, dtype=torch.int32, device=device),
+            query_lengths=torch.full((batch,), width, dtype=torch.int32, device=device),
+        ),
+    )
+    round_op.prepare()
+    assert len(bound) == width - 1
+    for score_shape, score_stride, id_shape, id_stride in bound:
+        assert score_shape == (batch, top_k)
+        assert score_stride == (top_k, 1)
+        assert id_shape == (batch, top_k)
+        assert id_stride == (block * top_k, 1)
+    kernel = draft_sampling._draft_shortlist_score_candidates
+    assert {"candidate_stride", "score_stride", "id_stride"}.issubset(set(kernel.do_not_specialize))
