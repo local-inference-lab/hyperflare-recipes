@@ -107,8 +107,7 @@ def _context(compact):
     written = []
     context = object.__new__(PreparedContext)
     context.compact, context.window = compact, WINDOW
-    context.weights = SimpleNamespace(shard=None, config=SimpleNamespace(draft=SimpleNamespace(
-        attention=SimpleNamespace(local=lambda shard: (1, 1), key_dim=KEY, value_dim=VALUE))))
+    context.kv_heads, context.key_dim, context.value_dim = 1, KEY, VALUE
     context.project = context.gather = context.norm = context.project_kv = lambda value: value
     context.inverse = 1.0 / (10000 ** (torch.arange(0, KEY, 2, dtype=torch.float32) / KEY))
     context.layers = [(lambda value: value, lambda key, value, slots: written.append((key, value, slots)))]
@@ -160,3 +159,77 @@ def test_context_rotates_and_places_retained_tokens(chunk, metadata_type):
     if compact:
         assert not torch.equal(key, _rotary(source, torch.arange(rows), context.inverse))
     assert torch.equal(value, auxiliary[:, KEY:].view(rows, 1, VALUE))
+
+
+class _TensorWriter:
+    def __init__(self, key, value, slots):
+        self.key, self.value, self.slots = key, value, slots
+
+    def __call__(self, key, value, slots):
+        self.key.copy_(key)
+        self.value.copy_(value)
+        self.slots.copy_(slots)
+
+
+class _ContextForward:
+    def __init__(self, context, auxiliary, counts, metadata):
+        self.context, self.auxiliary, self.counts, self.metadata = context, auxiliary, counts, metadata
+
+    def __call__(self):
+        self.context(self.auxiliary, self.counts, self.metadata)
+
+
+def _execute_forward(forward):
+    forward()
+
+
+@pytest.mark.parametrize("chunk", [1024, 4096])
+def test_context_aot_guards_match_across_tp_ranks(chunk):
+    """AOT-compiled PreparedContext guards must not depend on TensorParallelShard.rank."""
+    from torch._dynamo.aot_compile_types import GraphModuleSerializableCallable
+    from hyperflare_recipes.components.dflash2 import PreparedContext
+
+    compact = chunk > WINDOW
+    rows = WINDOW if compact else chunk
+    geometry = DraftAttentionGeometry(4, 2, KEY, VALUE, KEY, 10000., WINDOW)
+
+    def build(rank):
+        shard = TensorParallelShard(rank, 2)
+        _, kv_heads = geometry.local(shard)
+        out_key = torch.zeros((rows, kv_heads, KEY), dtype=torch.bfloat16)
+        out_value = torch.zeros((rows, kv_heads, VALUE), dtype=torch.bfloat16)
+        out_slots = torch.full((rows,), -1, dtype=torch.int64)
+        context = object.__new__(PreparedContext)
+        context.compact, context.window = compact, WINDOW
+        context.kv_heads, context.key_dim, context.value_dim = kv_heads, KEY, VALUE
+        context.weights = SimpleNamespace(shard=shard, config=SimpleNamespace(draft=SimpleNamespace(attention=geometry)))
+        context.project = context.gather = context.norm = context.project_kv = lambda value: value
+        context.inverse = 1.0 / (10000 ** (torch.arange(0, KEY, 2, dtype=torch.float32) / KEY))
+        context.layers = [(lambda value: value, _TensorWriter(out_key, out_value, out_slots))]
+        auxiliary = torch.randn((rows, kv_heads * (KEY + VALUE)),
+                                generator=torch.Generator().manual_seed(11 + rank)).bfloat16()
+        counts = torch.tensor([chunk], dtype=torch.int32)
+        metadata = _chunk_metadata(chunk, three_axis=False)
+        return _ContextForward(context, auxiliary, counts, metadata), (out_key, out_value, out_slots)
+
+    rank0_forward, _ = build(0)
+    rank1_forward, (out_key, out_value, out_slots) = build(1)
+    compiled = torch.compile(
+        _execute_forward,
+        backend=lambda graph, inputs: GraphModuleSerializableCallable(graph),
+        fullgraph=True,
+        dynamic=False,
+    ).aot_compile(((rank0_forward,), {}))
+    assert compiled.guard_check(rank0_forward)
+    assert compiled.guard_check(rank1_forward)
+
+    rank1_forward()
+    expected_key, expected_value, expected_slots = out_key.clone(), out_value.clone(), out_slots.clone()
+    out_key.zero_()
+    out_value.zero_()
+    out_slots.fill_(-1)
+
+    compiled(rank1_forward)
+    assert torch.equal(out_key, expected_key)
+    assert torch.equal(out_value, expected_value)
+    assert torch.equal(out_slots, expected_slots)

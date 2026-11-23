@@ -107,7 +107,6 @@ class PreparedContext:
 
     def __init__(self, weights, auxiliary, metadata, pool, *, session, name, workspace,
                  runtime, coordinator, compact_prefill=False, examples=None):
-        self.weights = weights
         c, a = weights.config.draft, weights.config.draft.attention
         self.window = a.window
         tokens, hidden = auxiliary.shape[0], c.text["hidden_size"]
@@ -117,6 +116,7 @@ class PreparedContext:
                 raise ValueError("compact prefill context requires one retained window of auxiliary rows")
         self.compact = compact
         _, kv_heads = a.local(weights.shard)
+        self.kv_heads, self.key_dim, self.value_dim = kv_heads, a.key_dim, a.value_dim
         self.inverse = _inverse(a, auxiliary.device)
         local = declaration_tensor(examples, "dflash.context.local",
             (tokens, hidden // weights.shard.world_size), torch.bfloat16, auxiliary.device)
@@ -171,14 +171,12 @@ class PreparedContext:
         slots = torch.where(valid, states * self.window + positions.remainder(self.window), -1)
         projected = self.norm(self.gather(self.project(auxiliary)))
         kv = self.project_kv(projected)
-        a = self.weights.config.draft.attention
-        _, kv_heads = a.local(self.weights.shard)
-        key_shape = (auxiliary.shape[0], kv_heads, a.key_dim)
-        width = kv_heads * a.key_dim
-        chunks = kv.view(auxiliary.shape[0], len(self.layers), width + kv_heads * a.value_dim)
+        key_shape = (auxiliary.shape[0], self.kv_heads, self.key_dim)
+        width = self.kv_heads * self.key_dim
+        chunks = kv.view(auxiliary.shape[0], len(self.layers), width + self.kv_heads * self.value_dim)
         for index, (norm, writer) in enumerate(self.layers):
             key = _rotary(norm(chunks[:, index, :width].view(key_shape)), rope, self.inverse)
-            value = chunks[:, index, width:].view(auxiliary.shape[0], kv_heads, a.value_dim).contiguous()
+            value = chunks[:, index, width:].view(auxiliary.shape[0], self.kv_heads, self.value_dim).contiguous()
             writer(key, value, slots)
 
     def scratch_tensors(self):
