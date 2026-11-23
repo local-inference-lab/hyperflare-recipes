@@ -21,6 +21,7 @@ from hyperflare_recipes.components.parallel import TensorParallelShard
 from ignition.preparation.tuning import register_finalizer
 
 from .attention import AttentionIndices, AttentionScratch, PreparedAttention, PreparedGlobalKV, Rotary, normalize
+from .decoder_halves import ChunkHalves, PendingHalvesCarry, PreparedHalvesLayer, halves_size
 from .decoder_prefill import PreparedDecoderSuffix
 from .engram import EngramScratch, PreparedEngram, PreparedTableRequests
 
@@ -245,7 +246,8 @@ class PreparedLayer:
 class PreparedDecoder:
     def __init__(self, weights, tables, scratch, metadata, pool, *, mode, runtime,
                  vocabulary_runtime, coordinator, session, name, workspace,
-                 vision=None, mla_compute_mode="auto", scoring=None, vocabulary_parallel=False, examples=None):
+                 vision=None, mla_compute_mode="auto", scoring=None, vocabulary_parallel=False, examples=None,
+                 suffix_runtime=None, halves=None):
         if scratch.local_logits.dtype != torch.float32 or scratch.logits.dtype != torch.float32:
             raise ValueError("DeepSeek target vocabulary logits require FP32 storage")
         self.weights, self.scratch, self.metadata, self.pool = weights, scratch, metadata, pool
@@ -290,13 +292,21 @@ class PreparedDecoder:
                 tokens=self.output_metadata.positions.numel(),
                 page_size=128 + self.output_metadata.max_query_tokens, width=128,
                 replay_start=self.packing.replay_start, ratios=set(ratios[decoder_start:]) - {0})
+        self.halves = None
+        if halves is not None and mode == "prefill" and scoring is None and decoder_start is not None:
+            size = halves_size(metadata.positions.numel())
+            if size is not None:
+                self.halves = ChunkHalves(metadata, size, ratios=set(prefix_ratios) - {0})
         self.layers, carry = [], False
         for index, layer in enumerate(weights.layers):
             boundary = replay_start = None
             layer_scratch, layer_metadata = scratch, metadata
+            layer_runtime = runtime
             if self.packing is not None and index >= decoder_start:
                 layer_scratch, layer_metadata = self.output_scratch, self.output_metadata
                 replay_start = self.packing.replay_start
+                if suffix_runtime is not None:
+                    layer_runtime = suffix_runtime
                 if index == decoder_start:
                     boundary = PreparedDecoderBoundary(index, layer, scratch, layer_scratch, self.packing,
                         pool, self.rotary, carry=carry, session=session, name=f"{name}.layer{index}", workspace=workspace,
@@ -306,14 +316,22 @@ class PreparedDecoder:
                                                       if key not in ("compressor", "index_k", "index_norm")})
             defer = (index + 1 < len(weights.layers) and weights.layers[index + 1].engram is None
                      and index + 1 not in self.aux_layers)
-            self.layers.append(PreparedLayer(index, layer, tables, layer_scratch, layer_metadata, pool, self.rotary,
-                shard=weights.shard, mode=mode, runtime=runtime,
-                coordinator=coordinator, session=session, name=f"{name}.layer{index}", workspace=workspace,
-                carry=carry, defer_post=defer, boundary=boundary, replay_start=replay_start,
-                window_staging=None if self.window_commit is None else self.window_commit.staging[index],
-                mla_compute_mode=mla_compute_mode,
-                window_metadata=(self.window_metadata if layer_metadata is metadata else self.suffix_window_metadata),
-                examples=examples))
+            if self.halves is not None and index < decoder_start:
+                half_runtimes, sides = halves
+                self.layers.append(PreparedHalvesLayer(index, layer, tables, layer_scratch, layer_metadata,
+                    self.halves, pool, self.rotary, shard=weights.shard, runtime=layer_runtime,
+                    coordinator=coordinator, session=session, name=f"{name}.layer{index}", workspace=workspace,
+                    carry=carry, defer_post=defer, half_runtimes=half_runtimes, sides=sides,
+                    mla_compute_mode=mla_compute_mode, examples=examples))
+            else:
+                self.layers.append(PreparedLayer(index, layer, tables, layer_scratch, layer_metadata, pool, self.rotary,
+                    shard=weights.shard, mode=mode, runtime=layer_runtime,
+                    coordinator=coordinator, session=session, name=f"{name}.layer{index}", workspace=workspace,
+                    carry=carry, defer_post=defer, boundary=boundary, replay_start=replay_start,
+                    window_staging=None if self.window_commit is None else self.window_commit.staging[index],
+                    mla_compute_mode=mla_compute_mode,
+                    window_metadata=(self.window_metadata if layer_metadata is metadata else self.suffix_window_metadata),
+                    examples=examples))
             carry = defer
         self.scoring = None if scoring is None else scoring.prepare(scratch.embedding, weights.head,
             vocabulary=129280, session=session, coordinator=coordinator, name=name + ".prompt",
@@ -321,6 +339,8 @@ class PreparedDecoder:
         self._prepare_head(vocabulary_parallel=vocabulary_parallel, vocabulary_runtime=vocabulary_runtime,
             coordinator=coordinator, session=session, name=name, workspace=workspace)
         self.window_metadata.functional()
+        if self.halves is not None:
+            self.halves.functional()
         if self.suffix_window_metadata is not None:
             self.suffix_window_metadata.functional()
             self.packing.functional()
@@ -363,6 +383,7 @@ class PreparedDecoder:
         pre_mix[:, 0].fill_(1)
         incoming = (residual,)
         indices = self.window_metadata(metadata)
+        halves_state = None if self.halves is None else self.halves.begin(metadata)
         selection = (torch.full((embedding.shape[0], 512), -1, dtype=torch.int32, device=embedding.device), None, None)
         staging = (None if self.staging_shape is None else torch.zeros(
             self.staging_shape, dtype=torch.uint8, device=embedding.device))
@@ -371,6 +392,8 @@ class PreparedDecoder:
         for index, layer in enumerate(self.layers):
             boundary = None
             if layer.boundary is not None:
+                if isinstance(incoming, PendingHalvesCarry):
+                    incoming = incoming.materialize()
                 suffix, state, attn_mix = layer.boundary(incoming, pre_mix, metadata, indices,
                                                         layer.attention.selectors[0])
                 metadata = suffix.metadata
@@ -379,13 +402,21 @@ class PreparedDecoder:
                 selection = (torch.full((metadata.positions.numel(), 512), -1,
                                        dtype=torch.int32, device=embedding.device), None, None)
             if index in self.aux_layers:
+                if isinstance(incoming, PendingHalvesCarry):
+                    incoming = incoming.materialize()
                 feedback = incoming[0].float().mean(1)
                 if suffix is not None:
                     feedback = torch.where(suffix.live[:, None], feedback, 0)
                 column = self.aux_layers.index(index)
                 auxiliary[:, column * 5120:(column + 1) * 5120].copy_(feedback)
-            incoming, pre_mix, record, selection = layer(incoming, pre_mix, metadata, indices, selection,
-                boundary=boundary, window_cache=None if staging is None else staging[index])
+            if isinstance(layer, PreparedHalvesLayer):
+                incoming, pre_mix, record, selection = layer(incoming, pre_mix, metadata, indices, selection,
+                    halves_state=halves_state, boundary=boundary, window_cache=None)
+            else:
+                if isinstance(incoming, PendingHalvesCarry):
+                    incoming = incoming.materialize()
+                incoming, pre_mix, record, selection = layer(incoming, pre_mix, metadata, indices, selection,
+                    boundary=boundary, window_cache=None if staging is None else staging[index])
             records.append(record)
         residual, = incoming
         samples = metadata.sample_indices

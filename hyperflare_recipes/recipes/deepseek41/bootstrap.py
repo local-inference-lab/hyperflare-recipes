@@ -371,6 +371,21 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         collective, prefill_collective, vocabulary_collective, result_collective, draft_vocabulary_collective = _collective_runtimes(
             config, group, device, coordinator=coordinator, core_storage=core_storage,
             verification_samples=verification_samples)
+        from b12x.comm import pcie
+        from ignition.components.collectives import SideStream
+        from .decoder_halves import halves_size
+
+        half_collectives = ()
+        prefill_halves = None
+        half_size = halves_size(config.prefill_chunk_size)
+        if (half_size is not None and not coordinator.spans_hosts and shard.world_size > 1
+                and isinstance(prefill_collective, pcie.DmaAllReduce)):
+            half_collectives = tuple(
+                create_dma_all_reduce_runtime(group, device, max_tokens=half_size, hidden_size=5120,
+                    ipc=core_storage.peer_storage)
+                for _ in range(2)
+            )
+            prefill_halves = (half_collectives, (SideStream(device), SideStream(device)))
         sampling_collective = logprob_collective = None
         if config.vocabulary_parallel_sampling and shard.world_size > 1:
             sampling_collective = (collective if coordinator.spans_hosts else create_all_gather_runtime(
@@ -485,7 +500,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                     decoder = decoder_factory(mode_weights, tables, scratch[name], metadata[name], pool,
                         mode=mode,
                         scoring=scoring if kind == "scored_prefill" else None,
-                        runtime=prefill_collective if mode == "prefill" and capacity >= 128 else collective,
+                        runtime=prefill_collective if mode == "prefill" and capacity > config.all_reduce_tokens else collective,
+                        suffix_runtime=(collective if mode == "prefill" and config.all_reduce_tokens >= 128 else None),
+                        halves=(prefill_halves if mode == "prefill" and kind == "prefill"
+                                and halves_size(capacity) is not None else None),
                         vocabulary_runtime=vocabulary_collective,
                         coordinator=coordinator, session=session, name=name, workspace=arena)
                     batch = PreparedBatch(inputs, requests, metadata[name], mode=mode, shard=shard, pool=pool,
@@ -649,10 +667,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         core_data=tables if rank == 0 else None,
         resources=(scoring, weights, tables, pool, requests, inputs, admission, commands, forwards,
             compiled, stream, graph_pool, session,
-            collective, prefill_collective, vocabulary_collective, draft_vocabulary_collective, result_collective, sampling_collective, logprob_collective, coordinator, speculation, confidence,
+            collective, prefill_collective, *half_collectives, vocabulary_collective, draft_vocabulary_collective, result_collective, sampling_collective, logprob_collective, coordinator, speculation, confidence,
             vision_state, vision_inputs, vision_prefill, feature_pool),
         close_resources=tuple(dict.fromkeys(c for c in
-            (scoring, sampling_collective, logprob_collective, result_collective, prefill_collective, vocabulary_collective, draft_vocabulary_collective, collective) if c is not None)))
+            (scoring, sampling_collective, logprob_collective, result_collective, *half_collectives, prefill_collective, vocabulary_collective, draft_vocabulary_collective, collective) if c is not None)))
     if confidence is not None:
         model.proposal_confidence = confidence.host_view
     return model

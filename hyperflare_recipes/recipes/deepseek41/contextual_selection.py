@@ -78,6 +78,8 @@ def catalog_contexts(forwards, signatures):
             found = False
             for index, layer in enumerate(decoder.layers):
                 attention = layer.attention
+                if isinstance(attention, list):
+                    continue
                 if (attention.norm_quant is None or layer.engram is not None
                         or layer.boundary is not None or attention.global_kv is not None):
                     continue
