@@ -622,6 +622,18 @@ def _fake_parallel_mx_projections(source, values, scales, outputs, workspaces, p
 class ParallelProjections:
     """Two prepared MX projections with explicit storage and a captured join."""
 
+    @staticmethod
+    def supports(*projections) -> bool:
+        from b12x.gemm.blockscaled._a16 import _weight_parts
+
+        for projection in projections:
+            if not isinstance(projection, QuantizedProjection) or projection.bias is not None:
+                return False
+            values, _, gain, fp4 = _weight_parts(projection.weight)
+            if values.dtype not in (torch.float8_e4m3fn, torch.uint8) or gain is not None or fp4:
+                return False
+        return bool(projections)
+
     def __init__(self, main: QuantizedProjection, auxiliary: QuantizedProjection, *, session,
                  workspace: ScratchArena):
         from b12x.gemm.blockscaled._a16 import _weight_parts
@@ -662,6 +674,18 @@ class ParallelProjections:
                                 workspaces, self.plans, self.stream_handle)
         if self.outputs is None:
             return tuple(outputs)
+
+    def start(self, source):
+        """Launch both projections across main and auxiliary streams without joining."""
+        outputs, workspaces = self.outputs, self.workspaces
+        if outputs is None:
+            outputs = [torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
+                       for shape, stride, dtype in self.output_layouts]
+            workspaces = [torch.empty(size, dtype=torch.uint8, device=source.device)
+                          for size in self.workspace_sizes]
+        _parallel_mx_projections(source, self.values, self.scales, outputs,
+                                workspaces, self.plans, self.stream_handle, False)
+        return tuple(outputs), tuple(workspaces)
 
     def functional(self, *, session):
         """Allocate disjoint branch buffers while preserving the prepared fork and join."""

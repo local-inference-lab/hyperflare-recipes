@@ -334,7 +334,12 @@ class PreparedAttention:
                 self.projections["qkv_proj"], self.projections["indexer.index_qk_proj"],
                 session=session, workspace=workspace,
             )
-            if use_sharded and concurrent and workspace.overlap else None
+            if (use_sharded and isinstance(workspace, ScratchArena) and workspace.overlap
+                and workspace is projection_workspace and (qsa_shard_mode == "group" or self.tokens <= 16)
+                and ParallelProjections.supports(
+                    self.projections["qkv_proj"], self.projections["indexer.index_qk_proj"]
+                ))
+            else None
         )
         self.concurrent = (ConcurrentAttention(self, session=session, workspace=workspace)
                            if not use_sharded and concurrent and workspace.overlap else None)
@@ -395,7 +400,23 @@ class PreparedAttention:
         self.binding = self.binding_kwargs = self.write_kwargs = self.workspace = None
 
     def __call__(self, source: torch.Tensor, metadata) -> torch.Tensor | None:
-        if self.parallel_projections is not None:
+        pending_sharded = None
+        if self.sharded is not None and self.sharded.overlap:
+            if self.parallel_projections is not None:
+                (projected_qkv, projected_index), projection_workspaces = self.parallel_projections.start(source)
+                pending_sharded = self.sharded.start_group_selection(
+                    source, projected_index, metadata, self.constants, self.workspace_bytes,
+                    fork_from_main=False, projection_workspaces=projection_workspaces,
+                )
+            else:
+                projected_index = self.projections["indexer.index_qk_proj"](source)
+                pending_sharded = self.sharded.start_group_selection(
+                    source, projected_index, metadata, self.constants, self.workspace_bytes,
+                    fork_from_main=True,
+                )
+                projected_qkv = self.projections["qkv_proj"](source)
+            projection_workspaces = None
+        elif self.parallel_projections is not None:
             projected_qkv, projected_index = self.parallel_projections(source)
             projection_workspaces = None
         elif self.concurrent is None:
@@ -417,23 +438,28 @@ class PreparedAttention:
         paged_kv_write.run(self.writer, key=key, value=value, k_cache=self.state.main_k_cache,
             v_cache=self.state.main_v_cache, slot_mapping=metadata.slot_mapping,
             k_scale=self.constants["k_descale"], v_scale=self.constants["v_descale"])
-        attended = torch.empty((self.tokens, self.q_heads, 256), dtype=source.dtype, device=source.device)
-        selected = torch.empty((self.tokens, 2051), dtype=torch.int32, device=source.device)
-        bindings = {**self.constants, "main_block_table": metadata.main_block_table,
-            "compressed_block_table": metadata.compressed_block_table,
-            "raw_state_slot_ids": metadata.raw_state_slot_ids, "output": attended,
-            "selected_positions": selected}
-        dynamic = {"query": query, "index_query": projected_index[:, :512].view(self.tokens, 4, 128),
-            "raw_index_key": projected_index[:, 512:], **{name: getattr(metadata, name) for name in
-                ("request_ids", "query_positions", "rope_positions", "sequence_lengths", "query_start_loc",
-                 "num_accepted_tokens", "is_prefilling")}}
-        if self.sharded is not None:
-            self.sharded(source, bindings, dynamic, self.workspace_bytes)
-        elif self.concurrent is None:
-            workspace = torch.empty(self.workspace_bytes, dtype=torch.uint8, device=source.device)
-            self.functional_qsa(source, bindings, dynamic, workspace)
+        if pending_sharded is not None:
+            attended, selected = self.sharded.finish_group_selection(
+                pending_sharded, query, metadata, self.workspace_bytes,
+            )
         else:
-            self.concurrent.attend_runtime(source, bindings, dynamic, projection_workspaces)
+            attended = torch.empty((self.tokens, self.q_heads, 256), dtype=source.dtype, device=source.device)
+            selected = torch.empty((self.tokens, 2051), dtype=torch.int32, device=source.device)
+            bindings = {**self.constants, "main_block_table": metadata.main_block_table,
+                "compressed_block_table": metadata.compressed_block_table,
+                "raw_state_slot_ids": metadata.raw_state_slot_ids, "output": attended,
+                "selected_positions": selected}
+            dynamic = {"query": query, "index_query": projected_index[:, :512].view(self.tokens, 4, 128),
+                "raw_index_key": projected_index[:, 512:], **{name: getattr(metadata, name) for name in
+                    ("request_ids", "query_positions", "rope_positions", "sequence_lengths", "query_start_loc",
+                     "num_accepted_tokens", "is_prefilling")}}
+            if self.sharded is not None:
+                self.sharded(source, bindings, dynamic, self.workspace_bytes)
+            elif self.concurrent is None:
+                workspace = torch.empty(self.workspace_bytes, dtype=torch.uint8, device=source.device)
+                self.functional_qsa(source, bindings, dynamic, workspace)
+            else:
+                self.concurrent.attend_runtime(source, bindings, dynamic, projection_workspaces)
         if self.cache_only:
             return None
         if self.sparse is not None:

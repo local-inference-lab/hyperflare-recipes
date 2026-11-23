@@ -357,6 +357,55 @@ def _fake_qsa_attend_selected(reads, output, workspace, handle):
     pass
 
 
+@torch.library.custom_op(
+    "flare::qsa_group_select_async",
+    mutates_args=("cache_writes", "aux_workspace", "aux_buffers", "selected_positions"),
+)
+def _qsa_group_select_async_op(
+    source: torch.Tensor,
+    cache_reads: list[torch.Tensor],
+    cache_writes: list[torch.Tensor],
+    select_reads: list[torch.Tensor],
+    aux_workspace: torch.Tensor,
+    aux_buffers: list[torch.Tensor],
+    selected_positions: torch.Tensor,
+    cache_ws_bytes: int,
+    handle: int,
+    stream_handle: int,
+    fork_from_main: bool,
+) -> None:
+    _SHARDED_CONTEXTS[handle].run_group_select_async(
+        cache_reads, cache_writes, select_reads, aux_workspace, aux_buffers,
+        selected_positions, cache_ws_bytes, stream_handle, fork_from_main,
+    )
+
+
+@_qsa_group_select_async_op.register_fake
+def _fake_qsa_group_select_async(
+    source, cache_reads, cache_writes, select_reads, aux_workspace, aux_buffers,
+    selected_positions, cache_ws_bytes, handle, stream_handle, fork_from_main,
+):
+    pass
+
+
+@torch.library.custom_op("flare::qsa_attend_joined", mutates_args=("output", "workspace"))
+def _qsa_attend_joined_op(
+    reads: list[torch.Tensor],
+    keepalive: list[torch.Tensor],
+    output: torch.Tensor,
+    workspace: torch.Tensor,
+    cache_ws_bytes: int,
+    handle: int,
+    stream_handle: int,
+) -> None:
+    _SHARDED_CONTEXTS[handle].run_attend_joined(reads, output, workspace, cache_ws_bytes, stream_handle)
+
+
+@_qsa_attend_joined_op.register_fake
+def _fake_qsa_attend_joined(reads, keepalive, output, workspace, cache_ws_bytes, handle, stream_handle):
+    pass
+
+
 def sharded_score_workspace_bytes(select_rows: int, context: int, device: torch.device) -> int | None:
     """Choose QSA score workspace size for a selection plan."""
     from hyperflare_recipes.components import sm103
@@ -394,9 +443,17 @@ class PreparedShardedQSA:
         self.rank = rank
         self.world_size = world_size
         self.tokens = attention.tokens
+        self.q_heads = attention.q_heads
         self.device = attention.scratch.query.device
         self.plan = attention.plan
         self.selection_only = attention.sparse is not None
+        self.overlap = (
+            mode == "group"
+            and isinstance(workspace, ScratchArena)
+            and workspace.overlap
+        )
+        self.stream = workspace.auxiliary_stream if self.overlap else None
+        self.stream_handle = self.stream.cuda_stream if self.stream is not None else 0
         self.batch, self.table_width = attention.metadata.main_block_table.shape
         self.page_size = attention.state.main_k_cache.shape[1]
         self.context = self.table_width * self.page_size
@@ -774,6 +831,159 @@ class PreparedShardedQSA:
             v_descale=v_descale,
         )
         _run_attention(binding, query=query, request_ids=request_ids, query_positions=query_positions)
+
+    def run_group_select_async(
+        self, cache_reads, cache_writes, select_reads, aux_workspace, aux_buffers,
+        selected_positions, cache_ws_bytes, stream_handle, fork_from_main,
+    ):
+        auxiliary = torch.cuda.ExternalStream(stream_handle, device=aux_workspace.device)
+        if fork_from_main:
+            auxiliary.wait_stream(torch.cuda.current_stream(aux_workspace.device))
+        (
+            main_k, main_v, comp_k, raw_k_ring, raw_pos, raw_rope, raw_anchor,
+            index_q_norm, index_k_norm, rope_cos, rope_sin, k_descale, v_descale,
+            comp_table, out_buf, index_query, request_ids, query_positions,
+            rope_positions, sequence_lengths,
+        ) = select_reads
+        half_table, local_pos, local_seq_len, global_eligible, send, gathered = aux_buffers[:6]
+        half_width = self.table_width // self.world_size
+        block_t = 256
+        tiles = triton.cdiv(half_width, block_t)
+        count = len(self.cache_read_names)
+        full_cache_reads = (
+            list(cache_reads[:count])
+            + [out_buf, selected_positions]
+            + list(cache_reads[count:])
+        )
+        common_constants = [
+            main_k, main_v, comp_k, raw_k_ring, raw_pos, raw_rope, raw_anchor,
+            index_q_norm, index_k_norm, rope_cos, rope_sin, k_descale, v_descale,
+        ]
+        with torch.cuda.stream(auxiliary):
+            self.run_cache_only(full_cache_reads, cache_writes, aux_workspace[:cache_ws_bytes])
+            _prepare_group_inputs_kernel[(self.batch * tiles + 1,)](
+                comp_table, half_table, request_ids, query_positions, sequence_lengths,
+                self.rank_tensor, local_pos, local_seq_len, global_eligible,
+                comp_table.stride(0), half_table.stride(0),
+                HALF_WIDTH=half_width, TILES=tiles, BATCH=self.batch, ROWS=self.tokens,
+                BLOCK_T=block_t, BLOCK_R=triton.next_power_of_2(self.tokens),
+                BLOCK_B=triton.next_power_of_2(self.batch),
+                PAGE_GROUPS=COMPRESSED_PAGE_SIZE, WORLD=self.world_size, num_warps=4,
+            )
+            self.run_select(
+                common_constants + [
+                    half_table, half_table, out_buf, selected_positions,
+                    index_query, request_ids, local_pos, rope_positions, local_seq_len,
+                ],
+                send,
+                aux_workspace[:self.select_workspace_bytes],
+            )
+            self.gather.run_eager(send, gathered)
+            if self.world_size == 2:
+                _merge_and_expand_group_candidates_2_kernel[(self.tokens,)](
+                    gathered.view(torch.int32), global_eligible, request_ids,
+                    query_positions, selected_positions, selected_positions.stride(0),
+                    TOPK=GROUP_BUDGET, COMPRESS_RATIO=COMPRESS_RATIO, SELECTION_WIDTH=SELECTION_WIDTH,
+                    num_warps=8,
+                )
+            else:
+                merged_ids = aux_buffers[6]
+                _merge_group_candidates_n_kernel[(self.tokens,)](
+                    gathered.view(torch.int32), merged_ids, WORLD=self.world_size, TOPK=GROUP_BUDGET,
+                    num_warps=16,
+                )
+                _expand_groups_kernel[(self.tokens,)](
+                    merged_ids, global_eligible, request_ids, query_positions, selected_positions,
+                    merged_ids.stride(0), selected_positions.stride(0),
+                    GROUP_BUDGET=GROUP_BUDGET, COMPRESS_RATIO=COMPRESS_RATIO,
+                    SELECTION_WIDTH=SELECTION_WIDTH, BLOCK_W=triton.next_power_of_2(SELECTION_WIDTH),
+                    num_warps=8,
+                )
+
+    def run_attend_joined(self, reads, output, workspace, cache_ws_bytes, stream_handle):
+        main = torch.cuda.current_stream(output.device)
+        main.wait_stream(torch.cuda.ExternalStream(stream_handle, device=output.device))
+        if not self.selection_only:
+            self.run_attend(reads, output, workspace[:cache_ws_bytes])
+
+    def start_group_selection(
+        self, source, projected_index, metadata, constants, full_workspace_bytes,
+        *, fork_from_main: bool, projection_workspaces=(),
+    ):
+        device = source.device
+        attended = torch.empty((self.tokens, self.q_heads, 256), dtype=source.dtype, device=device)
+        selected = torch.empty((self.tokens, SELECTION_WIDTH), dtype=torch.int32, device=device)
+        # Transient query buffer satisfies b12x cache_only's non-aliasing ABI check without touching qkv_proj.
+        dummy_query = torch.empty((self.tokens, self.q_heads, 256), dtype=source.dtype, device=device)
+        index_query = projected_index[:, :512].view(self.tokens, 4, 128)
+        raw_index_key = projected_index[:, 512:]
+        bindings = {
+            **constants,
+            "main_block_table": metadata.main_block_table,
+            "compressed_block_table": metadata.compressed_block_table,
+            "raw_state_slot_ids": metadata.raw_state_slot_ids,
+        }
+        dynamic_fields = {
+            "query": dummy_query,
+            "index_query": index_query,
+            "raw_index_key": raw_index_key,
+            **{name: getattr(metadata, name) for name in (
+                "request_ids", "query_positions", "rope_positions", "sequence_lengths",
+                "query_start_loc", "num_accepted_tokens", "is_prefilling",
+            )},
+        }
+        cache_reads = (
+            [bindings[name] for name in self.cache_read_names]
+            + [dynamic_fields[name] for name in _FULL_DYNAMIC_FIELDS]
+        )
+        cache_writes = [bindings[name] for name in _CACHE_MUTABLE_FIELDS]
+        common_constants = [
+            bindings["main_k_cache"], bindings["main_v_cache"], bindings["compressed_k_cache"],
+            bindings["raw_k_ring"], bindings["raw_logical_positions"],
+            bindings["raw_rope_positions"], bindings["raw_interval_start_positions"],
+            bindings["index_q_norm_weight"], bindings["index_k_norm_weight"],
+            bindings["rope_cos"], bindings["rope_sin"],
+            bindings["k_descale"], bindings["v_descale"],
+        ]
+        select_reads = common_constants + [
+            metadata.compressed_block_table, attended, index_query,
+            metadata.request_ids, metadata.query_positions, metadata.rope_positions,
+            metadata.sequence_lengths,
+        ]
+        half_width = self.table_width // self.world_size
+        aux_workspace = torch.empty(
+            max(full_workspace_bytes, self.select_workspace_bytes), dtype=torch.uint8, device=device
+        )
+        aux_buffers = [
+            torch.empty((self.batch, half_width), dtype=torch.int32, device=device),
+            torch.empty_like(metadata.query_positions),
+            torch.empty_like(metadata.sequence_lengths),
+            torch.empty((self.tokens,), dtype=torch.int32, device=device),
+            torch.empty(self.send_shape, dtype=torch.bfloat16, device=device),
+            torch.empty((self.local_rows, self.send_shape[1] * self.world_size), dtype=torch.bfloat16, device=device),
+        ]
+        if self.world_size != 2:
+            aux_buffers.append(torch.empty((self.tokens, GROUP_BUDGET), dtype=torch.int32, device=device))
+        _qsa_group_select_async_op(
+            source, cache_reads, cache_writes, select_reads,
+            aux_workspace, aux_buffers, selected, full_workspace_bytes,
+            self.handle, self.stream_handle, fork_from_main,
+        )
+        keepalive = [source, projected_index, dummy_query, *projection_workspaces, *aux_buffers]
+        return (attended, selected, aux_workspace, common_constants, keepalive)
+
+    def finish_group_selection(self, pending, query, metadata, full_workspace_bytes):
+        attended, selected, aux_workspace, common_constants, keepalive = pending
+        attend_reads = common_constants + [
+            metadata.main_block_table, metadata.compressed_block_table,
+            metadata.raw_state_slot_ids, selected,
+            query, metadata.request_ids, metadata.query_positions,
+        ]
+        _qsa_attend_joined_op(
+            attend_reads, keepalive, attended, aux_workspace,
+            full_workspace_bytes, self.handle, self.stream_handle,
+        )
+        return attended, selected
 
     def __call__(self, source, bindings, dynamic, full_workspace_bytes):
         device = source.device

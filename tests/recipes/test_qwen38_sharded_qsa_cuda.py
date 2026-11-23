@@ -40,11 +40,20 @@ def _make_dummy_qsa_module(device: torch.device):
     return module
 
 
-def _make_weights(device: torch.device, q_heads: int, kv_heads: int, seed: int):
+def _make_weights(device: torch.device, q_heads: int, kv_heads: int, seed: int, *, mxfp8: bool = False):
     gen = torch.Generator(device="cpu").manual_seed(seed)
 
-    def mat(out_f: int, in_f: int) -> torch.Tensor:
-        return (torch.randn((out_f, in_f), generator=gen) * 0.02).bfloat16().to(device)
+    def mat(out_f: int, in_f: int):
+        w = torch.randn((out_f, in_f), generator=gen) * 0.02
+        if mxfp8:
+            from b12x.gemm.blockscaled import pack_weight
+
+            return pack_weight(
+                w.to(torch.float8_e4m3fn).to(device),
+                torch.full((out_f, in_f // 32), 127, dtype=torch.uint8, device=device),
+                recipe="mxfp8",
+            )
+        return w.bfloat16().to(device)
 
     return {
         "qkv_proj": mat(q_heads * 512 + 2 * kv_heads * 256, 2560),
@@ -92,7 +101,9 @@ def _tp2_sharded_qsa_worker(rank: int, world: int, port: int, mode: str, cache_d
         context = 8192
         page_size = 64
         num_pages = 512
-        if mode == "row":
+        mxfp8 = mode == "group_mxfp8"
+        shard_mode = "group" if mxfp8 else mode
+        if shard_mode == "row":
             tokens, batch = 512, 1
             gather_rt = create_all_gather_runtime(group, device, max_rows=tokens // world, columns=1024 * world)
         else:
@@ -111,9 +122,9 @@ def _tp2_sharded_qsa_worker(rank: int, world: int, port: int, mode: str, cache_d
         session_entered = True
 
         module = _make_dummy_qsa_module(device)
-        weights = _make_weights(device, q_heads=12, kv_heads=1, seed=41)
+        weights = _make_weights(device, q_heads=12, kv_heads=1, seed=41, mxfp8=mxfp8)
         rotary = _make_rotary(context, device)
-        arena = ScratchArena(device, overlap=False)
+        arena = ScratchArena(device, overlap=(shard_mode == "group"))
         session.register_scratch(arena)
 
         # Prepare BOTH unsharded reference and sharded candidate using identical weights & initial 1-page pools.
@@ -134,10 +145,13 @@ def _tp2_sharded_qsa_worker(rank: int, world: int, port: int, mode: str, cache_d
             module, weights, source_ex, scratch_shd, state_shd, meta_shd, rotary,
             session=session, name=f"shd_{mode}", draft_tokens=7,
             workspace=arena, projection_workspace=arena, max_cache_pages=num_pages,
-            shard=shard, qsa_gather_runtime=gather_rt, qsa_shard_mode=mode, coordinator=coordinator,
+            shard=shard, qsa_gather_runtime=gather_rt, qsa_shard_mode=shard_mode, coordinator=coordinator,
         ).functional(session=session)
 
         session.tune(show_progress=False)
+
+        assert shd_attn.sharded.overlap is (shard_mode == "group")
+        assert (shd_attn.parallel_projections is not None) is mxfp8
 
         # PreparedShardedQSA must not retain per-layer persistent dummy output/query/position buffers.
         retained_bytes = sum(
@@ -316,7 +330,7 @@ def _tp2_sharded_qsa_worker(rank: int, world: int, port: int, mode: str, cache_d
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("mode", ["row", "group"])
+@pytest.mark.parametrize("mode", ["row", "group", "group_mxfp8"])
 def test_qwen38_sharded_qsa_matches_unsharded_and_shares_aot_binary_tp2(mode):
     """Sharded QSA selection matches unsharded reference and shares one AOT forward across TP2 ranks."""
     _requires_tp2()
