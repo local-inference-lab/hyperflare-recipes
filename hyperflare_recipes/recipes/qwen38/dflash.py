@@ -208,7 +208,8 @@ class SpeculativePreparation(DFlash2Preparation):
                  workspaces, rotary, cache, table, session, completion, frame, sequence,
                  context, prefill_capacity, max_cache_pages, draft_head=None,
                  runtime=None, vocabulary_runtime=None, coordinator=None, verification_width=8,
-                 sampling_workspace=None, gather_runtime=None):
+                 sampling_workspace=None, gather_runtime=None, result_runtime=None,
+                 shortlist_runtime=None, block_proposal_broadcast=False, shortlist_only=False):
         self.target_weights, self.cache, self.rotary, self.table = weights, cache, rotary, table
         self.context, self.max_cache_pages = context, max_cache_pages
         device = pool.backing.device
@@ -231,7 +232,9 @@ class SpeculativePreparation(DFlash2Preparation):
             page_tokens=64, completion=completion, frame=frame, sequence=sequence,
             session=session, workspace=workspaces, verification_width=verification_width,
             runtime=runtime, vocabulary_runtime=vocabulary_runtime, coordinator=coordinator,
-            block_size=draft_config.block_size, gather_runtime=gather_runtime)
+            block_size=draft_config.block_size, gather_runtime=gather_runtime,
+            result_runtime=result_runtime, shortlist_runtime=shortlist_runtime,
+            block_proposal_broadcast=block_proposal_broadcast, shortlist_only=shortlist_only)
 
     def buffers(self):
         return {}

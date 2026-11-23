@@ -240,7 +240,8 @@ class PreparedDecoder:
                  layer_outputs: torch.Tensor | None = None, embedding_injection=None,
                  max_cache_pages: int | None = None,
                  residual_output: torch.Tensor | None = None, verification: bool = False,
-                 gdn_records=None, gdn_in_place: bool = False, runtime=None, vocabulary_runtime=None, coordinator=None,
+                 gdn_records=None, gdn_in_place: bool = False, runtime=None, vocabulary_runtime=None,
+                 result_runtime=None, coordinator=None,
                  sampling_workspace=None, scoring=None):
         from hyperflare_recipes.components.embedding import PreparedEmbedding
         from hyperflare_recipes.components.linear import UnquantizedProjection
@@ -347,7 +348,8 @@ class PreparedDecoder:
                 inputs.live_rows, completion, frame_index, submission_sequence,
                 sample_enabled=inputs.sample_enabled[:state.rows], workspace=sampling_workspace)
             self.sampler.prepare()
-            self.sampler.prepare_broadcast(runtime=vocabulary_runtime, session=session,
+            self.sampler.prepare_broadcast(runtime=vocabulary_runtime if result_runtime is None else result_runtime,
+                session=session,
                 coordinator=coordinator, name=name + ".sampling")
 
     def capture_context(self, metadata, draft_config, *, compact_prefill=False):

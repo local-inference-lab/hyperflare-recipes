@@ -10,7 +10,7 @@ import torch
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm, rotate_half
 
 from hyperflare_recipes.components.candidate_selector import PreparedCandidateSelector
-from ignition.components.collectives import PreparedAllReduce, PreparedChunkedAllGather
+from ignition.components.collectives import PreparedAllGather, PreparedAllReduce, PreparedChunkedAllGather
 from hyperflare_recipes.components.embedding import PreparedShardedEmbedding
 from hyperflare_recipes.components.grouped_convolution import PreparedGroupedConvolution
 from hyperflare_recipes.components.linear import prepare_projection
@@ -326,7 +326,8 @@ class PreparedDraft:
     def __init__(self, weights, scratch, metadata, pool, *, runtime, vocabulary_runtime, embedding_runtime,
                  coordinator, session, name, workspace, embedding, head,
                  output_multiplier, final_logit_softcapping, examples=None,
-                 convolution_runtime=None, templates=None, attention_factory=DraftAttention):
+                 convolution_runtime=None, templates=None, attention_factory=DraftAttention,
+                 shortlist_only=False, shortlist_runtime=None):
         self.logit_shape = scratch.logit_shape
         self.logit_dtype, self.local_logit_dtype = torch.float32, torch.bfloat16
         self.local_logit_shape = (scratch.tokens, scratch.local_vocabulary_size)
@@ -356,11 +357,37 @@ class PreparedDraft:
             self.layers.append((_norm(layer.input_norm, c.text["rms_norm_eps"]), conv["attention_conv"], attention,
                 _norm(layer.post_attention_norm, c.text["rms_norm_eps"]), conv["mlp_conv"], mlp, reduction))
         self.norm = _norm(weights.draft.norm, c.text["rms_norm_eps"])
-        self.head = PreparedVocabularyProjection(s.hidden, head, s.local_logits, s.gathered_logits,
-            runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head",
-            activation_mode="a16", workspace=workspace).functional(session=session)
+        self.top_k = c.text["dflash_config"]["selector_top_k"]
+        self.world_size = weights.shard.world_size
+        self.shortlist_output = bool(shortlist_only)
+        if self.shortlist_output:
+            if self.world_size > 1 and shortlist_runtime is None:
+                raise ValueError("distributed DFlash2 shortlist selection requires shortlist_runtime")
+            self.head = PreparedVocabularyProjection(s.hidden, head, s.local_logits, s.local_logits,
+                runtime=None, coordinator=coordinator, session=session, name=name + ".head",
+                activation_mode="a16", workspace=workspace, gather=False).functional(session=session)
+            self.vocab_offset = persistent_copy(torch.tensor(
+                weights.shard.rank * scratch.local_vocabulary_size, dtype=torch.int32, device=embedding.device))
+            if self.world_size > 1:
+                self.shortlist_cols = ((self.top_k * 4 + 63) // 64) * 64
+                send = declaration_tensor(examples, "dflash.draft.shortlist_send",
+                    (scratch.tokens, self.shortlist_cols), torch.bfloat16, embedding.device)
+                gathered = declaration_tensor(examples, "dflash.draft.shortlist_gathered",
+                    (scratch.tokens, self.shortlist_cols * self.world_size), torch.bfloat16, embedding.device)
+                self.shortlist_gather = PreparedAllGather(send, gathered, runtime=shortlist_runtime,
+                    coordinator=coordinator, session=session, name=name + ".shortlist_gather").functional(session=session)
+            else:
+                self.shortlist_cols = 0
+                self.shortlist_gather = None
+        else:
+            self.head = PreparedVocabularyProjection(s.hidden, head, s.local_logits, s.gathered_logits,
+                runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head",
+                activation_mode="a16", workspace=workspace).functional(session=session)
+            self.vocab_offset = None
+            self.shortlist_cols = 0
+            self.shortlist_gather = None
         self.selector = PreparedCandidateSelector(s.hidden.view(-1, scratch.block_size, s.hidden.shape[-1]),
-            weights.draft.selector, top_k=c.text["dflash_config"]["selector_top_k"], session=session,
+            weights.draft.selector, top_k=self.top_k, session=session,
             name=name + ".selector").functional(session=session)
         self.block_size = scratch.block_size
         self.hidden_size = scratch.hidden_size
@@ -370,6 +397,39 @@ class PreparedDraft:
 
     def release_outputs(self):
         return self
+
+    def _shortlist_from_local_logits(self, local_logits):
+        local_vocab = local_logits.shape[-1]
+        if local_vocab * self.world_size != self.vocabulary_size:
+            col_ids = torch.arange(local_vocab, device=local_logits.device, dtype=torch.int32) + self.vocab_offset
+            local_logits = torch.where((col_ids < self.vocabulary_size)[None, :], local_logits, -torch.inf)
+        monotonic = self.multiplier > 0 and (self.softcap is None or self.softcap > 0)
+        if monotonic:
+            local_vals, local_pos = local_logits.topk(self.top_k, dim=-1, sorted=False)
+            unary = local_vals.float() * self.multiplier
+            if self.softcap is not None:
+                unary = (unary / self.softcap).tanh() * self.softcap
+        else:
+            scores = local_logits.float() * self.multiplier
+            if self.softcap is not None:
+                scores = (scores / self.softcap).tanh() * self.softcap
+            unary, local_pos = scores.topk(self.top_k, dim=-1, sorted=False)
+        ids = local_pos.to(torch.int32) + self.vocab_offset
+        if self.shortlist_gather is not None:
+            words_per_rank = self.shortlist_cols // 2
+            if words_per_rank == 2 * self.top_k:
+                packet = torch.cat((unary.view(torch.int32), ids), dim=-1).view(torch.bfloat16)
+            else:
+                pad = torch.zeros((local_logits.shape[0], words_per_rank - 2 * self.top_k),
+                                  dtype=torch.int32, device=local_logits.device)
+                packet = torch.cat((unary.view(torch.int32), ids, pad), dim=-1).view(torch.bfloat16)
+            gathered = self.shortlist_gather(packet)
+            g_words = gathered.view(torch.int32).view(local_logits.shape[0], self.world_size, words_per_rank)
+            all_vals = g_words[:, :, :self.top_k].reshape(local_logits.shape[0], self.world_size * self.top_k).view(torch.float32)
+            all_ids = g_words[:, :, self.top_k:2 * self.top_k].reshape(local_logits.shape[0], self.world_size * self.top_k)
+            unary, best = all_vals.topk(self.top_k, dim=-1, sorted=False)
+            ids = all_ids.gather(-1, best)
+        return unary.view(-1, self.block_size, self.top_k), ids.long().view(-1, self.block_size, self.top_k)
 
     def forward(self, metadata):
         m = metadata
@@ -384,6 +444,11 @@ class PreparedDraft:
             mlp_output = reduce(mlp(mlp_input))
             embedding = embedding + mlp_conv.finish(mlp_output, mlp_coefficients)
         hidden = self.norm(embedding[m.sample_indices])
+        if self.shortlist_output:
+            local_logits = self.head(hidden)
+            shortlist = self._shortlist_from_local_logits(local_logits)
+            selector_features = self.selector.prepare_features(hidden.view(-1, self.block_size, self.hidden_size))
+            return hidden, shortlist, selector_features
         logits = self.head(hidden)
         unary = logits[:, :self.vocabulary_size].float() * self.multiplier
         logits = unary if self.softcap is None else (unary / self.softcap).tanh() * self.softcap

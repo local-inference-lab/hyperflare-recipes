@@ -383,7 +383,7 @@ class PreparedResume:
 
     def __init__(self, inputs, requests, pool, sample_hidden, logits, lm_head_weight,
                  completion, frame_index, submission_sequence, *, session, name,
-                 local_logits=None, vocabulary_runtime=None, coordinator=None, sampling_workspace=None):
+                 local_logits=None, vocabulary_runtime=None, result_runtime=None, coordinator=None, sampling_workspace=None):
         from hyperflare_recipes.components.linear import UnquantizedProjection
         from ignition.components.sampling import PreparedSampling
 
@@ -407,7 +407,8 @@ class PreparedResume:
             inputs.row_generations[:rows], inputs.live_rows, completion, frame_index, submission_sequence,
             sample_enabled=inputs.sample_enabled[:rows], workspace=sampling_workspace)
         self.sampler.prepare()
-        self.sampler.prepare_broadcast(runtime=vocabulary_runtime, session=session,
+        self.sampler.prepare_broadcast(runtime=vocabulary_runtime if result_runtime is None else result_runtime,
+            session=session,
             coordinator=coordinator, name=name + ".sampling")
 
     def functional(self, *, session):

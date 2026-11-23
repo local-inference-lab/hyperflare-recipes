@@ -233,3 +233,94 @@ def test_context_aot_guards_match_across_tp_ranks(chunk):
     assert torch.equal(out_key, expected_key)
     assert torch.equal(out_value, expected_value)
     assert torch.equal(out_slots, expected_slots)
+
+
+class _FixedGather:
+    def __init__(self, output):
+        self.output = output
+
+    def __call__(self, packet):
+        return self.output
+
+
+class _ShortlistForward:
+    def __init__(self, draft, local_logits, out_u, out_i):
+        self.draft, self.local_logits, self.out_u, self.out_i = draft, local_logits, out_u, out_i
+
+    def __call__(self):
+        u, i = self.draft._shortlist_from_local_logits(self.local_logits)
+        self.out_u.copy_(u)
+        self.out_i.copy_(i)
+
+
+@pytest.mark.parametrize("vocab,local_vocab", [(256, 128), (250, 128)])
+@pytest.mark.parametrize("softcap", [None, 20.0])
+def test_distributed_shortlist_matches_full_topk_and_aot_guards_match_across_tp_ranks(vocab, local_vocab, softcap):
+    """Distributed local top-k shortlist matches full-vocab top-k and shares AOT guards across TP ranks."""
+    from torch._dynamo.aot_compile_types import GraphModuleSerializableCallable
+    from hyperflare_recipes.components.dflash2 import PreparedDraft
+
+    batch, block, top_k, world = 2, 4, 16, 2
+    tokens = batch * block
+    gen = torch.Generator().manual_seed(173 + vocab)
+    full_bf16 = torch.randn((tokens, vocab), generator=gen).bfloat16()
+    padded = torch.zeros((tokens, local_vocab * world), dtype=torch.bfloat16)
+    padded[:, :vocab] = full_bf16
+    shards = padded.chunk(world, dim=-1)
+    words_per_rank = ((top_k * 4 + 63) // 64) * 64 // 2
+
+    def local_packet(rank):
+        draft = object.__new__(PreparedDraft)
+        draft.shortlist_output = True
+        draft.top_k, draft.world_size = top_k, world
+        draft.block_size, draft.vocabulary_size = block, vocab
+        draft.multiplier, draft.softcap = 0.5, softcap
+        draft.vocab_offset = torch.tensor(rank * local_vocab, dtype=torch.int32)
+        draft.shortlist_cols = words_per_rank * 2
+        captured = []
+        draft.shortlist_gather = lambda pkt: (captured.append(pkt.clone()), torch.cat((pkt, pkt), dim=-1))[1]
+        draft._shortlist_from_local_logits(shards[rank])
+        return captured[0]
+
+    packets = [local_packet(r) for r in range(world)]
+    gathered_packet = torch.cat(packets, dim=-1)
+
+    def build_forward(rank):
+        draft = object.__new__(PreparedDraft)
+        draft.shortlist_output = True
+        draft.top_k, draft.world_size = top_k, world
+        draft.block_size, draft.vocabulary_size = block, vocab
+        draft.multiplier, draft.softcap = 0.5, softcap
+        draft.vocab_offset = torch.tensor(rank * local_vocab, dtype=torch.int32)
+        draft.shortlist_cols = words_per_rank * 2
+        draft.shortlist_gather = _FixedGather(gathered_packet)
+        out_u = torch.empty((batch, block, top_k), dtype=torch.float32)
+        out_i = torch.empty((batch, block, top_k), dtype=torch.int64)
+        return _ShortlistForward(draft, shards[rank].contiguous(), out_u, out_i), (out_u, out_i)
+
+    f0, (u0, i0) = build_forward(0)
+    f1, (u1, i1) = build_forward(1)
+    compiled = torch.compile(
+        _execute_forward,
+        backend=lambda graph, inputs: GraphModuleSerializableCallable(graph),
+        fullgraph=True,
+        dynamic=False,
+    ).aot_compile(((f0,), {}))
+    assert compiled.guard_check(f0)
+    assert compiled.guard_check(f1)
+    compiled(f0)
+    compiled(f1)
+    assert torch.equal(u0, u1) and torch.equal(i0, i1)
+
+    ref_scores = full_bf16.float() * 0.5
+    if softcap is not None:
+        ref_scores = (ref_scores / softcap).tanh() * softcap
+    ref_u, _ = ref_scores.topk(top_k, dim=-1, sorted=True)
+    got_u, order = u0.view(tokens, top_k).sort(dim=-1, descending=True)
+    got_i = i0.view(tokens, top_k).gather(-1, order)
+    assert torch.equal(got_u, ref_u)
+    assert torch.equal(ref_scores.gather(-1, got_i), got_u)
+    # Every selected token ID within a row must be distinct and in-bounds.
+    for row in range(tokens):
+        assert len(set(got_i[row].tolist())) == top_k
+        assert int(got_i[row].min()) >= 0 and int(got_i[row].max()) < vocab
