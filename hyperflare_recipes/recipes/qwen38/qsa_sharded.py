@@ -33,7 +33,7 @@ import torch
 import triton
 import triton.language as tl
 from b12x.attention import qsa
-from b12x.attention.qsa._contract import _STABLE_TOPK_BLOCK, _run_attention, _scratch_view
+from b12x.attention.qsa._contract import _STABLE_TOPK_BLOCK, _run_attention
 from b12x.attention.qsa._kernels import (
     launch_prepare_index_query,
     launch_score_representatives_tiled,
@@ -41,6 +41,7 @@ from b12x.attention.qsa._kernels import (
     launch_stage_topk_carry,
     launch_topk_groups,
 )
+from b12x.preparation import PreparedCall
 
 from ignition.components.collectives import PreparedAllGather
 from ignition.preparation.persistent import persistent_copy
@@ -77,6 +78,11 @@ _FULL_DYNAMIC_FIELDS = (
     "num_accepted_tokens",
     "is_prefilling",
 )
+
+
+def _scratch_view(storage: torch.Tensor, *, offset_bytes: int, shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+    nbytes = math.prod(shape) * dtype.itemsize
+    return storage.narrow(0, int(offset_bytes), int(nbytes)).view(dtype).view(shape)
 
 
 def _launch(kernel, grid, args, **meta):
@@ -592,7 +598,7 @@ class PreparedShardedQSA:
             storage = planned_scratch(materialized.scratch_specs(), workspace)
             binding = materialized.bind_for_preparation(scratch=storage, **self.select_binding_kwargs)
             self.select_workspace = storage
-            return qsa._contract.PreparedCall(
+            return PreparedCall(
                 run=lambda: materialized.run_for_preparation(binding, **self._select_dynamic_ex),
                 owners=prime_owners(workspace, storage, binding),
             )
@@ -721,12 +727,24 @@ class PreparedShardedQSA:
         ):
             raise ValueError("sharded QSA sequence_lengths must be contiguous int32 [batch]")
         work_rows = int(state.workspace_q_rows)
+        if work_rows != self.local_rows:
+            raise ValueError(
+                f"sharded QSA selection requires workspace_q_rows ({work_rows}) to match local_rows ({self.local_rows})"
+            )
         group_budget = int(caps.group_budget)
         score_chunk_groups = int(state.score_chunk_groups)
         num_score_chunks = int(state.num_score_chunks)
         stable_blocks = math.ceil(int(state.score_workspace_width) / _STABLE_TOPK_BLOCK)
         stable_offset = int(state._layout.topk_offset_bytes)
+        topk_end = stable_offset + int(state._layout.topk_nbytes)
         count_nbytes = work_rows * stable_blocks * torch.int32.itemsize
+        stable_nbytes = (
+            2 * count_nbytes
+            + work_rows * group_budget * (torch.float32.itemsize + torch.int32.itemsize)
+            + work_rows * (torch.float32.itemsize + torch.int32.itemsize)
+        )
+        if stable_offset + stable_nbytes > topk_end or topk_end > workspace.numel():
+            raise ValueError("sharded QSA scratch workspace does not cover the prepared stable-topk layout")
         tie_counts = _scratch_view(workspace, offset_bytes=stable_offset, shape=(work_rows, stable_blocks), dtype=torch.int32)
         stable_offset += count_nbytes
         greater_counts = _scratch_view(workspace, offset_bytes=stable_offset, shape=(work_rows, stable_blocks), dtype=torch.int32)
@@ -738,9 +756,6 @@ class PreparedShardedQSA:
         thresholds = _scratch_view(workspace, offset_bytes=stable_offset, shape=(work_rows,), dtype=torch.float32)
         stable_offset += work_rows * torch.float32.itemsize
         greater_totals = _scratch_view(workspace, offset_bytes=stable_offset, shape=(work_rows,), dtype=torch.int32)
-        stable_offset += work_rows * torch.int32.itemsize
-        if stable_offset > workspace.numel():
-            raise ValueError("sharded QSA scratch workspace is smaller than the prepared stable-topk layout")
 
         launch_prepare_index_query(
             index_query=index_query,
