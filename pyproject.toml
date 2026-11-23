@@ -41,6 +41,7 @@ include = ["hyperflare_recipes*"]
 
 [tool.setuptools.package-data]
 "hyperflare_recipes.components.megamoe_kernel" = ["LICENSE.vllm"]
+"hyperflare_recipes.components.sm103_mover_kernel" = ["mover_kernels.cu"]
 "hyperflare_recipes.recipes.deepseek41" = ["assets/*"]
 "hyperflare_recipes.recipes.deepseek4" = ["assets/*"]
 "hyperflare_recipes.recipes.gemma4" = ["assets/*"]

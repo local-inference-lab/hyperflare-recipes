@@ -163,6 +163,42 @@ def test_megamoe_catalog_keeps_host_weights_and_excludes_residency_state():
     assert not tensors & {id(experts.expert_map), id(experts.workspace), id(tier.control), id(tier.descriptors)}
 
 
+def test_megamoe_dynamic_tier_catalog_keeps_host_weights_and_excludes_mover_state():
+    from hyperflare_recipes.components import weights as _registered_containers
+    from hyperflare_recipes.components.megamoe_tiers import MegaMoeDynamicHostTier, MegaMoeLayerWeights
+    from hyperflare_recipes.components.megamoe_weights import MegaMoeWeights
+
+    del _registered_containers
+
+    def matrices():
+        return MegaMoeWeights((torch.zeros(8, dtype=torch.int8), torch.ones(4, dtype=torch.int32)),
+                              (torch.zeros(8, dtype=torch.int8), torch.ones(4, dtype=torch.int32)))
+
+    tier = object.__new__(MegaMoeDynamicHostTier)
+    tier.weights = matrices()
+    tier.live_slot_map = torch.full((8,), -1, dtype=torch.int32)
+    tier.slot_owner = torch.full((4,), -1, dtype=torch.int32)
+    tier.layer_epoch = torch.zeros((1,), dtype=torch.int32)
+    tier.control = torch.zeros(24, dtype=torch.int32)
+    tier.descriptors = torch.zeros(128, dtype=torch.uint8)
+    experts = MegaMoeLayerWeights(matrices(), matrices(), torch.zeros(128), tier,
+                                  torch.arange(8, dtype=torch.int32))
+    views = list(declared_views(declare_weights({'experts': experts}, components=('experts',))))
+    tensors = {id(tensor) for _, _, tensor, _, _ in views}
+    expected = {id(tensor) for owner in (experts.routed, experts.shared, tier.weights)
+                for tensor in (*owner.gate_up, *owner.down)}
+    assert tensors == expected
+    assert not tensors & {
+        id(experts.expert_map),
+        id(experts.workspace),
+        id(tier.live_slot_map),
+        id(tier.slot_owner),
+        id(tier.layer_epoch),
+        id(tier.control),
+        id(tier.descriptors),
+    }
+
+
 def test_declared_catalog_matches_legacy_schema():
     catalog = rebuild_weights_metadata(declare_weights(build(), components=COMPONENTS))
     assert catalog['version'] == 1
