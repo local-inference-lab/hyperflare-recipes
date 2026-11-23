@@ -10,6 +10,9 @@ license = "Apache-2.0"
 license-files = [
     "LICENSE",
     "NOTICE",
+    "hyperflare_recipes/components/mega_attention_kernel/LICENSE.ds41",
+    "hyperflare_recipes/components/mega_attention_kernel/NOTICE",
+    "hyperflare_recipes/components/mega_attention_kernel/NOTICE.upstream",
     "hyperflare_recipes/components/megamoe_kernel/LICENSE.vllm",
     "hyperflare_recipes/recipes/deepseek41/assets/LICENSE",
 ]
@@ -40,8 +43,18 @@ flashinfer-python = { git = "https://github.com/local-inference-lab/flashinfer.g
 include = ["hyperflare_recipes*"]
 
 [tool.setuptools.package-data]
+"hyperflare_recipes.components.mega_attention_kernel" = [
+    "LICENSE.ds41",
+    "NOTICE",
+    "NOTICE.upstream",
+    "csrc/*.cu",
+    "include/w1/*.cuh",
+    "include/w7/*.cuh",
+    "include/w8/*.cuh",
+]
 "hyperflare_recipes.components.megamoe_kernel" = ["LICENSE.vllm"]
 "hyperflare_recipes.components.sm103_mover_kernel" = ["mover_kernels.cu"]
+"hyperflare_recipes.components.sm103_router_kernel" = ["csrc/*.cu"]
 "hyperflare_recipes.recipes.deepseek41" = ["assets/*"]
 "hyperflare_recipes.recipes.deepseek4" = ["assets/*"]
 "hyperflare_recipes.recipes.gemma4" = ["assets/*"]

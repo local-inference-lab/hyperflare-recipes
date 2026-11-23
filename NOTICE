@@ -69,6 +69,20 @@ license with tiered MegaMoE extensions) during preparation. Exported CUDA graphs
 retain the compiled kernels; the native serving runtime has no Python or
 DeepGEMM dependency.
 
+DS41 SM103 fused decode attention kernels
+-----------------------------------------
+hyperflare_recipes/components/mega_attention_kernel/include/ carries unchanged
+MIT-licensed ds41 W1 attention headers from chronarion/dsv41 commit
+f8cd311caf3328ed6f4bb158a7c12811e32a06f8 (sourced from Garner McCloud's
+dgx-station-recipes, deepseek-v4.1-flash recipe, commit 8043a68), and
+hyperflare_recipes/components/mega_attention_kernel/csrc/w1_attn.cu carries the
+upstream launcher with a thread-safe set_num_sms/get_num_sms override of
+num_sms() for CUDA Green Context cooperative launch clamping. The upstream MIT
+license and attribution notices are retained in
+hyperflare_recipes/components/mega_attention_kernel/LICENSE.ds41,
+hyperflare_recipes/components/mega_attention_kernel/NOTICE, and
+hyperflare_recipes/components/mega_attention_kernel/NOTICE.upstream.
+
 PyTorch
 -------
 helios/src/frontend/images/resize.rs adapts the resize coefficient generator
