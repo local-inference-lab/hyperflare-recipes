@@ -7,6 +7,10 @@ import torch
 import triton
 import triton.language as tl
 
+from hyperflare_recipes.components.inkling2_vec_residual import (
+    PreparedVecResidualMix,
+    supports_vec_residual_mix,
+)
 from ignition.preparation.examples import declaration_tensor
 from ignition.preparation.triton import launch_triton, prepare_triton
 
@@ -78,7 +82,6 @@ def _mixture_norm(Source0, Source1, Source2, Source3, Source4, Source5, Source6,
 
 class PreparedResidualMix:
     def __init__(self, source, queries, norms, *, sources, eps, session, name, addend=False, examples=None):
-        del session, name
         if not 1 <= sources <= 9 or not 1 <= len(norms) <= 3:
             raise ValueError('attention-residual mixtures require one to nine sources and one to three output streams')
         if queries.dtype != torch.float32 or queries.shape != (len(norms), source.shape[1]):
@@ -97,6 +100,20 @@ class PreparedResidualMix:
         arguments = ((source,) * 9 + (queries,) + mixtures
                      + (mixtures[0],) * (3 - self.streams) + (source,))
         self.compiled = prepare_triton(_mixture, arguments, (self.tokens, 1, 1), **self.options).compiled
+        self._vec_mix = None
+        self.fused_compiled = None
+        if (
+            supports_vec_residual_mix(self.tokens, self.hidden, self.sources, source.device)
+            and source.dtype == torch.bfloat16
+            and source.is_contiguous()
+            and queries.is_contiguous()
+            and queries.data_ptr() % 16 == 0
+        ):
+            self._vec_mix = PreparedVecResidualMix(
+                source, queries, self.norms, sources=sources, eps=eps,
+                addend=addend, session=session, name=name,
+            )
+            return
         norm_args = self.norms + (self.norms[0],) * (3 - self.streams)
         out_args = outputs + (outputs[0],) * (3 - self.streams)
         fused_args = (source,) * 9 + (queries,) + norm_args + out_args + (source,)
@@ -122,6 +139,8 @@ class PreparedResidualMix:
             raise ValueError('attention-residual source count differs from the prepared layer')
         if (addend is not None) != self.addend:
             raise ValueError('attention-residual addend differs from the prepared layer')
+        if self._vec_mix is not None:
+            return self._vec_mix(sources, addend=addend)
         outputs = tuple(torch.empty((self.tokens, self.hidden), dtype=torch.bfloat16,
             device=sources[0].device) for _ in range(self.streams))
         norm_args = self.norms + (self.norms[0],) * (3 - self.streams)

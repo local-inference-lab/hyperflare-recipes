@@ -66,14 +66,8 @@ class PreparedLayer(torch.nn.Module):
         def example(role, shape, dtype=torch.bfloat16):
             return declaration_tensor(examples, "inkling.mlp." + role, shape, dtype, device)
         source = example("source", (tokens, text.hidden))
-        logits = example("router_logits", (tokens, text.experts), torch.float32)
-        self.router_dtype = weights.router.dtype
-        self.router_projection = UnquantizedProjection(example("router_source", source.shape, self.router_dtype),
-            weights.router, logits, session=session, name=name + ".router").functional(session=session)
-        routes = RouterScratch.allocate(tokens, device, experts=text.experts, top_k=text.experts_per_token)
-        self.router = PreparedRouter(logits, routes, session=session, name=name + ".routing", score_func="sigmoid",
-            renormalize=True, routed_scaling_factor=text.route_scale, correction_bias=weights.correction,
-            num_valid_tokens=metadata.live_counts[:1]).functional(session=session)
+        routes = self._build_router(source, weights, text, metadata, tokens=tokens, session=session,
+            name=name, example=example)
         self.experts = self._build_experts(source, weights, routes, tokens=tokens, mode=mode,
             session=session, workspace=workspace, name=name, example=example)
         self.attention_convolution = PreparedCausalConvolution(weights.attention_convolution,
@@ -89,6 +83,18 @@ class PreparedLayer(torch.nn.Module):
         self.mlp_mix = PreparedResidualMix(source, weights.mlp_query, (weights.mlp_norm,),
             sources=blocks + (2 if layer % text.residual_block == 0 else 1), eps=text.eps,
             session=session, name=name + ".mlp_input", addend=layer % text.residual_block != 0, examples=examples)
+
+    def _build_router(self, source, weights, text, metadata, *, tokens, session, name, example):
+        device = weights.router.device
+        logits = example("router_logits", (tokens, text.experts), torch.float32)
+        self.router_dtype = weights.router.dtype
+        self.router_projection = UnquantizedProjection(example("router_source", source.shape, self.router_dtype),
+            weights.router, logits, session=session, name=name + ".router").functional(session=session)
+        routes = RouterScratch.allocate(tokens, device, experts=text.experts, top_k=text.experts_per_token)
+        self.router = PreparedRouter(logits, routes, session=session, name=name + ".routing", score_func="sigmoid",
+            renormalize=True, routed_scaling_factor=text.route_scale, correction_bias=weights.correction,
+            num_valid_tokens=metadata.live_counts[:1]).functional(session=session)
+        return routes
 
     def _build_experts(self, source, weights, routes, *, tokens, mode, session, workspace, name, example):
         del tokens

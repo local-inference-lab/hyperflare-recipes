@@ -76,6 +76,10 @@ MINI_RECIPE = replace(RECIPE, name="inkling2_mini", served_model_name="inkling-2
     draft_head_quantizations=("nvfp4", "mxfp8"), markov_head_quantizations=("nvfp4",),
     checkpoints=(Checkpoint(alias="inkling-2-mini", repository="thinkingmachines/Inkling-2-Mini",
         revision="ed40e7da625f594fc9c4990f5f66be24873c22d7", architecture="Inkling2LoopForConditionalGeneration",
+        stored_bytes=19_525_870_752, device_bytes=20_263_810_112, draft_bytes=737_939_360),
+        Checkpoint(alias="tml-d24-varloop-research", repository="thinkingmachines/TML-d24-varloop-research",
+        revision="657b53ba5da7baefe9ff15dca5cd25f5bd3dbaa2", architecture="Inkling2LoopForConditionalGeneration",
+        served_model_name="TML-d24-varloop-research",
         stored_bytes=19_525_870_752, device_bytes=20_263_810_112, draft_bytes=737_939_360),),
     ranks=MappingProxyType({1: RankCosts(107_347_968, 2_621_440, 3 << 30)}),
     plain_ranks=MappingProxyType({1: RankCosts(98_435_072, 2_097_152, 3 << 30)}))

@@ -13,6 +13,26 @@ from b12x._lib.scratch import scratch_buffer_spec
 from b12x.preparation import Knob, MemoryRequirements, Plan, TuningContract
 
 
+def is_sm120(device) -> bool:
+    """Whether ``device`` is a CUDA device of compute capability 12.0."""
+    device = torch.device(device)
+    if device.type != "cuda":
+        return False
+    index = torch.cuda.current_device() if device.index is None else device.index
+    return torch.cuda.get_device_capability(index) == (12, 0)
+
+
+def compile_triton(kernel, grid, *args, **kwargs):
+    """Register local Triton executable caches for reclamation during b12x preparation."""
+    from b12x._lib.compile_plan import launch_triton
+    from b12x._lib.program_cache import register_program_cache
+
+    program = launch_triton(kernel, grid, *args, **kwargs)
+    for executable_cache, *_ in kernel.device_caches.values():
+        register_program_cache(executable_cache)
+    return program
+
+
 def _tactic(value):
     """Restore tuple tactics after a JSON round trip through the selection cache."""
     if isinstance(value, (list, tuple)):

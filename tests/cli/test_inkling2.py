@@ -28,6 +28,16 @@ def test_mini_directory_resolves_loop_architecture(tmp_path):
             model.recipe.speculation.token_capacity) == (8, 8192, 64)
 
 
+def test_varloop_alias_and_repository_share_mini_recipe():
+    mini = resolve("inkling-2-mini")
+    varloop = resolve("tml-d24-varloop-research")
+    assert varloop.recipe is MINI_RECIPE
+    assert resolve(varloop.checkpoint.repository).checkpoint is varloop.checkpoint
+    assert resolve(f"{varloop.checkpoint.repository}@{varloop.checkpoint.revision}").checkpoint is varloop.checkpoint
+    assert MINI_RECIPE.served_name(mini.checkpoint) == "inkling-2-mini"
+    assert MINI_RECIPE.served_name(varloop.checkpoint) == "TML-d24-varloop-research"
+
+
 def test_small_directory_retains_its_recipe(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps({
         "architectures": ["Inkling2ForConditionalGeneration"], "model_type": "inkling2"}))

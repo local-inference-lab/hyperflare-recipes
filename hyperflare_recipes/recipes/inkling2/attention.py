@@ -22,7 +22,17 @@ import triton.language as tl
 
 from hyperflare_recipes.components.causal_convolution import PreparedCausalConvolution
 from hyperflare_recipes.components.head_gate import PreparedHeadGate
+from hyperflare_recipes.components.inkling2_relative_decode_ops import (
+    PreparedLogScalingTau,
+    PreparedRelativeDecodeAttention,
+    supports_relative_decode,
+)
+from hyperflare_recipes.components.inkling2_relative_prefill_ops import (
+    PreparedRelativePrefillAttention,
+    supports_relative_prefill,
+)
 from hyperflare_recipes.components.linear import UnquantizedProjection
+from hyperflare_recipes.components.native_operator import is_sm120
 from hyperflare_recipes.components.paged_attention import PreparedPagedAttention, PreparedPagedKVWriter
 from hyperflare_recipes.components.rms_norm import PreparedRMSNorm
 from ignition.preparation.persistent import persistent_empty
@@ -33,6 +43,17 @@ from .pool import KV_DTYPE, PAGE_TOKENS
 from ignition.preparation.rebuild_manifest import weight_container
 
 RELATIVE_RANK = 16
+_SM120_MAX_PREFILL_BIAS_BYTES = 512 << 20
+
+
+def _ring_4d(rings, ring_len, kv_heads, dim):
+    """4D `[rows, ring, kv_heads, dim]` FP8 view of a local layer's ring storage."""
+    if rings is None or rings.stride(1) != 1:
+        raise ValueError("ring view requires contiguous per-row ring bytes")
+    return rings.view(KV_DTYPE).as_strided(
+        (rings.shape[0], ring_len, kv_heads, dim),
+        (rings.stride(0), kv_heads * dim, dim, 1),
+    )
 
 
 @dataclass(frozen=True)
@@ -224,14 +245,225 @@ class PreparedAttention(torch.nn.Module):
             eps=text.eps, session=session, name=f"{name}.value_norm").functional()
         projection = example("inkling.attention.projection0", (tokens, self.columns.widths()[0]))
         channels = self.heads * self.dim
-        self.gate = PreparedHeadGate(attended.view(tokens, channels, 1), projection[:, channels:2 * channels],
-            session=session, name=f"{name}.gate").functional(session=session)
-        slots = example("inkling.attention.slots", (tokens,), torch.int64)
-        requests = metadata.lengths.numel()
         self.writer = None
         self._stage_compiled = self._retain_compiled = None
         self._stage_opts = self._retain_opts = None
         self._stage_grid = self._retain_grid = None
+        self._stage_right_compiled = self._stage_right_opts = self._stage_right_grid = None
+        self.sm120_staged_cap = 0
+        self.sm120 = is_sm120(device)
+        self.use_sm120_decode = False
+        self.use_sm120_prefill = False
+        self.relative_projection = None
+        self.tau_op = None
+        if self.sm120:
+            requests = metadata.lengths.numel()
+            if not self.local and session is not None:
+                tau_ex = example("inkling.attention.tau", (tokens,), torch.float32)
+                self.tau_op = PreparedLogScalingTau(
+                    metadata.positions, tau_ex,
+                    floor=text.log_scaling_floor, alpha=text.log_scaling_alpha,
+                    session=session, name=f"{name}.tau",
+                ).functional(session=session)
+            extent = weights.relative_projection.shape[1]
+            gate_ex = projection[:, channels:2 * channels].view(tokens, self.heads, self.dim)
+            if mode in ("decode", "verify"):
+                rel_ex = example("inkling.attention.relative_bias", (tokens, self.heads, extent))
+                rel_src = example("inkling.attention.relative_source", (tokens * self.heads, RELATIVE_RANK))
+                self.relative_projection = UnquantizedProjection(
+                    rel_src, weights.relative_rows, rel_ex.view(tokens * self.heads, extent),
+                    session=session, name=f"{name}.relative",
+                ).functional(session=session)
+                decode_max_q = metadata.max_query_tokens
+                decode_key_cache = _ring_4d(cache.key_rings, self.ring, self.kv_heads, self.dim) if self.local else cache.key
+                decode_val_cache = _ring_4d(cache.value_rings, self.ring, self.kv_heads, self.dim) if self.local else cache.value
+                if (
+                    1 <= decode_max_q <= 16
+                    and tokens >= requests
+                    and supports_relative_decode(
+                        query=query,
+                        key_cache=decode_key_cache,
+                        value_cache=decode_val_cache,
+                        is_window=self.local,
+                        commit_ring=(self.local and mode == "decode"),
+                        window=self.window,
+                        rel_extent=extent,
+                        max_q_per_req=decode_max_q,
+                        new_key=key,
+                        new_value=value,
+                        gate=gate_ex,
+                        gated=output,
+                    )
+                ):
+                    sink_bf16_ex = example("inkling.attention.sink_bf16", (tokens, self.heads), torch.bfloat16)
+                    self.use_sm120_decode = True
+                    self.gate = None
+                    staged_k_ex = staged_v_ex = None
+                    if self.local and mode == "verify":
+                        row_elems = self.kv_heads * self.dim
+                        block_e = triton.next_power_of_2(row_elems)
+                        row_stride = cache.key_rings.stride(0)
+                        if (
+                            cache.value_rings.stride(0) != row_stride
+                            or cache.key_rings.stride(1) != 1
+                            or cache.value_rings.stride(1) != 1
+                        ):
+                            raise ValueError("ring staging requires matching row strides and contiguous ring elements")
+                        retain_w = min(metadata.max_query_tokens, self.ring)
+                        counts_ex = example("inkling.attention.retain_counts", (requests,), torch.int32)
+                        self._retain_opts = dict(
+                            RING_LEN=self.ring, RING_ROW_STRIDE=row_stride, ROW_ELEMS=row_elems, MAX_TOKENS=tokens,
+                            BLOCK_E=block_e, num_warps=4,
+                        )
+                        self._retain_grid = (requests, retain_w, 1)
+                        self._retain_compiled = prepare_triton(
+                            _retain_kv_kernel,
+                            (cache.key_rings.view(KV_DTYPE), cache.value_rings.view(KV_DTYPE), key, value,
+                             metadata.state_rows, metadata.starts, counts_ex, metadata.query_start_loc),
+                            self._retain_grid, **self._retain_opts,
+                        ).compiled
+                        staged_k_ex = example(
+                            "inkling.attention.verify_staged_key",
+                            (requests, self.ring + decode_max_q, self.kv_heads, self.dim),
+                            KV_DTYPE,
+                        )
+                        staged_v_ex = example(
+                            "inkling.attention.verify_staged_value",
+                            (requests, self.ring + decode_max_q, self.kv_heads, self.dim),
+                            KV_DTYPE,
+                        )
+                    self.attention = PreparedRelativeDecodeAttention(
+                        query=query,
+                        new_key=key,
+                        new_value=value,
+                        key_cache=decode_key_cache,
+                        value_cache=decode_val_cache,
+                        metadata=metadata,
+                        relative_logits=rel_ex,
+                        gate=gate_ex,
+                        sink=sink_bf16_ex,
+                        gated=output,
+                        is_window=self.local,
+                        commit_ring=(self.local and mode == "decode"),
+                        window=self.window,
+                        softmax_scale=self.dim ** -0.5,
+                        max_q_per_req=decode_max_q,
+                        staged_key=staged_k_ex,
+                        staged_value=staged_v_ex,
+                        session=session,
+                        workspace=workspace,
+                        name=f"{name}.attention",
+                    ).functional(session=session)
+                    return
+            elif mode == "prefill" and tokens * self.heads * extent * 2 <= _SM120_MAX_PREFILL_BIAS_BYTES:
+                from hyperflare_recipes.components.inkling2_relative_prefill_ops import _relative_prefill_module
+
+                if _relative_prefill_module() is not None:
+                    rel_ex = example("inkling.attention.relative_bias", (tokens, self.heads, extent))
+                    sink_bf16_ex = example("inkling.attention.sink_bf16", (tokens, self.heads), torch.bfloat16)
+                    if self.local:
+                        staged_cap = -(-(self.window + max(metadata.max_query_tokens, tokens)) // 64) * 64
+                        prefill_key_cache = example(
+                            "inkling.attention.sm120_staged_key",
+                            (requests, staged_cap, self.kv_heads, self.dim),
+                            KV_DTYPE,
+                        )
+                        prefill_val_cache = example(
+                            "inkling.attention.sm120_staged_value",
+                            (requests, staged_cap, self.kv_heads, self.dim),
+                            KV_DTYPE,
+                        )
+                        prefill_window = self.window
+                    else:
+                        staged_cap = 0
+                        prefill_key_cache, prefill_val_cache = cache.key, cache.value
+                        prefill_window = -1
+                    if supports_relative_prefill(
+                        query=query,
+                        key_cache=prefill_key_cache,
+                        value_cache=prefill_val_cache,
+                        relative_logits=rel_ex,
+                        gate=gate_ex,
+                        sink=sink_bf16_ex,
+                        gated=output,
+                        window=prefill_window,
+                    ):
+                        self.use_sm120_prefill = True
+                        self.gate = None
+                        rel_src = example("inkling.attention.relative_source", (tokens * self.heads, RELATIVE_RANK))
+                        self.relative_projection = UnquantizedProjection(
+                            rel_src, weights.relative_rows, rel_ex.view(tokens * self.heads, extent),
+                            session=session, name=f"{name}.relative",
+                        ).functional(session=session)
+                        lengths = example("inkling.attention.lengths", (requests,), torch.int32)
+                        if self.local:
+                            self.sm120_staged_cap = staged_cap
+                            row_elems = self.kv_heads * self.dim
+                            block_e = triton.next_power_of_2(row_elems)
+                            row_stride = cache.key_rings.stride(0)
+                            if (
+                                cache.value_rings.stride(0) != row_stride
+                                or cache.key_rings.stride(1) != 1
+                                or cache.value_rings.stride(1) != 1
+                            ):
+                                raise ValueError("ring staging requires matching row strides and contiguous ring elements")
+                            self._stage_right_opts = dict(
+                                RING_LEN=self.ring, RING_ROW_STRIDE=row_stride, WINDOW=self.window, CAPACITY=staged_cap,
+                                ROW_ELEMS=row_elems, MAX_TOKENS=tokens, BLOCK_E=block_e, num_warps=4,
+                            )
+                            self._stage_right_grid = (requests, staged_cap, 1)
+                            self._stage_right_compiled = prepare_triton(
+                                _stage_kv_right_aligned_kernel,
+                                (cache.key_rings.view(KV_DTYPE), cache.value_rings.view(KV_DTYPE), key, value,
+                                 metadata.state_rows, metadata.starts, metadata.lengths, metadata.query_start_loc,
+                                 prefill_key_cache, prefill_val_cache, lengths),
+                                self._stage_right_grid, **self._stage_right_opts,
+                            ).compiled
+                            retain_w = min(metadata.max_query_tokens, self.ring)
+                            counts_ex = example("inkling.attention.retain_counts", (requests,), torch.int32)
+                            self._retain_opts = dict(
+                                RING_LEN=self.ring, RING_ROW_STRIDE=row_stride, ROW_ELEMS=row_elems, MAX_TOKENS=tokens,
+                                BLOCK_E=block_e, num_warps=4,
+                            )
+                            self._retain_grid = (requests, retain_w, 1)
+                            self._retain_compiled = prepare_triton(
+                                _retain_kv_kernel,
+                                (cache.key_rings.view(KV_DTYPE), cache.value_rings.view(KV_DTYPE), key, value,
+                                 metadata.state_rows, metadata.starts, counts_ex, metadata.query_start_loc),
+                                self._retain_grid, **self._retain_opts,
+                            ).compiled
+                        else:
+                            slots = example("inkling.attention.slots", (tokens,), torch.int64)
+                            self.writer = PreparedPagedKVWriter(
+                                key, value, cache.key, cache.value, slots,
+                                session=session, name=f"{name}.cache_write",
+                            ).functional()
+                        self.attention = PreparedRelativePrefillAttention(
+                            query=query,
+                            key_cache=prefill_key_cache,
+                            value_cache=prefill_val_cache,
+                            page_table=None if self.local else metadata.page_table,
+                            lengths=lengths,
+                            query_start_loc=metadata.query_start_loc,
+                            relative_logits=rel_ex,
+                            gate=gate_ex,
+                            sink=sink_bf16_ex,
+                            gated=output,
+                            window=prefill_window,
+                            softmax_scale=self.dim ** -0.5,
+                            session=session,
+                            workspace=workspace,
+                            name=f"{name}.attention",
+                        ).functional(
+                            session=session,
+                            k_cache=None if self.local else cache.key,
+                            v_cache=None if self.local else cache.value,
+                        )
+                        return
+        self.gate = PreparedHeadGate(attended.view(tokens, channels, 1), projection[:, channels:2 * channels],
+            session=session, name=f"{name}.gate").functional(session=session)
+        slots = example("inkling.attention.slots", (tokens,), torch.int64)
+        requests = metadata.lengths.numel()
         if self.local and mode in ("prefill", "verify"):
             self.staged_pages = -(-(self.window - 1 + metadata.max_query_tokens) // PAGE_TOKENS)
             count = requests * self.staged_pages
@@ -310,7 +542,12 @@ class PreparedAttention(torch.nn.Module):
             dynamic=None if self.local else parts["key_lags"].reshape(dynamic_shape))
         value, value_previous = self.value_convolution(value_raw, m,
             dynamic=None if self.local else parts["value_lags"].reshape(dynamic_shape))
-        tau = None if self.local else log_scaling(m.positions, t.log_scaling_floor, t.log_scaling_alpha)
+        if self.local:
+            tau = None
+        elif self.tau_op is not None:
+            tau = self.tau_op(m.positions)
+        else:
+            tau = log_scaling(m.positions, t.log_scaling_floor, t.log_scaling_alpha)
         if self.mode != "verify":
             self.key_convolution.commit(key_previous, key_raw, m)
             self.value_convolution.commit(value_previous, value_raw, m)
@@ -320,7 +557,12 @@ class PreparedAttention(torch.nn.Module):
         value = self.value_norm(value.view(-1, dim)).view(tokens, kv_heads, dim)
         relative = l2_clip(parts["relative"].reshape(tokens, heads, RELATIVE_RANK), t.relative_clip,
                            scale=self.weights.relative_clip_scale, tau=tau)
-        return dict(query=query, key=key, value=value, relative=relative, sink=parts["sink"].to(dtype=torch.float32, memory_format=torch.contiguous_format),
+        sink = (
+            parts["sink"]
+            if (self.use_sm120_decode or self.use_sm120_prefill)
+            else parts["sink"].to(dtype=torch.float32, memory_format=torch.contiguous_format)
+        )
+        return dict(query=query, key=key, value=value, relative=relative, sink=sink,
                     gate=parts["gate"].reshape(tokens, heads, dim), key_raw=key_raw, value_raw=value_raw,
                     key_previous=key_previous, value_previous=value_previous)
 
@@ -334,8 +576,11 @@ class PreparedAttention(torch.nn.Module):
             attended = self._verify(values, m)
         else:
             attended = self._decode(values, m)
-        attended = self.gate(attended.view(attended.shape[0], -1, 1),
-            values["gate"].reshape(attended.shape[0], -1)).flatten(1)
+        if self.gate is not None:
+            attended = self.gate(attended.view(attended.shape[0], -1, 1),
+                values["gate"].reshape(attended.shape[0], -1)).flatten(1)
+        else:
+            attended = attended.flatten(1)
         return attended, self.output_projection(attended), values
 
     def forward(self, streams, metadata):
@@ -355,6 +600,19 @@ class PreparedAttention(torch.nn.Module):
         )
         return staged_key, staged_value, lengths
 
+    def _stage_kv_right_aligned(self, key, value, m):
+        requests = m.lengths.numel()
+        staged_key = torch.empty((requests, self.sm120_staged_cap, self.kv_heads, self.dim), dtype=KV_DTYPE, device=key.device)
+        staged_value = torch.empty((requests, self.sm120_staged_cap, self.kv_heads, self.dim), dtype=KV_DTYPE, device=key.device)
+        lengths = torch.empty((requests,), dtype=torch.int32, device=key.device)
+        launch_triton(
+            _stage_kv_right_aligned_kernel, self._stage_right_compiled,
+            (self.cache.key_rings.view(KV_DTYPE), self.cache.value_rings.view(KV_DTYPE), key, value,
+             m.state_rows, m.starts, m.lengths, m.query_start_loc, staged_key, staged_value, lengths),
+            self._stage_right_grid, **self._stage_right_opts,
+        )
+        return staged_key, staged_value, lengths
+
     def _retain_kv(self, key, value, counts, m):
         launch_triton(
             _retain_kv_kernel, self._retain_compiled,
@@ -363,8 +621,33 @@ class PreparedAttention(torch.nn.Module):
             self._retain_grid, **self._retain_opts,
         )
 
+    def _relative_bias(self, relative):
+        tokens = relative.shape[0]
+        if self.relative_projection is not None:
+            return self.relative_projection(relative.flatten(0, 1)).view(tokens, self.heads, -1)
+        return (relative.reshape(tokens * self.heads, RELATIVE_RANK) @ self.weights.relative_projection).view(
+            tokens, self.heads, -1
+        )
+
     def _prefill(self, v, m):
         key, value = v["key"], v["value"]
+        if self.use_sm120_prefill:
+            bias = self._relative_bias(v["relative"])
+            if self.local:
+                staged_key, staged_value, staged = self._stage_kv_right_aligned(key, value, m)
+                self._retain_kv(key, value, m.lengths, m)
+                return self.attention(
+                    v["query"], key_cache=staged_key, value_cache=staged_value,
+                    lengths=staged, cu_seqlens_q=m.query_start_loc,
+                    relative_logits=bias, gate=v["gate"], sink=v["sink"],
+                )
+            self.writer(key, value, _page_slots(m))
+            lengths = torch.where(m.lengths > 0, m.starts + m.lengths, 0).int()
+            return self.attention(
+                v["query"], page_table=m.page_table, lengths=lengths,
+                cu_seqlens_q=m.query_start_loc, relative_logits=bias,
+                gate=v["gate"], sink=v["sink"],
+            )
         if self.local:
             staged_key, staged_value, staged = self._stage_kv(key, value, m)
             self._retain_kv(key, value, m.lengths, m)
@@ -379,6 +662,15 @@ class PreparedAttention(torch.nn.Module):
                               cache_seqlens=lengths, page_table=m.page_table, cu_seqlens_q=m.query_start_loc)
 
     def _decode(self, v, m):
+        if self.use_sm120_decode:
+            bias = self._relative_bias(v["relative"])
+            return self.attention(
+                v["query"], new_key=v["key"], new_value=v["value"],
+                page_table=None if self.local else m.page_table,
+                state_rows=m.state_rows if self.local else None,
+                starts=m.starts, cu_seqlens_q=m.query_start_loc,
+                relative_logits=bias, gate=v["gate"], sink=v["sink"],
+            )
         if self.local:
             slots = ring_slots(m.positions, m.state_rows[m.requests], self.ring, self.cache.ring_row_pages)
             pages, lengths = rotated_ring(m, self.ring, self.window, self.cache.ring_row_pages)
@@ -387,13 +679,21 @@ class PreparedAttention(torch.nn.Module):
             pages = m.page_table
             lengths = torch.where(m.lengths > 0, m.starts + m.lengths, 0).int()
         self.writer(v["key"], v["value"], slots)
-        tokens = v["relative"].shape[0]
-        bias = (v["relative"].reshape(tokens * self.heads, RELATIVE_RANK) @ self.weights.relative_projection)
-        attended = self.attention(v["query"], sink=v["sink"], relative_bias=bias.view(tokens, self.heads, -1),
+        bias = self._relative_bias(v["relative"])
+        attended = self.attention(v["query"], sink=v["sink"], relative_bias=bias,
                                   cache_seqlens=lengths, page_table=pages, cu_seqlens_q=m.query_start_loc)
         return attended
 
     def _verify(self, v, m):
+        if self.use_sm120_decode:
+            bias = self._relative_bias(v["relative"])
+            return self.attention(
+                v["query"], new_key=v["key"], new_value=v["value"],
+                page_table=None if self.local else m.page_table,
+                state_rows=m.state_rows if self.local else None,
+                starts=m.starts, cu_seqlens_q=m.query_start_loc,
+                relative_logits=bias, gate=v["gate"], sink=v["sink"],
+            )
         if self.local:
             cache_key, cache_value, lengths = self._stage_kv(v["key"], v["value"], m)
             pages = self.staged_table
@@ -402,8 +702,7 @@ class PreparedAttention(torch.nn.Module):
             self.writer(v["key"], v["value"], _page_slots(m))
             lengths, pages = torch.where(m.lengths > 0, m.starts + m.lengths, 0).int(), m.page_table
             kwargs = {}
-        bias = (v["relative"].flatten(0, 1) @ self.weights.relative_projection).view(
-            v["relative"].shape[0], self.heads, -1)
+        bias = self._relative_bias(v["relative"])
         return self.attention(v["query"], sink=v["sink"], relative_bias=bias,
             cache_seqlens=lengths, page_table=pages, cu_seqlens_q=m.query_start_loc, **kwargs)
 
@@ -439,6 +738,54 @@ def _stage_kv_kernel(
     mask = cols < ROW_ELEMS
 
     if length <= 0 or pos >= start + length:
+        z = tl.zeros((BLOCK_E,), dtype=tl.float8e4nv)
+        tl.store(OutKey + out_offset + cols, z, mask=mask)
+        tl.store(OutVal + out_offset + cols, z, mask=mask)
+    elif pos < start:
+        srow = tl.load(StateRows + b).to(tl.int64)
+        slot = pos % RING_LEN
+        ring_offset = srow * RING_ROW_STRIDE + slot * ROW_ELEMS
+        k = tl.load(KeyRings + ring_offset + cols, mask=mask)
+        v = tl.load(ValRings + ring_offset + cols, mask=mask)
+        tl.store(OutKey + out_offset + cols, k, mask=mask)
+        tl.store(OutVal + out_offset + cols, v, mask=mask)
+    else:
+        qstart = tl.load(QueryStartLoc + b).to(tl.int64)
+        idx = tl.minimum(tl.maximum(qstart + pos - start, 0), MAX_TOKENS - 1)
+        val_offset = idx * ROW_ELEMS
+        k_bf = tl.load(KeyVals + val_offset + cols, mask=mask, other=0.0).to(tl.float32)
+        v_bf = tl.load(ValVals + val_offset + cols, mask=mask, other=0.0).to(tl.float32)
+        k_fp8 = tl.minimum(tl.maximum(k_bf, -448.0), 448.0).to(tl.float8e4nv)
+        v_fp8 = tl.minimum(tl.maximum(v_bf, -448.0), 448.0).to(tl.float8e4nv)
+        tl.store(OutKey + out_offset + cols, k_fp8, mask=mask)
+        tl.store(OutVal + out_offset + cols, v_fp8, mask=mask)
+
+
+@triton.jit
+def _stage_kv_right_aligned_kernel(
+    KeyRings, ValRings, KeyVals, ValVals,
+    StateRows, Starts, Lengths, QueryStartLoc,
+    OutKey, OutVal, OutLengths,
+    RING_LEN: tl.constexpr, RING_ROW_STRIDE: tl.constexpr, WINDOW: tl.constexpr, CAPACITY: tl.constexpr,
+    ROW_ELEMS: tl.constexpr, MAX_TOKENS: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+):
+    """Fused K/V right-aligned sliding-window staging for SM120 relative prefill attention."""
+    b = tl.program_id(0).to(tl.int64)
+    j = tl.program_id(1).to(tl.int64)
+    start = tl.load(Starts + b).to(tl.int64)
+    length = tl.load(Lengths + b).to(tl.int64)
+    if j == 0:
+        hist = tl.minimum(start, WINDOW)
+        out_len = tl.where(length > 0, hist + length, 0).to(tl.int32)
+        tl.store(OutLengths + b, out_len)
+
+    pos = start - WINDOW + j
+    out_offset = (b * CAPACITY + j) * ROW_ELEMS
+    cols = tl.arange(0, BLOCK_E)
+    mask = cols < ROW_ELEMS
+
+    if length <= 0 or pos < 0 or pos >= start + length:
         z = tl.zeros((BLOCK_E,), dtype=tl.float8e4nv)
         tl.store(OutKey + out_offset + cols, z, mask=mask)
         tl.store(OutVal + out_offset + cols, z, mask=mask)

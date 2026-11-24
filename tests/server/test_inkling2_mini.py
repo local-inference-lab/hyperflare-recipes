@@ -24,7 +24,7 @@ def service():
     url = url.rstrip("/")
     with urllib.request.urlopen(url + "/v1/models", timeout=10) as response:
         model = json.load(response)["data"][0]
-    assert model["id"] == "inkling-2-mini"
+    assert model["id"] in ("inkling-2-mini", "TML-d24-varloop-research")
     assert "text" in model["flare"]["input_modalities"]
 
     def ask(prompt, **options):
@@ -39,7 +39,7 @@ def service():
         assert result["usage"]["completion_tokens"] == len(result["choices"][0]["token_ids"])
         return result
 
-    return ask, model["flare"]
+    return ask, model["flare"], model["id"]
 
 
 def answer(result):
@@ -47,7 +47,7 @@ def answer(result):
 
 
 def test_text_reasoning_and_request_isolation(service):
-    ask, settings = service
+    ask, settings, _ = service
     result = ask("What is 17 times 23? Put only the integer in the final answer.")
     assert answer(result) == "391"
     assert result["choices"][0]["message"]["reasoning_content"].strip()
@@ -59,8 +59,9 @@ def test_text_reasoning_and_request_isolation(service):
 
 
 def test_streamed_reasoning_and_answer(service):
+    _, _, model_id = service
     url = os.environ["FLARE_INKLING2_MINI_TEST_URL"].rstrip("/")
-    body = dict(model="inkling-2-mini", messages=[dict(role="user",
+    body = dict(model=model_id, messages=[dict(role="user",
         content="What is 17 times 23? Put only the integer in the final answer.")],
         max_tokens=768, seed=1234, stream=True, stream_options=dict(include_usage=True))
     request = urllib.request.Request(url + "/v1/chat/completions", json.dumps(body).encode(),
@@ -84,7 +85,7 @@ def test_streamed_reasoning_and_answer(service):
 
 
 def test_chunked_prefix_restore_and_branching(service):
-    ask, settings = service
+    ask, settings, model_id = service
     # Cross the 1024-token local-attention ring and the largest prefill graph.
     count = max(200, settings["prefill_chunk_size"] // 8)
     prefix = " ".join(f"Item {i} records code {i * 17 % 997}." for i in range(count))
@@ -103,7 +104,7 @@ def test_chunked_prefix_restore_and_branching(service):
         # Timing probes can change decode capacity within a request. Exact
         # state transfer is checked separately, without cross-capacity arithmetic.
         prefix_ids = first["prompt_token_ids"] + first["choices"][0]["token_ids"][:64]
-        body = dict(model="inkling-2-mini", prompt=prefix_ids, max_tokens=1, seed=1234,
+        body = dict(model=model_id, prompt=prefix_ids, max_tokens=1, seed=1234,
                     logprobs=20, return_tokens_as_token_ids=True, ignore_eos=True)
         completions = []
         url = os.environ["FLARE_INKLING2_MINI_TEST_URL"].rstrip("/")
@@ -118,11 +119,12 @@ def test_chunked_prefix_restore_and_branching(service):
 
 
 def test_tml_tool_call(service):
+    _, _, model_id = service
     tools = [dict(type="function", function=dict(name="lookup_weather", description="Get a city's weather.",
         parameters=dict(type="object", properties=dict(city=dict(type="string")), required=["city"])))]
     # Tool calls terminate with tool_calls, so inspect this response separately.
     url = os.environ["FLARE_INKLING2_MINI_TEST_URL"].rstrip("/")
-    body = dict(model="inkling-2-mini", messages=[dict(role="user", content="Use lookup_weather for Paris.")],
+    body = dict(model=model_id, messages=[dict(role="user", content="Use lookup_weather for Paris.")],
                 tools=tools, tool_choice="required", max_tokens=768, seed=1234)
     request = urllib.request.Request(url + "/v1/chat/completions", json.dumps(body).encode(),
                                      {"Content-Type": "application/json"})
@@ -138,7 +140,7 @@ def test_tml_tool_call(service):
 def test_images_and_cached_image_prefixes(service):
     from .test_minimax_m3 import image
 
-    ask, settings = service
+    ask, settings, _ = service
     if "image" not in settings["input_modalities"]:
         pytest.skip("requires a vision-enabled Mini core")
     labels = ("FIRST 128", "SECOND 256", "THIRD 512", "FOURTH 1024")
@@ -148,9 +150,11 @@ def test_images_and_cached_image_prefixes(service):
                *pictures, dict(type="text", text="Read all four image labels in order. Only output the labels.")]
     # A complete system message supplies an anchor independently of timing costs.
     # Prime snapshot and prefill estimates before testing optional prompt-end retention.
+    calibration_notes = " ".join(
+        f"Entry {i} calibration note." for i in range(settings["prefill_chunk_size"] // 4 + 100)
+    )
     calibration = ask("", messages=[
-        dict(role="system", content="Read these notes before answering. "
-             + "calibration " * (settings["prefill_chunk_size"] + 100)),
+        dict(role="system", content="Read these notes before answering. " + calibration_notes),
         dict(role="user", content="Repeat exactly the code CALIBRATED.")])
     assert answer(calibration) == "CALIBRATED"
     assert calibration["usage"]["prompt_tokens"] > settings["prefill_chunk_size"]

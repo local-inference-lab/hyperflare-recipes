@@ -8,6 +8,11 @@ from types import SimpleNamespace
 import torch
 
 from ignition.components.collectives import PreparedAllGather, PreparedChunkedAllReduce
+from hyperflare_recipes.components.inkling2_router_ops import (
+    PreparedInkling2SplitKRouter,
+    splitk_router_eligible,
+)
+from hyperflare_recipes.components.moe import RouterScratch
 from hyperflare_recipes.components.rms_norm import PreparedTorchRMSNorm
 from hyperflare_recipes.components.situ_experts import PreparedSiTUExperts
 from ignition.preparation.examples import declaration_tensor
@@ -39,6 +44,24 @@ class PreparedLoopLayer(PreparedLayer):
                 self.shared_qkv_cat = PreparedSharedQKVNormCat(weights.input_norms[0],
                     base_stream=base, num_streams=num_cross_pass_streams, tokens=tokens,
                     hidden=text.hidden, eps=text.eps, device=weights.router.device, examples=examples)
+
+    def _build_router(self, source, weights, text, metadata, *, tokens, session, name, example):
+        if splitk_router_eligible(source, weights.router, weights.correction, None, text.experts_per_token):
+            device = weights.router.device
+            logits = example("router_logits", (tokens, text.experts), torch.float32)
+            routes = RouterScratch.allocate(tokens, device, experts=text.experts, top_k=text.experts_per_token)
+            self.router_dtype = weights.router.dtype
+            self.router_projection = None
+            self.router = None
+            self.splitk_router = PreparedInkling2SplitKRouter(
+                source, weights.router, weights.correction, logits, routes.ids, routes.weights,
+                session=session, name=name + ".splitk_router", route_scale=text.route_scale,
+                num_valid_tokens=metadata.live_counts[:1],
+            ).functional(session=session)
+            return routes
+        self.splitk_router = None
+        return super()._build_router(source, weights, text, metadata, tokens=tokens, session=session,
+                                     name=name, example=example)
 
     def _build_experts(self, source, weights, routes, *, tokens, mode, session, workspace, name, example):
         del source, routes, mode, session, workspace, name, example
@@ -81,7 +104,10 @@ class PreparedLoopLayer(PreparedLayer):
         else:
             n0, n1, probs = cross_pass
             mlp_input = self.gates[3](self.mlp_mix.mix(sources, **options)[0], n0, n1, probs)
-        routes = self.router(self.router_projection(mlp_input.to(self.router_dtype)), num_valid_tokens=m.live_counts[:1])
+        if self.splitk_router is not None:
+            routes = self.splitk_router(mlp_input, num_valid_tokens=m.live_counts[:1])
+        else:
+            routes = self.router(self.router_projection(mlp_input.to(self.router_dtype)), num_valid_tokens=m.live_counts[:1])
         expert_partial = self.experts(mlp_input, routes.ids, routes.weights)
         mlp_raw = self.reduction(expert_partial.to(self.reduction_dtype)).to(torch.bfloat16)
         mlp, mlp_previous = self.mlp_convolution(mlp_raw, m)
