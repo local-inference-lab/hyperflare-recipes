@@ -35,7 +35,8 @@ def _requires_tp2():
 
 @pytest.mark.parametrize("q_heads,kv_heads", [(24, 2), (12, 1), (6, 1)])
 @pytest.mark.parametrize("tokens", [1, 7, 128, 512, 2048])
-def test_qk_head_norm_mrope_matches_canonical(q_heads, kv_heads, tokens):
+@pytest.mark.parametrize("zero_centered", [True, False])
+def test_qk_head_norm_mrope_matches_canonical(q_heads, kv_heads, tokens, zero_centered):
     """Fused Q/K RMSNorm + 3-axis interleaved MRoPE matches canonical PyTorch within BF16 rounding."""
     _requires_cuda()
     from transformers.models.qwen4_exp.modeling_qwen4_exp import (
@@ -55,11 +56,17 @@ def test_qk_head_norm_mrope_matches_canonical(q_heads, kv_heads, tokens):
         },
     )
     rotary = RotaryTables.allocate(cfg, 8192, device)
-    gen = torch.Generator(device="cpu").manual_seed(1000 + tokens * 17 + q_heads)
-    q_norm = Qwen4ExpTextRMSNorm(256, eps=1e-6).to(device=device, dtype=torch.bfloat16).eval()
-    k_norm = Qwen4ExpTextRMSNorm(256, eps=1e-6).to(device=device, dtype=torch.bfloat16).eval()
-    q_norm.weight.data.copy_((torch.randn((256,), generator=gen) * 0.25).bfloat16().to(device))
-    k_norm.weight.data.copy_((torch.randn((256,), generator=gen) * 0.25).bfloat16().to(device))
+    gen = torch.Generator(device="cpu").manual_seed(1000 + tokens * 17 + q_heads + int(zero_centered))
+    if zero_centered:
+        q_norm = Qwen4ExpTextRMSNorm(256, eps=1e-6).to(device=device, dtype=torch.bfloat16).eval()
+        k_norm = Qwen4ExpTextRMSNorm(256, eps=1e-6).to(device=device, dtype=torch.bfloat16).eval()
+        q_norm.weight.data.copy_((torch.randn((256,), generator=gen) * 0.25).bfloat16().to(device))
+        k_norm.weight.data.copy_((torch.randn((256,), generator=gen) * 0.25).bfloat16().to(device))
+    else:
+        q_norm = torch.nn.RMSNorm(256, eps=1e-6, device=device, dtype=torch.bfloat16).eval()
+        k_norm = torch.nn.RMSNorm(256, eps=1e-6, device=device, dtype=torch.bfloat16).eval()
+        q_norm.weight.data.copy_((1.0 + torch.randn((256,), generator=gen) * 0.25).bfloat16().to(device))
+        k_norm.weight.data.copy_((1.0 + torch.randn((256,), generator=gen) * 0.25).bfloat16().to(device))
 
     q_width = q_heads * 512
     kv_width = kv_heads * 256
@@ -89,6 +96,7 @@ def test_qk_head_norm_mrope_matches_canonical(q_heads, kv_heads, tokens):
         q_heads=q_heads,
         kv_heads=kv_heads,
         eps=1e-6,
+        zero_centered=zero_centered,
     )
     for actual, expected in ((q_fused, q_ref), (k_fused, k_ref)):
         rel_l2 = ((actual.float() - expected.float()).norm() / expected.float().norm().clamp_min(1e-6)).item()
@@ -102,7 +110,7 @@ def test_qk_head_norm_mrope_matches_canonical(q_heads, kv_heads, tokens):
         zero_pos[-2:] = 0
         q_zero, k_zero = qk_head_norm_mrope(
             qkv, q_norm.weight, k_norm.weight, zero_pos, rotary.cos, rotary.sin,
-            q_heads=q_heads, kv_heads=kv_heads, eps=1e-6,
+            q_heads=q_heads, kv_heads=kv_heads, eps=1e-6, zero_centered=zero_centered,
         )
         assert torch.equal(q_fused[-2:], q_zero[-2:])
         assert torch.equal(k_fused[-2:], k_zero[-2:])
@@ -181,6 +189,23 @@ def _run_decoder_forward(forward):
     forward()
 
 
+def _run_decoder_forward_with_capture(decoder, out_draft):
+    from tests.recipes.test_qwen38_pipelined_prefill_cuda import _CaptureMetadata
+
+    runtime = decoder.state.begin_runtime()
+    s = decoder.state
+    runtime.capture_metadata = _CaptureMetadata(
+        positions=runtime.qsa.query_positions,
+        starts=runtime.values["positions"],
+        lengths=s.inputs.query_lengths[:1],
+        requests=runtime.qsa.request_ids,
+        state_rows=runtime.gdn.convolution_slots,
+        query_start_loc=runtime.gdn.query_start_loc,
+    )
+    _, _, aux, _ = decoder(runtime)
+    out_draft.copy_(aux.draft_features)
+
+
 def _tp2_terminal_prefill_worker(rank: int, world: int, port: int, tokens: int, cache_dir: str, error_queue):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
@@ -254,15 +279,18 @@ def _tp2_terminal_prefill_worker(rank: int, world: int, port: int, tokens: int, 
         rotary = RotaryTables.allocate(weights.tree.config.text_config, context, device)
 
         def build_env():
-            pool = HybridStatePool.allocate(slots + 1, device, speculative_tokens=0, world_size=world)
+            pool = HybridStatePool.allocate(slots + 1, device, speculative_tokens=7, world_size=world)
             requests = DeviceRequestState.allocate(device, capacity=slots)
             inputs = DecoderInputs.allocate(device, context=context, tokens=tokens, capacity=slots)
-            cache = {3: QSAState.allocate(pages=1, slots=slots + 1, device=device, draft_tokens=0, kv_heads=1)}
+            cache = {3: QSAState.allocate(pages=1, slots=slots + 1, device=device, draft_tokens=7, kv_heads=1)}
             completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + 1), device=device)
             return pool, requests, inputs, cache, completion
 
         ref_pool, ref_req, ref_in, ref_cache, ref_comp = build_env()
         split_pool, split_req, split_in, split_cache, split_comp = build_env()
+        draft_cfg = SimpleNamespace(target_layers=(0, 1, 2, 3, 4), attention=SimpleNamespace(window=256))
+        ref_draft_out = torch.empty((256, 5 * 2560), dtype=torch.bfloat16, device=device)
+        split_draft_out = torch.empty((256, 5 * 2560), dtype=torch.bfloat16, device=device)
 
         session = RecordedPreparationSession(
             device=device,
@@ -298,18 +326,26 @@ def _tp2_terminal_prefill_worker(rank: int, world: int, port: int, tokens: int, 
             )
 
         ref_scratch = DecoderScratch.allocate(tokens, device, sample_rows=1, world_size=world)
-        ref_state = PreparedDecoderState(ref_in, ref_req, ref_pool, tokens=tokens, rows=1, mode="prefill", maintain_draft_state=False)
+        ref_state = PreparedDecoderState(ref_in, ref_req, ref_pool, tokens=tokens, rows=1, mode="prefill", maintain_draft_state=True)
         ref_dec = PreparedDecoder(
             weights, ref_scratch, ref_state, ref_cache, rotary, table, arena,
             ref_comp, frame, sequence, session=session, name=f"ref_term_{tokens}",
             max_cache_pages=num_pages, sample=True, **dec_collectives,
         )
+        ref_dec.capture_context(
+            SimpleNamespace(
+                positions=ref_state.qsa.query_positions, starts=ref_state.token_state.positions,
+                lengths=ref_state.inputs.query_lengths[:1], requests=ref_state.qsa.request_ids,
+                state_rows=ref_state.gdn.convolution_slots, query_start_loc=ref_state.gdn.query_start_loc,
+            ),
+            draft_cfg,
+            compact_prefill=True,
+        )
         ref_dec.functional(session=session)
         ref_dec.release_outputs()
-        ref_fwd = PreparedDecoderForward(ref_dec)
 
         split_scratch = DecoderScratch.allocate(tokens, device, sample_rows=1, world_size=world)
-        nonterm_state = PreparedDecoderState(split_in, split_req, split_pool, tokens=tokens, rows=1, mode="prefill", maintain_draft_state=False)
+        nonterm_state = PreparedDecoderState(split_in, split_req, split_pool, tokens=tokens, rows=1, mode="prefill", maintain_draft_state=True)
         nonterm_dec = PreparedDecoder(
             weights, split_scratch, nonterm_state, split_cache, rotary, table, arena,
             split_comp, frame, sequence, session=session, name=f"nonterm_{tokens}",
@@ -320,11 +356,19 @@ def _tp2_terminal_prefill_worker(rank: int, world: int, port: int, tokens: int, 
         assert nonterm_dec.sampler is None
         assert nonterm_dec.completion_recorder is not None
         assert nonterm_dec.pipelined_prefill is (tokens >= 4096)
+        nonterm_dec.capture_context(
+            SimpleNamespace(
+                positions=nonterm_state.qsa.query_positions, starts=nonterm_state.token_state.positions,
+                lengths=nonterm_state.inputs.query_lengths[:1], requests=nonterm_state.qsa.request_ids,
+                state_rows=nonterm_state.gdn.convolution_slots, query_start_loc=nonterm_state.gdn.query_start_loc,
+            ),
+            draft_cfg,
+            compact_prefill=True,
+        )
         nonterm_dec.functional(session=session)
         nonterm_dec.release_outputs()
-        nonterm_fwd = PreparedDecoderForward(nonterm_dec)
 
-        term_state = PreparedDecoderState(split_in, split_req, split_pool, tokens=tokens, rows=1, mode="prefill", maintain_draft_state=False)
+        term_state = PreparedDecoderState(split_in, split_req, split_pool, tokens=tokens, rows=1, mode="prefill", maintain_draft_state=True)
         term_dec = PreparedDecoder(
             weights, split_scratch, term_state, split_cache, rotary, table, arena,
             split_comp, frame, sequence, session=session, name=f"term_{tokens}",
@@ -356,8 +400,8 @@ def _tp2_terminal_prefill_worker(rank: int, world: int, port: int, tokens: int, 
         )
         compiled = fwd_cache.prepare_many(
             {
-                "ref": partial(_run_decoder_forward, ref_fwd),
-                "nonterm": partial(_run_decoder_forward, nonterm_fwd),
+                "ref": partial(_run_decoder_forward_with_capture, ref_dec, ref_draft_out),
+                "nonterm": partial(_run_decoder_forward_with_capture, nonterm_dec, split_draft_out),
                 "term": partial(_run_decoder_forward, term_fwd),
             },
             {"ref": ("ref", tokens), "nonterm": ("nonterm", tokens), "term": ("term", tokens)},
@@ -442,6 +486,8 @@ def _tp2_terminal_prefill_worker(rank: int, world: int, port: int, tokens: int, 
             with torch.cuda.stream(stream):
                 graphs["ref"].replay()
             stream.synchronize()
+            ref_chunk0_residual_repeat = ref_pool.region("target_residual")[1].clone()
+            ref_chunk0_draft_repeat = ref_draft_out.clone()
             chunk1_len = tokens // 2 + 17
             sequence.fill_(12)
             stage_chunk(ref_in, consumed=tokens, live_len=chunk1_len, sample_enabled=True, token_values=tok1, rope_offset=20)
@@ -479,6 +525,33 @@ def _tp2_terminal_prefill_worker(rank: int, world: int, port: int, tokens: int, 
             assert int(split_req.pending_token[0].item()) == -1
             assert torch.equal(split_req.rng_counter, ref_req.rng_counter)
             assert torch.equal(split_pool.last_hidden[1], poisoned_hidden), "non-terminal prefill mutated last_hidden"
+            # Verify MTP target_residual/target_residual_position and DFlash2 context capture on sample=False.
+            assert torch.equal(
+                split_pool.region("target_residual_position")[1],
+                ref_pool.region("target_residual_position")[1],
+            ), "chunk 0 target_residual_position diverged"
+            res0_repeat = (
+                (ref_chunk0_residual_repeat.float() - ref_pool.region("target_residual")[1].float()).norm()
+                / ref_pool.region("target_residual")[1].float().norm().clamp_min(1e-6)
+            ).item()
+            res0_rel = (
+                (split_pool.region("target_residual")[1].float() - ref_pool.region("target_residual")[1].float()).norm()
+                / ref_pool.region("target_residual")[1].float().norm().clamp_min(1e-6)
+            ).item()
+            assert res0_rel <= max(2e-3, 2.5 * res0_repeat) and res0_rel < 0.15, (
+                f"chunk 0 target_residual diverged: rel_l2={res0_rel:.6f} (repeat={res0_repeat:.6f})"
+            )
+            draft0_repeat = (
+                (ref_chunk0_draft_repeat.float() - ref_draft_out.float()).norm()
+                / ref_draft_out.float().norm().clamp_min(1e-6)
+            ).item()
+            draft0_rel = (
+                (split_draft_out.float() - ref_draft_out.float()).norm()
+                / ref_draft_out.float().norm().clamp_min(1e-6)
+            ).item()
+            assert draft0_rel <= max(2e-3, 2.5 * draft0_repeat) and draft0_rel < 0.15, (
+                f"chunk 0 DFlash2 draft_features diverged: rel_l2={draft0_rel:.6f} (repeat={draft0_repeat:.6f})"
+            )
             assert torch.equal(final_split_cache[3].raw_logical_positions, final_ref_cache[3].raw_logical_positions)
             assert torch.equal(final_split_cache[3].raw_rope_positions, final_ref_cache[3].raw_rope_positions)
             assert torch.equal(

@@ -223,12 +223,21 @@ class PreparedAttention:
         self.module, self.scratch, self.state = module, scratch, state
         self.metadata, self.rotary = metadata, rotary
         self.tokens = source.shape[0]
-        if (getattr(module.q_norm, "group_size", None) is not None
-                or getattr(module.k_norm, "group_size", None) is not None
-                or type(module.q_norm) is not type(module.k_norm)
-                or module.q_norm.eps != module.k_norm.eps):
-            raise ValueError("QSA fused Q/K RMSNorm requires matching ungrouped norms")
-        self._qk_norm_zero_centered = not isinstance(module.q_norm, torch.nn.RMSNorm)
+        from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextRMSNorm
+
+        q_norm, k_norm = module.q_norm, module.k_norm
+        if (not isinstance(q_norm, (Qwen4ExpTextRMSNorm, torch.nn.RMSNorm))
+                or type(q_norm) is not type(k_norm)
+                or getattr(q_norm, "group_size", None) is not None
+                or getattr(k_norm, "group_size", None) is not None
+                or type(q_norm.eps) not in (int, float)
+                or not (q_norm.eps >= 0)
+                or q_norm.eps != k_norm.eps):
+            raise ValueError(
+                "QSA fused Q/K RMSNorm requires matching ungrouped Qwen4ExpTextRMSNorm or "
+                "torch.nn.RMSNorm modules with nonnegative numeric eps"
+            )
+        self._qk_norm_zero_centered = isinstance(q_norm, Qwen4ExpTextRMSNorm)
         if source.shape != scratch.output.shape or source.dtype != torch.bfloat16:
             raise ValueError("QSA source must match BF16 [token_capacity, 2560] output")
         if bool((metadata.request_ids != -1).any().item()) or bool((metadata.slot_mapping != -1).any().item()):

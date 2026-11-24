@@ -82,14 +82,6 @@ def _terminal_prefill_capacities(prefill_capacities: tuple[int, ...], *, has_ter
     return (prefill_capacities[-1],)
 
 
-def _terminal_prefill_window(prefill_capacities: tuple[int, ...], terminal_capacities: tuple[int, ...]) -> int:
-    """Return the Helios terminal-prefill lookahead window implied by the catalog split."""
-    if not terminal_capacities:
-        return 0
-    terminal = set(terminal_capacities)
-    return max((capacity for capacity in prefill_capacities if capacity not in terminal), default=0)
-
-
 @dataclass(frozen=True)
 class PreparationConfig(BasePreparationConfig):
     prompt_logprobs: bool = False
@@ -508,7 +500,6 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
         terminal_capacities = _terminal_prefill_capacities(
             config.prefill_capacities, has_terminal_op=hasattr(contract_proto, "TERMINAL_PREFILL"),
         )
-        terminal_window = _terminal_prefill_window(config.prefill_capacities, terminal_capacities)
         graph_count = (4 + len(graph_modes) * (prefill_graph_count(config.prefill_capacities, scoring)
                                               + len(terminal_capacities)
                                               + 4 * len(config.batch_capacities))
@@ -587,11 +578,10 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                                 sampling_workspace=sampling_workspace, result_runtime=result_collective,
                                 scoring=scoring if graph_kind == "scored_prefill" else None,
                                 sample=sample, **decoder_collectives)
-                            skip_dflash_context = (
-                                not sample and enabled and has_dflash
-                                and terminal_window >= draft_config.attention.window
-                            )
-                            if enabled and not skip_dflash_context:
+                            # Retain speculative prefill absorption on non-terminal chunks so
+                            # classic MTP Layer-48 KV and DFlash2 draft KV rings remain complete
+                            # at any dynamically selected prefix checkpoint cut.
+                            if enabled:
                                 forward = speculation.prefill(decoder, name)
                                 if has_mtp:
                                     forward.functional(session=session)

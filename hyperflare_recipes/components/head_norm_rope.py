@@ -122,15 +122,25 @@ def qk_head_norm_mrope(
     zero_centered: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused Q/K RMSNorm and 3-axis interleaved MRoPE from packed [Q, gate, K, V]."""
-    tokens = projected_qkv.shape[0]
+    if (
+        type(q_heads) is not int
+        or type(kv_heads) is not int
+        or q_heads <= 0
+        or kv_heads <= 0
+        or type(eps) not in (int, float)
+        or not (eps >= 0)
+    ):
+        raise ValueError("qk_head_norm_mrope requires positive integer head counts and nonnegative numeric eps")
     expected_cols = q_heads * 2 * head_dim + kv_heads * 2 * head_dim
     if (
         projected_qkv.ndim != 2
+        or projected_qkv.shape[0] <= 0
         or projected_qkv.stride(1) != 1
         or projected_qkv.shape[1] != expected_cols
         or projected_qkv.dtype != torch.bfloat16
     ):
-        raise ValueError("packed QKV projection must be row-contiguous BF16 [tokens, q_heads*2*D + kv_heads*2*D]")
+        raise ValueError("packed QKV projection must be non-empty row-contiguous BF16 [tokens, q_heads*2*D + kv_heads*2*D]")
+    tokens = projected_qkv.shape[0]
     if (
         head_dim <= 0
         or (head_dim & (head_dim - 1)) != 0
@@ -138,6 +148,7 @@ def qk_head_norm_mrope(
         or rotary_dim > head_dim
         or rotary_dim % 2 != 0
         or len(mrope_section) != 3
+        or any(type(section) is not int or section < 0 for section in mrope_section)
         or sum(mrope_section) != rotary_dim // 2
     ):
         raise ValueError("invalid head_dim, rotary_dim, or 3-axis mrope_section geometry")
@@ -158,6 +169,9 @@ def qk_head_norm_mrope(
         or rope_sin.stride(1) != 1
     ):
         raise ValueError("3-axis MRoPE requires [tokens, 3] positions and [capacity, rotary_dim // 2] cos/sin tables")
+    device = projected_qkv.device
+    if any(tensor.device != device for tensor in (q_weight, k_weight, rope_positions, rope_cos, rope_sin)):
+        raise ValueError("qk_head_norm_mrope operands must reside on the same device")
 
     q_out = torch.empty((tokens, q_heads, head_dim), dtype=projected_qkv.dtype, device=projected_qkv.device)
     k_out = torch.empty((tokens, kv_heads, head_dim), dtype=projected_qkv.dtype, device=projected_qkv.device)
