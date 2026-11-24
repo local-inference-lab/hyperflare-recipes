@@ -233,6 +233,8 @@ def test_native_depth_sizes_proposal_and_recovery_storage(config, width):
         completion=None, frame=None, sequence=None, session=None, workspace=None,
         verification_width=width)
     assert owner.study_width is None
+    assert owner.block_proposal_broadcast is True
+    assert owner.forwards.draft.keywords["shortlist_only"] is True
     assert owner.block_size == owner.draft_scratch.block_size == width
     assert (owner.draft_scratch.tokens, owner.draft_scratch.hidden_size) == (2 * width, config.hidden)
     assert owner.records.delta.shape == (48, 2, 48, width, 128)
