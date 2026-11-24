@@ -75,6 +75,21 @@ from ignition.preparation.bootstrap import BasePreparationConfig
 _DMA_PREFILL_TOKENS = 1024
 
 
+def _terminal_prefill_capacities(prefill_capacities: tuple[int, ...], *, has_terminal_op: bool) -> tuple[int, ...]:
+    """Select chunk capacities that split into non-terminal prefill and terminal_prefill graphs."""
+    if not has_terminal_op or not prefill_capacities or prefill_capacities[-1] < 512:
+        return ()
+    return (prefill_capacities[-1],)
+
+
+def _terminal_prefill_window(prefill_capacities: tuple[int, ...], terminal_capacities: tuple[int, ...]) -> int:
+    """Return the Helios terminal-prefill lookahead window implied by the catalog split."""
+    if not terminal_capacities:
+        return 0
+    terminal = set(terminal_capacities)
+    return max((capacity for capacity in prefill_capacities if capacity not in terminal), default=0)
+
+
 @dataclass(frozen=True)
 class PreparationConfig(BasePreparationConfig):
     prompt_logprobs: bool = False
@@ -490,7 +505,12 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
         scoring = PromptScoring.allocate(config, device, buffers, frame=frame, group=group, ipc=ipc,
             runtime=collective, coordinator=coordinator)
         graph_modes = serving_modes(config.mtp, config.mtp_only)
+        terminal_capacities = _terminal_prefill_capacities(
+            config.prefill_capacities, has_terminal_op=hasattr(contract_proto, "TERMINAL_PREFILL"),
+        )
+        terminal_window = _terminal_prefill_window(config.prefill_capacities, terminal_capacities)
         graph_count = (4 + len(graph_modes) * (prefill_graph_count(config.prefill_capacities, scoring)
+                                              + len(terminal_capacities)
                                               + 4 * len(config.batch_capacities))
                        + (len(config.batch_capacities) if False in graph_modes else 0)
                        + (len(config.speculative_shapes) if config.mtp else 0)
@@ -530,49 +550,60 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                     () if enabled else reversed(config.batch_capacities), scoring)
                 for kind, mode, capacities in modes:
                     for capacity in capacities:
-                        rows = 1 if mode == "prefill" else capacity
-                        name = f"{kind}{capacity}" + (suffix if mode == "prefill" else "")
-                        metadata = PreparedDecoderState(inputs, requests, state, tokens=capacity, rows=rows, mode=mode,
-                            maintain_draft_state=enabled and has_mtp)
-                        s = scratch.rows(capacity, rows)
-                        injection = None
-                        if mode == "prefill":
-                            injection = PreparedEmbeddingInjection(features, requests, inputs.vision_token_indices[:capacity],
-                                inputs.row_slot_ids, inputs.row_generations, inputs.query_lengths, inputs.live_rows,
-                                s.embedding, rows=rows)
-                            injection.prepare()
-                        decoder_collectives = (
-                            {**collectives, "runtime": prefill_collective, "barrier_runtime": collective}
-                            if prefill_collective is not None and mode == "prefill" and capacity >= _DMA_PREFILL_TOKENS
-                            else dict(collectives)
+                        variants = (
+                            (("prefill", False), ("terminal_prefill", True))
+                            if kind == "prefill" and capacity in terminal_capacities
+                            else ((kind, True),)
                         )
-                        if (mode == "prefill" and qsa_prefill_gather_collective is not None
-                                and capacity >= 512 and capacity % (32 * shard.world_size) == 0):
-                            decoder_collectives.update(
-                                qsa_gather_runtime=qsa_prefill_gather_collective, qsa_shard_mode="row"
+                        for graph_kind, sample in variants:
+                            rows = 1 if mode == "prefill" else capacity
+                            name = f"{graph_kind}{capacity}" + (suffix if mode == "prefill" else "")
+                            metadata = PreparedDecoderState(inputs, requests, state, tokens=capacity, rows=rows, mode=mode,
+                                maintain_draft_state=enabled and has_mtp)
+                            s = scratch.rows(capacity, rows)
+                            injection = None
+                            if mode == "prefill":
+                                injection = PreparedEmbeddingInjection(features, requests, inputs.vision_token_indices[:capacity],
+                                    inputs.row_slot_ids, inputs.row_generations, inputs.query_lengths, inputs.live_rows,
+                                    s.embedding, rows=rows)
+                                injection.prepare()
+                            decoder_collectives = (
+                                {**collectives, "runtime": prefill_collective, "barrier_runtime": collective}
+                                if prefill_collective is not None and mode == "prefill" and capacity >= _DMA_PREFILL_TOKENS
+                                else dict(collectives)
                             )
-                        elif mode == "decode" and qsa_decode_gather_collective is not None and capacity <= 128:
-                            decoder_collectives.update(
-                                qsa_gather_runtime=qsa_decode_gather_collective, qsa_shard_mode="group"
+                            if (mode == "prefill" and qsa_prefill_gather_collective is not None
+                                    and capacity >= 512 and capacity % (32 * shard.world_size) == 0):
+                                decoder_collectives.update(
+                                    qsa_gather_runtime=qsa_prefill_gather_collective, qsa_shard_mode="row"
+                                )
+                            elif mode == "decode" and qsa_decode_gather_collective is not None and capacity <= 128:
+                                decoder_collectives.update(
+                                    qsa_gather_runtime=qsa_decode_gather_collective, qsa_shard_mode="group"
+                                )
+                            decoder = PreparedDecoder(weights, s, metadata, cache, rotary, table, workspaces,
+                                completion, frame, sequence, session=session, name=name,
+                                embedding_injection=injection, max_cache_pages=planned_pages,
+                                sampling_workspace=sampling_workspace, result_runtime=result_collective,
+                                scoring=scoring if graph_kind == "scored_prefill" else None,
+                                sample=sample, **decoder_collectives)
+                            skip_dflash_context = (
+                                not sample and enabled and has_dflash
+                                and terminal_window >= draft_config.attention.window
                             )
-                        decoder = PreparedDecoder(weights, s, metadata, cache, rotary, table, workspaces,
-                            completion, frame, sequence, session=session, name=name,
-                            embedding_injection=injection, max_cache_pages=planned_pages,
-                            sampling_workspace=sampling_workspace, result_runtime=result_collective,
-                            scoring=scoring if kind == "scored_prefill" else None, **decoder_collectives)
-                        if enabled:
-                            forward = speculation.prefill(decoder, name)
-                            if has_mtp:
-                                forward.functional(session=session)
-                        else:
-                            from .decoder import PreparedDecoderForward
-                            decoder.functional(session=session)
-                            decoder.release_outputs()
-                            forward = PreparedDecoderForward(decoder)
-                        add(name, forward, kind, rows,
-                            capacity if mode == "prefill" else 1,
-                            forward_fields, enabled=enabled)
-                        decoders.append(decoder)
+                            if enabled and not skip_dflash_context:
+                                forward = speculation.prefill(decoder, name)
+                                if has_mtp:
+                                    forward.functional(session=session)
+                            else:
+                                from .decoder import PreparedDecoderForward
+                                decoder.functional(session=session)
+                                decoder.release_outputs()
+                                forward = PreparedDecoderForward(decoder)
+                            add(name, forward, graph_kind, rows,
+                                capacity if mode == "prefill" else 1,
+                                forward_fields, enabled=enabled)
+                            decoders.append(decoder)
 
             if speculation is not None:
                 forward_fields = (*inputs.buffers(), "sampling_grammar_mask",

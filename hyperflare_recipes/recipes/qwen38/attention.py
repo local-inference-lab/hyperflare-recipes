@@ -13,9 +13,9 @@ from functools import partial
 import torch
 from b12x.attention import paged_kv_write, qsa
 from b12x.preparation import PreparationSession, PreparedCall
-from transformers.models.qwen4_exp.modeling_qwen4_exp import apply_rotary_pos_emb
 
 from hyperflare_recipes.components import sm103
+from hyperflare_recipes.components.head_norm_rope import qk_head_norm_mrope
 from hyperflare_recipes.components.sm103_sparse_attention import PARTIAL_ROWS, SPLIT_ROWS, PreparedSparseAttention
 from hyperflare_recipes.components.linear import ParallelProjections, QuantizedProjection, UnquantizedProjection
 from hyperflare_recipes.fixtures import qsa as qsa_fixtures
@@ -223,6 +223,12 @@ class PreparedAttention:
         self.module, self.scratch, self.state = module, scratch, state
         self.metadata, self.rotary = metadata, rotary
         self.tokens = source.shape[0]
+        if (getattr(module.q_norm, "group_size", None) is not None
+                or getattr(module.k_norm, "group_size", None) is not None
+                or type(module.q_norm) is not type(module.k_norm)
+                or module.q_norm.eps != module.k_norm.eps):
+            raise ValueError("QSA fused Q/K RMSNorm requires matching ungrouped norms")
+        self._qk_norm_zero_centered = not isinstance(module.q_norm, torch.nn.RMSNorm)
         if source.shape != scratch.output.shape or source.dtype != torch.bfloat16:
             raise ValueError("QSA source must match BF16 [token_capacity, 2560] output")
         if bool((metadata.request_ids != -1).any().item()) or bool((metadata.slot_mapping != -1).any().item()):
@@ -412,22 +418,32 @@ class PreparedAttention:
         self.scratch = self.metadata = self.index_query = self.index_key = None
         self.binding = self.binding_kwargs = self.write_kwargs = self.workspace = None
 
+    def _prepare_qkv_runtime(self, projected_qkv: torch.Tensor, metadata):
+        q_width = self.q_heads * 512
+        kv_width = self.kv_heads * 256
+        gate = projected_qkv[:, :q_width].view(self.tokens, self.q_heads, 512)[..., 256:]
+        value = projected_qkv[:, q_width + kv_width:].view(self.tokens, self.kv_heads, 256)
+        query, key = qk_head_norm_mrope(
+            projected_qkv,
+            self.module.q_norm.weight,
+            self.module.k_norm.weight,
+            metadata.rope_positions,
+            self.rotary.cos,
+            self.rotary.sin,
+            q_heads=self.q_heads,
+            kv_heads=self.kv_heads,
+            eps=self.module.q_norm.eps,
+            zero_centered=self._qk_norm_zero_centered,
+        )
+        return query, gate, key, value
+
     def pre_gather_runtime(self, source: torch.Tensor, metadata) -> RowGatherStage:
         """Run local QKV/index projections, KV/compressed cache updates, and row-split selection."""
         if self.cache_only or self.sharded is None or self.sharded.mode != "row":
             raise ValueError("pre_gather_runtime requires non-cache-only row-split QSA")
         projected_index = self.projections["indexer.index_qk_proj"](source)
         projected_qkv = self.projections["qkv_proj"](source)
-        q_width = self.q_heads * 512
-        kv_width = self.kv_heads * 256
-        projected_q = projected_qkv[:, :q_width].view(self.tokens, self.q_heads, 512)
-        query, gate = projected_q[..., :256], projected_q[..., 256:]
-        key = projected_qkv[:, q_width:q_width + kv_width].view(self.tokens, self.kv_heads, 256)
-        value = projected_qkv[:, q_width + kv_width:].view(self.tokens, self.kv_heads, 256)
-        cos, sin = self.rotary.gather(metadata.rope_positions)
-        query, key = apply_rotary_pos_emb(self.module.q_norm(query), self.module.k_norm(key), cos, sin,
-                                         unsqueeze_dim=1)
-        query, key = query.contiguous(), key.contiguous()
+        query, gate, key, value = self._prepare_qkv_runtime(projected_qkv, metadata)
         paged_kv_write.run(self.writer, key=key, value=value, k_cache=self.state.main_k_cache,
             v_cache=self.state.main_v_cache, slot_mapping=metadata.slot_mapping,
             k_scale=self.constants["k_descale"], v_scale=self.constants["v_descale"])
@@ -483,16 +499,7 @@ class PreparedAttention:
             projection_workspaces = None
         else:
             (projected_qkv, projected_index), projection_workspaces = self.concurrent.project_runtime(source)
-        q_width = self.q_heads * 512
-        kv_width = self.kv_heads * 256
-        projected_q = projected_qkv[:, :q_width].view(self.tokens, self.q_heads, 512)
-        query, gate = projected_q[..., :256], projected_q[..., 256:]
-        key = projected_qkv[:, q_width:q_width + kv_width].view(self.tokens, self.kv_heads, 256)
-        value = projected_qkv[:, q_width + kv_width:].view(self.tokens, self.kv_heads, 256)
-        cos, sin = self.rotary.gather(metadata.rope_positions)
-        query, key = apply_rotary_pos_emb(self.module.q_norm(query), self.module.k_norm(key), cos, sin,
-                                         unsqueeze_dim=1)
-        query, key = query.contiguous(), key.contiguous()
+        query, gate, key, value = self._prepare_qkv_runtime(projected_qkv, metadata)
         paged_kv_write.run(self.writer, key=key, value=value, k_cache=self.state.main_k_cache,
             v_cache=self.state.main_v_cache, slot_mapping=metadata.slot_mapping,
             k_scale=self.constants["k_descale"], v_scale=self.constants["v_descale"])

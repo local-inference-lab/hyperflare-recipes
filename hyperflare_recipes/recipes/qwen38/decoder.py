@@ -349,7 +349,7 @@ class PreparedDecoder:
                  residual_output: torch.Tensor | None = None, verification: bool = False,
                  gdn_records=None, gdn_in_place: bool = False, runtime=None, barrier_runtime=None, vocabulary_runtime=None,
                  result_runtime=None, qsa_gather_runtime=None, qsa_shard_mode: str | None = None,
-                 coordinator=None, sampling_workspace=None, scoring=None):
+                 coordinator=None, sampling_workspace=None, scoring=None, sample: bool = True):
         from hyperflare_recipes.components.embedding import PreparedEmbedding
         from hyperflare_recipes.components.linear import UnquantizedProjection
         from hyperflare_recipes.components.recurrent import DeltaMetadata
@@ -359,6 +359,10 @@ class PreparedDecoder:
         from .hyperconnection import PreparedHyperconnection
         from .moe import PreparedQwenMoe
         from .ple import PreparedPLE
+
+        if not sample and (state.mode != "prefill" or verification or scoring is not None):
+            raise ValueError("non-sampling decoders require unverified, unscored prefill state")
+        self.sample = bool(sample)
 
         if verification and scratch.sample_hidden.shape == scratch.hidden.shape:
             scratch = replace(scratch, sample_hidden=scratch.hidden)
@@ -483,13 +487,16 @@ class PreparedDecoder:
             mode=state.mode, session=session, name=f"{name}.ple", workspace=workspaces,
             partitions=getattr(state, "ple_partitions", None),
             runtime=runtime if barrier_runtime is None else barrier_runtime, coordinator=coordinator)
-        self.final_mixer = PreparedHyperconnection(language.hyper_connection_mixer,
-            replace(scratch.hyperconnection, block_input=scratch.hidden), priming_state=scratch.residual,
-            session=session, name=f"{name}.final_mixer", runtime=runtime, coordinator=coordinator)
+        self.final_mixer = (
+            PreparedHyperconnection(language.hyper_connection_mixer,
+                replace(scratch.hyperconnection, block_input=scratch.hidden), priming_state=scratch.residual,
+                session=session, name=f"{name}.final_mixer", runtime=runtime, coordinator=coordinator)
+            if self.sample else None
+        )
         for index, (attn_hc, _, mlp_hc, _) in enumerate(self.layers):
             attn_hc.prepare_combine_norm(mlp_hc, priming_state=layer_scratch.residual,
                 session=session, name=f"{name}.layer{index}.attn_combine_norm")
-            if index != 0:
+            if index != 0 and (self.sample or index + 1 < len(self.layers)):
                 following = self.layers[index + 1][0] if index + 1 < len(self.layers) else self.final_mixer
                 mlp_hc.prepare_combine_norm(following, priming_state=layer_scratch.residual,
                     session=session, name=f"{name}.layer{index}.mlp_combine_norm")
@@ -499,7 +506,7 @@ class PreparedDecoder:
                 attn_cn = attn_hc.plans["combine_norm"]
                 workspaces.register_parallel(cr_att_1.reduce.plan, attn_cn)
                 workspaces.register_parallel(cr_mlp_0.reduce.plan, attn_cn)
-                if index > 0:
+                if index > 0 and "combine_norm" in mlp_hc.plans:
                     workspaces.register_parallel(cr_mlp_1.reduce.plan, mlp_hc.plans["combine_norm"])
                 if index >= 2:
                     prev_cr_mlp_1 = self.pipelined_reductions[index - 1][3]
@@ -507,9 +514,14 @@ class PreparedDecoder:
                     workspaces.register_parallel(cr_att_0.reduce.plan, prev_mlp_cn)
                     for plan in _hc_plans(attn_hc) + _attention_plans(attention, is_qsa=index % 4 == 3):
                         workspaces.register_parallel(prev_cr_mlp_1.reduce.plan, plan)
-        state.prepare_hidden(scratch.hidden, scratch.sample_hidden)
+        if self.sample:
+            state.prepare_hidden(scratch.hidden, scratch.sample_hidden)
+        else:
+            state.prepare_rope_delta()
         state.prepare_residual(scratch.residual)
-        if vocabulary_runtime is None:
+        if not self.sample:
+            self.lm_head = None
+        elif vocabulary_runtime is None:
             self.lm_head = UnquantizedProjection(scratch.sample_hidden, weights.tree.lm_head.weight,
                 scratch.logits, session=session, name=f"{name}.lm_head")
         else:
@@ -521,18 +533,27 @@ class PreparedDecoder:
         self.scoring = None if scoring is None else scoring.prepare(scratch.hidden, weights.tree.lm_head.weight,
             vocabulary=248320, session=session, coordinator=coordinator, name=name + ".prompt")
         self.sampler = None
+        self.completion_recorder = None
         if not verification:
-            from ignition.components.sampling import PreparedSampling
-
             state, inputs = self.state, self.state.inputs
-            self.sampler = PreparedSampling(self.scratch.logits, state.requests,
-                inputs.row_slot_ids[:state.rows], inputs.row_generations[:state.rows],
-                inputs.live_rows, completion, frame_index, submission_sequence,
-                sample_enabled=inputs.sample_enabled[:state.rows], workspace=sampling_workspace)
-            self.sampler.prepare()
-            self.sampler.prepare_broadcast(runtime=vocabulary_runtime if result_runtime is None else result_runtime,
-                session=session,
-                coordinator=coordinator, name=name + ".sampling")
+            if self.sample:
+                from ignition.components.sampling import PreparedSampling
+
+                self.sampler = PreparedSampling(self.scratch.logits, state.requests,
+                    inputs.row_slot_ids[:state.rows], inputs.row_generations[:state.rows],
+                    inputs.live_rows, completion, frame_index, submission_sequence,
+                    sample_enabled=inputs.sample_enabled[:state.rows], workspace=sampling_workspace)
+                self.sampler.prepare()
+                self.sampler.prepare_broadcast(runtime=vocabulary_runtime if result_runtime is None else result_runtime,
+                    session=session,
+                    coordinator=coordinator, name=name + ".sampling")
+            else:
+                from ignition.components.sampling import PreparedCompletion
+
+                self.completion_recorder = PreparedCompletion(state.requests,
+                    inputs.row_slot_ids[:state.rows], inputs.row_generations[:state.rows],
+                    inputs.live_rows, completion, frame_index, submission_sequence)
+                self.completion_recorder.prepare()
 
     def capture_context(self, metadata, draft_config, *, compact_prefill=False):
         from hyperflare_recipes.components.dflash2 import PreparedContextCapture
@@ -564,8 +585,10 @@ class PreparedDecoder:
             for reduction in group:
                 reduction.functional(session=session)
         self.ple.functional(session=session)
-        self.final_mixer.functional(session=session)
-        self.lm_head.functional(session=session)
+        if self.final_mixer is not None:
+            self.final_mixer.functional(session=session)
+        if self.lm_head is not None:
+            self.lm_head.functional(session=session)
         if self.sampler is not None:
             self.sampler.functional(session=session)
         if self.context_capture is not None:
@@ -679,11 +702,18 @@ class PreparedDecoder:
             elif index < last_layer:
                 pending_prev = (cr_mlp_1, mlp_hc, p_mlp_b, res_a, mlp_a, mlp_inj_a, res_b, mlp_inj_b)
             else:
-                res_a, norm_a = mlp_hc.combine_norm_runtime(res_a, mlp_a, mlp_inj_a)
-                mlp_b = cr_mlp_1.finish(p_mlp_b, res_a)
-                res_b, norm_b = mlp_hc.combine_norm_runtime(res_b, mlp_b, mlp_inj_b)
-                residual = torch.cat((res_a, res_b), dim=0)
-                normalized = torch.cat((norm_a, norm_b), dim=0)
+                if self.sample:
+                    res_a, norm_a = mlp_hc.combine_norm_runtime(res_a, mlp_a, mlp_inj_a)
+                    mlp_b = cr_mlp_1.finish(p_mlp_b, res_a)
+                    res_b, norm_b = mlp_hc.combine_norm_runtime(res_b, mlp_b, mlp_inj_b)
+                    residual = torch.cat((res_a, res_b), dim=0)
+                    normalized = torch.cat((norm_a, norm_b), dim=0)
+                else:
+                    res_a = mlp_hc.combine_runtime(res_a, mlp_a, mlp_inj_a)
+                    mlp_b = cr_mlp_1.finish(p_mlp_b, res_a)
+                    res_b = mlp_hc.combine_runtime(res_b, mlp_b, mlp_inj_b)
+                    residual = torch.cat((res_a, res_b), dim=0)
+                    normalized = None
                 if self.layer_outputs is not None:
                     self.layer_outputs[index].copy_(residual)
                 if index in self.context_layers:
@@ -727,7 +757,7 @@ class PreparedDecoder:
                 block = moe(mixed)
                 if self.reductions:
                     block = self.reductions[index][1](block)
-                if index == 0:
+                if index == 0 or (not self.sample and index + 1 == len(self.layers)):
                     residual = mlp_hc.combine_runtime(residual, block, injection)
                     normalized = None
                 else:
@@ -737,6 +767,11 @@ class PreparedDecoder:
                 if index in self.context_layers:
                     features = residual.view(-1, 4, 2560).mean(dim=1)
                     self.context_capture(capture, features, self.context_layers.index(index) * 2560)
+        if not self.sample:
+            self.state.finish_runtime(runtime, None, residual)
+            if self.completion_recorder is not None:
+                self.completion_recorder()
+            return None, None, DecoderAuxiliary(residual, None if capture is None else capture[0]), records
         hidden, _ = self.final_mixer.mix_runtime(residual, normalized)
         if self.scoring is not None:
             self.scoring(hidden)
