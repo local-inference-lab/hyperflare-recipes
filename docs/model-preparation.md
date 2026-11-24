@@ -1654,11 +1654,19 @@ comparison of BF16 cross-host reductions against single-host FP32 output.
 The `inkling-2-mini` alias selects
 [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini/tree/ed40e7da625f594fc9c4990f5f66be24873c22d7)
 at revision `ed40e7da625f594fc9c4990f5f66be24873c22d7`.
-The public checkpoint declares `Inkling2LoopForConditionalGeneration` and
+The `tml-d24-varloop-research` alias selects
+[`thinkingmachines/TML-d24-varloop-research`](https://huggingface.co/thinkingmachines/TML-d24-varloop-research/tree/657b53ba5da7baefe9ff15dca5cd25f5bd3dbaa2)
+at revision `657b53ba5da7baefe9ff15dca5cd25f5bd3dbaa2`, which shares the same
+looped geometry, quantization map, vision tower, and DSpark drafter while
+recording `loop_config.is_varloop: true` and serving as `TML-d24-varloop-research`.
+Both public checkpoints declare `Inkling2LoopForConditionalGeneration` and
 `model_type: inkling2_loop`.
 Mini reads its per-layer NVFP4/MXFP8 formats from `hf_quant_config.json`.
-The recipe targets one SM120 or SM121 GPU (qualified on GB10 SM121; SM120 is
-untested) and prepares text, vision, and the bundled DSpark drafter.
+The recipe targets one SM120 or SM121 GPU (`inkling-2-mini` is qualified on
+GB10 SM121 and RTX PRO 6000 Blackwell Max-Q Workstation Edition SM120;
+`tml-d24-varloop-research` is qualified on RTX PRO 6000 Blackwell Max-Q
+Workstation Edition SM120 only, and is untested on GB10) and prepares text,
+vision, and the bundled DSpark drafter.
 `--language-model-only` omits vision; `--no-mtp` omits drafting.
 
 Mini stores 24 target layers. Layers 6 through 17 execute three times, for 48
@@ -1706,10 +1714,18 @@ admission. Mini's sampling defaults are temperature 1, top-p 1, no top-k
 filter, and neutral penalties. TMLv0 prompt encoding defaults to reasoning
 effort 0.9.
 
-On one GB10 SM121 GPU (SM120 is untested), an exported native core at Mini's
+On one GB10 SM121 GPU, an exported `inkling-2-mini` native core at Mini's
 declared defaults (concurrency 8, 8192-token prefill chunks, 64 speculative
 target rows) passes all six service tests in `tests/server/test_inkling2_mini.py`
-with drafting disabled and with seven fixed drafts.
+with drafting disabled and with seven fixed drafts (`tml-d24-varloop-research`
+is untested on GB10). On one RTX PRO 6000 Blackwell Max-Q Workstation Edition
+SM120 GPU with pinned FlashInfer `994df9c4`, both `inkling-2-mini` and
+`tml-d24-varloop-research` pass the checkpoint CUDA unit suites
+(`test_inkling2_kernels_cuda.py`, `test_inkling2_mini.py`, and
+`test_inkling2_dspark_cuda.py`), and exported native cores at Mini's declared
+defaults pass the six-test plain-decode and fixed-draft suites and the
+five-test adaptive-draft suite with positive draft acceptance (service runs
+measured against `NVIDIA/hyperflare-inference` revision `b9cac839`).
 The tests cover text, streamed reasoning, tools, request isolation, prefix restore
 and branching above 8192 tokens, four ordered images across a prefill boundary,
 image-prefix reuse, and four concurrent image requests. Fixed-depth drafting

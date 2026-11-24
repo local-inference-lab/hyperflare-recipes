@@ -3,6 +3,7 @@
 
 """Mini checkpoint geometry, independent loop histories, and expert replay."""
 
+from dataclasses import fields
 import json
 import os
 from pathlib import Path
@@ -84,7 +85,39 @@ def test_public_precision_summary_loads_layer_map(mini_config_dir, tmp_path):
     assert ModelConfig.load(target).quantization == json.loads(precision)
 
 
-@pytest.mark.parametrize("field,value", [("num_passes", 0), ("core_start", 7), ("core_end", 30), ("is_varloop", True)])
+def test_varloop_release_configuration(mini_config_dir):
+    # Adapt the reduced local Mini fixture to match the public varloop checkpoint's schema differences
+    # (no top-level dtype, explicit sub-config model_type/text_hidden_size, and loop_config.is_varloop=True).
+    raw = json.loads((mini_config_dir / "config.json").read_text())
+    precision = json.loads((mini_config_dir / "hf_quant_config.json").read_text())
+    raw.pop("dtype", None)
+    raw.update(architectures=["Inkling2LoopForConditionalGeneration"], quantization_config=precision)
+    raw["text_config"]["model_type"] = "inkling2_loop_text"
+    raw["text_config"]["loop_config"]["is_varloop"] = True
+    raw["vision_config"].update(model_type="inkling2_vision", text_hidden_size=2304)
+    for flag in ("pre_norm_pre_affine", "final_norm_pre_affine"):
+        raw["text_config"].pop(flag, None)
+    model = ModelConfig.from_dict(raw)
+    assert model.text.hidden == 2304 and len(model.text.visits) == 48
+    assert model.quantization == precision
+
+
+def test_mini_preparation_identity(mini_config_dir):
+    from hyperflare_recipes.recipes.inkling2.config import LoopConfig, MiniTextConfig
+
+    mini = ModelConfig.load(mini_config_dir)
+    assert type(mini.text) is MiniTextConfig
+    assert type(mini.text.loop) is LoopConfig
+    assert tuple(f.name for f in fields(LoopConfig)) == ("core_start", "core_end", "num_passes", "gate_rank")
+    raw = json.loads((mini_config_dir / "config.json").read_text())
+    raw["quantization_config"] = json.loads((mini_config_dir / "hf_quant_config.json").read_text())
+    raw["text_config"]["loop_config"]["is_varloop"] = True
+    varloop = ModelConfig.from_dict(raw)
+    assert varloop.text == mini.text
+    assert varloop.text.loop == mini.text.loop
+
+
+@pytest.mark.parametrize("field,value", [("num_passes", 0), ("core_start", 7), ("core_end", 30), ("is_varloop", "true")])
 def test_invalid_loop_geometry(mini_config_dir, field, value):
     raw = json.loads((mini_config_dir / "config.json").read_text())
     raw["quantization_config"] = json.loads((mini_config_dir / "hf_quant_config.json").read_text())

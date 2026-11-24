@@ -88,8 +88,9 @@ class LoopConfig:
         _known(value, {"core_start", "core_end", "num_passes", "gate_rank", "is_varloop"}, "loop_config")
         config = cls(*(_integer(value, key) for key in
                        ("core_start", "core_end", "num_passes", "gate_rank")))
-        if value.get("is_varloop", False) is not False:
-            raise ValueError("Inkling 2 preparation requires a fixed loop pass count")
+        # is_varloop records training-time variable-loop metadata; preparation always runs fixed num_passes.
+        if type(value.get("is_varloop", False)) is not bool:
+            raise ValueError("is_varloop must be a boolean")
         if not 0 < config.core_start < config.core_end <= layers:
             raise ValueError("loop core must follow a prelude and fit the decoder")
         if config.core_start % block or config.core_end % block:
