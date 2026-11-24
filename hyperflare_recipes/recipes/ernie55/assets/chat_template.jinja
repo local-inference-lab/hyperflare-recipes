@@ -1,0 +1,143 @@
+{# ERNIE 5.5 Flash Preview chatv2p3 Jinja template with Helios message-boundary marks. #}
+{%- set ns = namespace(
+    thinking_off=(enable_thinking is defined and (enable_thinking == false or enable_thinking == 0 or enable_thinking == "false")),
+    effort=(reasoning_effort if (reasoning_effort is defined and reasoning_effort is not none) else "high"),
+    has_tools=(tools is defined and tools is not none and (tools | length) > 0),
+    in_tool=false,
+    emitted=false
+) -%}
+{{- "<|ERNIE_MASK|><|ernie:im_start|>system\n" -}}
+{%- if messages and messages[0]["role"] == "system" -%}
+    {{- "<ernie:system_setting>\n" -}}
+    {%- if messages[0]["content"] is string -%}
+        {{- messages[0]["content"] -}}
+    {%- elif messages[0]["content"] is iterable -%}
+        {%- for item in messages[0]["content"] -%}
+            {%- if item["type"] == "text" -%}
+                {{- item.get("text", "") -}}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- endif -%}
+    {{- "\n</ernie:system_setting>\n" -}}
+{%- endif -%}
+{{- "<ernie:global_setting>" -}}
+{%- if not ns.thinking_off -%}
+    {{- "\nreasoning_effort=" ~ ns.effort -}}
+{%- endif -%}
+{%- if ns.has_tools -%}
+    {{- "\nparallel_tool_calls=True" -}}
+{%- endif -%}
+{{- "\n</ernie:global_setting>" -}}
+{%- if ns.has_tools -%}
+    {{- "\n<ernie:tool_list>\n[" -}}
+    {%- for tool in tools -%}
+        {%- if not loop.first -%}{{- ", " -}}{%- endif -%}
+        {{- tool | tojson -}}
+    {%- endfor -%}
+    {{- "]\n</ernie:tool_list>" -}}
+{%- endif -%}
+{{- "<|ernie:im_end|>\n" -}}
+{%- mark -%}
+{%- for message in messages -%}
+    {%- set role = message["role"] -%}
+    {%- set prev_role = messages[loop.index0 - 1]["role"] if loop.index0 > 0 else "" -%}
+    {%- set next_role = messages[loop.index0 + 1]["role"] if not loop.last else "" -%}
+    {%- if role == "user" or (role == "system" and loop.index0 > 0) -%}
+        {%- if ns.emitted -%}{{- "\n" -}}{%- endif -%}
+        {%- set ns.emitted = true -%}
+        {{- "<|ernie:im_start|>" ~ role ~ "\n" -}}
+        {%- if message["content"] is string -%}
+            {{- message["content"] -}}
+        {%- elif message["content"] is iterable -%}
+            {%- for item in message["content"] -%}
+                {%- if item["type"] == "text" -%}
+                    {{- item.get("text", "") -}}
+                {%- endif -%}
+            {%- endfor -%}
+        {%- endif -%}
+        {{- "<|ernie:im_end|>" -}}
+        {%- mark -%}
+    {%- elif role == "assistant" -%}
+        {%- if ns.emitted -%}{{- "\n" -}}{%- endif -%}
+        {%- set ns.emitted = true -%}
+        {{- "<|ernie:im_start|>assistant\n<ernie:think>" -}}
+        {%- set reasoning = message.get("thoughts", none) -%}
+        {%- if reasoning is not string -%}
+            {%- set reasoning = message.get("reasoning_content", none) -%}
+        {%- endif -%}
+        {%- set content_str = "" -%}
+        {%- if message["content"] is string -%}
+            {%- set content_str = message["content"] -%}
+        {%- elif message["content"] is iterable -%}
+            {%- set cns = namespace(parts="") -%}
+            {%- for item in message["content"] -%}
+                {%- if item["type"] == "text" -%}
+                    {%- set cns.parts = cns.parts ~ item.get("text", "") -%}
+                {%- endif -%}
+            {%- endfor -%}
+            {%- set content_str = cns.parts -%}
+        {%- endif -%}
+        {%- if reasoning is not string and "</ernie:think>" in content_str -%}
+            {%- set split_parts = content_str.split("</ernie:think>") -%}
+            {%- set before_end = split_parts[0] -%}
+            {%- if "<ernie:think>" in before_end -%}
+                {%- set reasoning = before_end.split("<ernie:think>")[-1] -%}
+            {%- else -%}
+                {%- set reasoning = before_end -%}
+            {%- endif -%}
+            {%- set content_str = split_parts[-1] -%}
+        {%- endif -%}
+        {%- if not ns.thinking_off and reasoning is string and (reasoning | trim) -%}
+            {{- reasoning -}}
+        {%- endif -%}
+        {{- "</ernie:think>" ~ content_str -}}
+        {%- if message.get("tool_calls") -%}
+            {{- "<ernie:tool_call>\n" -}}
+            {%- for call in message["tool_calls"] -%}
+                {%- set fn = call.get("function") or call -%}
+                {{- '<invoke name="' ~ fn["name"] ~ '">' -}}
+                {%- set args = fn.get("arguments", {}) -%}
+                {%- if args is mapping -%}
+                    {%- for k, v in args | dictsort -%}
+                        {{- '<parameter name="' ~ k ~ '">' -}}
+                        {%- if v is string -%}{{- v -}}{%- else -%}{{- v | tojson -}}{%- endif -%}
+                        {{- "</parameter>" -}}
+                    {%- endfor -%}
+                {%- endif -%}
+                {{- "</invoke>\n" -}}
+            {%- endfor -%}
+            {{- "</ernie:tool_call>" -}}
+        {%- endif -%}
+        {{- "<|ernie:im_end|>" -}}
+        {%- mark -%}
+    {%- elif role == "tool" -%}
+        {%- if prev_role != "tool" -%}
+            {%- if ns.emitted -%}{{- "\n" -}}{%- endif -%}
+            {%- set ns.emitted = true -%}
+            {{- "<|ernie:im_start|>tool" -}}
+        {%- endif -%}
+        {{- "\n<ernie:tool_output>" -}}
+        {%- if message["content"] is string -%}
+            {{- message["content"] -}}
+        {%- elif message["content"] is iterable -%}
+            {%- for item in message["content"] -%}
+                {%- if item["type"] == "text" -%}
+                    {{- item.get("text", "") -}}
+                {%- endif -%}
+            {%- endfor -%}
+        {%- endif -%}
+        {{- "</ernie:tool_output>" -}}
+        {%- if next_role != "tool" -%}
+            {{- "<|ernie:im_end|>" -}}
+            {%- mark -%}
+        {%- endif -%}
+    {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- "\n<|ernie:im_start|>assistant\n" -}}
+    {%- if ns.thinking_off -%}
+        {{- "<ernie:think></ernie:think>" -}}
+    {%- else -%}
+        {{- "<ernie:think>" -}}
+    {%- endif -%}
+{%- endif -%}

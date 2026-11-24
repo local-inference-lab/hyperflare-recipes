@@ -208,7 +208,9 @@ class _FunctionalPromptReduction:
 
 class PreparedPromptScoring:
     def __init__(self, source, weight, outputs, frame, *, vocabulary, rank=0,
-                 runtime=None, session, coordinator=None, name, logits_dtype=torch.bfloat16):
+                 runtime=None, session, coordinator=None, name, logits_dtype=torch.bfloat16,
+                 multimax=None):
+        self.multimax = multimax
         local = weight.shape[0] if isinstance(weight, torch.Tensor) else weight.out_features
         def zeros(shape, dtype):
             return torch.zeros(shape, dtype=dtype, device=source.device)
@@ -234,16 +236,22 @@ class PreparedPromptScoring:
                       for start, (view, projection, reduction) in zip(
                           range(0, self.source.shape[0], BLOCK_ROWS), self.parts, strict=True))
         self.source, self.parts = None, ()
-        return _FunctionalPromptScoring(parts)
+        return _FunctionalPromptScoring(parts, multimax=self.multimax)
 
 
 class _FunctionalPromptScoring:
-    def __init__(self, parts):
+    def __init__(self, parts, *, multimax=None):
         self.parts = parts
+        self.multimax = multimax
 
     def __call__(self, source):
+        from .markov_sampling import apply_multimax_inplace
+
         for start, count, projection, reduction in self.parts:
-            reduction(projection(source[start:start + count]))
+            logits = projection(source[start:start + count])
+            if self.multimax is not None:
+                apply_multimax_inplace(logits, self.multimax)
+            reduction(logits)
 
 
 class PromptScoring:
@@ -287,10 +295,10 @@ class PromptScoring:
         return storage_ranges(self.outputs.buffers())
 
     def prepare(self, source, weight, *, vocabulary, session, coordinator, name,
-                logits_dtype=torch.bfloat16):
+                logits_dtype=torch.bfloat16, multimax=None):
         operation = PreparedPromptScoring(source, weight, self.outputs, self.frame, vocabulary=vocabulary,
             rank=self.rank, runtime=self.runtime, session=session, coordinator=coordinator,
-            name=name, logits_dtype=logits_dtype)
+            name=name, logits_dtype=logits_dtype, multimax=multimax)
         return operation.functional(session=session)
 
 

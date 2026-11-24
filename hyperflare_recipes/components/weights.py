@@ -1479,6 +1479,7 @@ class DirectWeightLoader:
         self, prefixes, *, hidden_size, intermediate_size, scale_scratch,
         intermediate_range=None, swiglu_limit=None, scale_compression=None,
         projection_names=("up_proj", "gate_proj", "down_proj"), scale_name="weight_scale",
+        activation="silu", activation_mode="a8",
     ):
         """Load MXFP4 storage, optionally compressing native scales losslessly.
 
@@ -1508,9 +1509,9 @@ class DirectWeightLoader:
                    for prefix in prefixes for projection in projection_names]
         geometry = dict(hidden_size=hidden_size, intermediate_size=intermediate_size,
                         intermediate_range=intermediate_range, swiglu_limit=swiglu_limit,
-                        scale_name=scale_name)
+                        scale_name=scale_name, activation=activation)
         if not any(encoded) and scale_compression is None:
-            return self.load_fp4_experts(prefixes, **geometry, format="mxfp4", activation_mode="a8",
+            return self.load_fp4_experts(prefixes, **geometry, format="mxfp4", activation_mode=activation_mode,
                                          projection_names=projection_names)
         if any(encoded) and not all(encoded):
             raise ValueError("each routed expert group must use one complete MXFP4 scale encoding")
@@ -1521,11 +1522,11 @@ class DirectWeightLoader:
             scale_scratch[key] = tuple(torch.empty(shape, dtype=torch.uint8, device=self.device)
                 for shape in ((count, hidden_size // 32, 2 * local), (count, local // 32, hidden_size)))
         if not any(encoded):
-            return self.load_fp4_experts(prefixes, **geometry, format="mxfp4", activation_mode="a8",
+            return self.load_fp4_experts(prefixes, **geometry, format="mxfp4", activation_mode=activation_mode,
                 projection_names=projection_names, scale_compression=scale_compression,
                 scale_scratch=scale_scratch[key])
         up, gate, down = projection_names
-        return self.load_mxfp4_csf_experts(prefixes, **geometry,
+        return self.load_mxfp4_csf_experts(prefixes, **geometry, activation_mode=activation_mode,
             scale_scratch=scale_scratch[key], projection_names=(gate, up, down))
 
     def load_mxfp4_csf_experts(

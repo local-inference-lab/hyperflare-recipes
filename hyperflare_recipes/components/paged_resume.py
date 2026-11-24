@@ -86,6 +86,7 @@ class PreparedResume:
         self.validation.functional(session=session)
         self.state.functional()
         self.local_logits = self.logits = None
+        self.multimax = getattr(weights, "multimax", None)
         self.compilation_variant = "sample"
 
     def __call__(self):
@@ -93,4 +94,8 @@ class PreparedResume:
         totals = self.validation(validation)
         hidden = self.state.gather(totals, present=present)
         logits = self.projection(hidden)
+        if self.multimax is not None:
+            from .markov_sampling import apply_multimax_inplace
+
+            apply_multimax_inplace(logits, self.multimax)
         self.completion.run(logits)

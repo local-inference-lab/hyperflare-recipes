@@ -244,6 +244,7 @@ class PreparedParallelDraftRound:
             elif self.shortlisted_selector is not None and self.shortlisted_selector.top_k <= DRAFT_CANDIDATES:
                 proposal.bind_shortlist(shortlist_example[:, index + o.logit_offset])
             elif (self.draft is not None and self.selector is None
+                    and getattr(o.weights, "multimax", None) is None
                     and (self.markov is None or bias is not None)):
                 block = self.draft_inputs.shape[1]
                 proposal.bind_logits(draft_logits_example.view(b, block, -1)[:, index + o.logit_offset],
@@ -257,7 +258,8 @@ class PreparedParallelDraftRound:
                 self.markov_token, self.drafts, self.probabilities, self.valid, o.requests,
                 o.inputs.row_slot_ids[:b], o.inputs.row_generations[:b], o.inputs.live_rows,
                 self.seed, self.base_offset, workspace=None,
-                proposal_capacity=min(w - 1, self.target_token_capacity - 1))
+                proposal_capacity=min(w - 1, self.target_token_capacity - 1),
+                multimax=getattr(o.weights, "multimax", None))
             self.full_proposal.prepare()
             runtime = getattr(o, "result_runtime", None)
             if runtime is None:
@@ -362,7 +364,8 @@ class PreparedParallelDraftRound:
                 self.drafts, **options, name=self.name + ".proposal", workspace=None,
                 **transition,
                 pending=self.markov_token, seeds=self.seed, offsets=self.base_offset, tokens=self.drafts,
-                tile_masses=self.draft_tile_masses, token_limits=o.inputs.query_lengths[:b])
+                tile_masses=self.draft_tile_masses, token_limits=o.inputs.query_lengths[:b],
+                multimax=getattr(o.weights, "multimax", None))
             self.full_proposal.prepare()
         if self.proposal_only:
             self.operations = None, (), None, None
@@ -513,6 +516,10 @@ class PreparedParallelDraftRound:
                     proposal_logits = source_logits.float()
                     if bias is not None:
                         proposal_logits = proposal_logits + bias
+                    if getattr(o.weights, "multimax", None) is not None:
+                        from .markov_sampling import apply_multimax_inplace
+
+                        proposal_logits = apply_multimax_inplace(proposal_logits.contiguous(), o.weights.multimax)
                     if self.shortlisted_selector is not None:
                         proposal_logits = self.shortlisted_selector.apply_shortlist(
                             proposal_logits, markov_token, position, selector_features, unary, shortlist_ids)

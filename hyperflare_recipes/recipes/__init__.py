@@ -24,6 +24,7 @@ from ignition.registry import (  # noqa: F401
 def recipes() -> tuple[Recipe, ...]:
     from .deepseek4.recipe import RECIPE as deepseek4
     from .deepseek41.recipe import RECIPE as deepseek41
+    from .ernie55.recipe import RECIPE as ernie55
     from .gemma4.recipe import RECIPE as gemma4
     from .glm53.recipe import RECIPE as glm53
     from .qwen38.recipe import RECIPE as qwen38
@@ -38,7 +39,7 @@ def recipes() -> tuple[Recipe, ...]:
     from .inkling2.recipe import RECIPE as inkling2
     from .inkling2.recipe import MINI_RECIPE as inkling2_mini
 
-    return qwen38, qwen38_dense, glm53, deepseek41, deepseek4, mimo_v2, kimi3, kimi31, step5, nemotron_h, minimax_m3, gemma4, muse_spark, inkling2_mini, inkling2
+    return qwen38, qwen38_dense, glm53, deepseek41, deepseek4, ernie55, mimo_v2, kimi3, kimi31, step5, nemotron_h, minimax_m3, gemma4, muse_spark, inkling2_mini, inkling2
 
 
 def aliases() -> tuple[str, ...]:

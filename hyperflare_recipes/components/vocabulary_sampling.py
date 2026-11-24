@@ -18,7 +18,7 @@ from ignition.preparation.triton import launch_triton, prepare_triton
 from ignition.preparation.persistent import persistent_copy
 from ignition.preparation.tensor_metadata import record_numeric_tensor
 from ignition.components.collectives import PreparedAllGather
-from .markov_sampling import _row_live, _token_noise, _transition_bias, RowScaledFP8MarkovWeight
+from .markov_sampling import _apply_multimax, _row_live, _token_noise, _transition_bias, RowScaledFP8MarkovWeight
 from .speculation import SpeculativeAcceptance, TARGET_RNG_DOMAIN, _geometry, _metadata, _tensor
 
 SUMMARY_WORDS = 32
@@ -70,6 +70,15 @@ def _score_tiles(
     STEP: tl.constexpr,
     BLOCK: tl.constexpr,
     HAS_LIMITS: tl.constexpr = False,
+    USE_MULTIMAX: tl.constexpr = False,
+    MM_R0: tl.constexpr = 0.0,
+    MM_R1: tl.constexpr = 0.0,
+    MM_R2: tl.constexpr = 0.0,
+    MM_R3: tl.constexpr = 0.0,
+    MM_T0: tl.constexpr = 0.0,
+    MM_T1: tl.constexpr = 0.0,
+    MM_T2: tl.constexpr = 0.0,
+    MM_T3: tl.constexpr = 0.0,
 ):
     tile, lane_row = tl.program_id(0), tl.program_id(1)
     position = STEP if SAMPLE else lane_row % WIDTH
@@ -95,6 +104,8 @@ def _score_tiles(
         predecessor = tl.load(Pending + request_row) if STEP == 0 else tl.load(Drafts + request_row * DRAFTS + STEP - 1)
         predecessor = tl.minimum(tl.maximum(predecessor, 0), VOCAB - 1)
         value += _transition_bias(Embedding, Head, HeadScale, predecessor, local_id, present, RANK, 64, BLOCK, FP8)
+    if USE_MULTIMAX:
+        value = _apply_multimax(value, MM_R0, MM_R1, MM_R2, MM_R3, MM_T0, MM_T1, MM_T2, MM_T3)
     slot = tl.minimum(tl.maximum(tl.load(Slots + request_row).to(tl.int64), 0), CAPACITY - 1)
     temperature = tl.load(Params + slot * 6)
     repeat = tl.load(Params + slot * 6 + 3)
@@ -182,6 +193,15 @@ def _score_tiles_markov_batched(
     BLOCK: tl.constexpr,
     ROWS_PER_CTA: tl.constexpr,
     HAS_LIMITS: tl.constexpr = False,
+    USE_MULTIMAX: tl.constexpr = False,
+    MM_R0: tl.constexpr = 0.0,
+    MM_R1: tl.constexpr = 0.0,
+    MM_R2: tl.constexpr = 0.0,
+    MM_R3: tl.constexpr = 0.0,
+    MM_T0: tl.constexpr = 0.0,
+    MM_T1: tl.constexpr = 0.0,
+    MM_T2: tl.constexpr = 0.0,
+    MM_T3: tl.constexpr = 0.0,
 ):
     """Multi-row Tensor-Core Markov proposal scorer sharing Head loads across ROWS_PER_CTA requests."""
     tile = tl.program_id(0)
@@ -258,6 +278,8 @@ def _score_tiles_markov_batched(
                     ).to(tl.float32)
                     + bias
                 )
+                if USE_MULTIMAX:
+                    value = _apply_multimax(value, MM_R0, MM_R1, MM_R2, MM_R3, MM_T0, MM_T1, MM_T2, MM_T3)
                 slot = tl.minimum(tl.maximum(tl.load(Slots + request_row).to(tl.int64), 0), CAPACITY - 1)
                 temperature = tl.load(Params + slot * 6)
                 repeat = tl.load(Params + slot * 6 + 3)
@@ -707,6 +729,7 @@ class PreparedVocabularySoftmax:
         tokens=None,
         tile_masses=None,
         token_limits=None,
+        multimax=None,
     ):
         if logits.ndim != 3 or logits.dtype not in (torch.bfloat16, torch.float32) or logits.stride(-1) != 1:
             raise ValueError("vocabulary logits require BF16/FP32 [batch,width,local vocabulary]")
@@ -780,6 +803,21 @@ class PreparedVocabularySoftmax:
         self.vocabulary_offset = persistent_copy(torch.tensor([start], dtype=torch.int32, device=device))
         self.embedding, self.head, self.scale, self.pending = embedding, values, scale, pending
         self.seeds, self.offsets, self.tokens, self.sample = seeds, offsets, tokens, sample
+        if multimax is not None:
+            mm_ranges, mm_ts = multimax
+            self.multimax_kwargs = dict(
+                USE_MULTIMAX=True,
+                MM_R0=float(mm_ranges[0]),
+                MM_R1=float(mm_ranges[1]),
+                MM_R2=float(mm_ranges[2]),
+                MM_R3=float(mm_ranges[3]),
+                MM_T0=float(mm_ts[0]),
+                MM_T1=float(mm_ts[1]),
+                MM_T2=float(mm_ts[2]),
+                MM_T3=float(mm_ts[3]),
+            )
+        else:
+            self.multimax_kwargs = {}
         summary_rows = b if sample else b * w
         self.scratch = bind_scratch(
             dict(
@@ -855,6 +893,7 @@ class PreparedVocabularySoftmax:
                 STEP=step,
                 BLOCK=256,
                 HAS_LIMITS=self.has_token_limits,
+                **self.multimax_kwargs,
                 num_warps=4,
                 enable_fp_fusion=False,
             )

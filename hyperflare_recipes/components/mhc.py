@@ -96,7 +96,8 @@ class PreparedMHC:
 
     def __init__(self, inputs, weights: MHCWeights, scratch: MHCScratch, *,
                  session, name, workspace, rms_eps, hc_eps, sinkhorn_iters, norm_eps,
-                 pre_mix=None, pre_out=None, max_rows_per_call=None):
+                 pre_mix=None, pre_out=None, max_rows_per_call=None,
+                 rms_eps_outside_sqrt=False):
         if max_rows_per_call is not None and (type(max_rows_per_call) is not int
                                               or max_rows_per_call <= 0):
             raise ValueError("mHC row capacity per call must be a positive integer")
@@ -134,7 +135,7 @@ class PreparedMHC:
                     scratch.rows(end - start, start=start), session=session,
                     name=f"{name}.rows{start}_{end}", workspace=workspace,
                     rms_eps=rms_eps, hc_eps=hc_eps, sinkhorn_iters=sinkhorn_iters,
-                    norm_eps=norm_eps,
+                    norm_eps=norm_eps, rms_eps_outside_sqrt=rms_eps_outside_sqrt,
                     pre_mix=None if pre_mix is None else pre_mix[start:end],
                     pre_out=None if pre_out is None else pre_out[start:end])
                 self.row_calls.append((start, end, call))
@@ -143,7 +144,8 @@ class PreparedMHC:
             invocation={"operation": self.operation, "output_mode": "provided", "has_norm_weight": True,
                 "norm_weight_dtype": str(weights.norm.dtype).removeprefix("torch."),
                 "expanded_residual": self.operation == "pre",
-                "rms_eps": rms_eps, "hc_eps": hc_eps, "sinkhorn_iters": sinkhorn_iters, "norm_eps": norm_eps,
+                "rms_eps": rms_eps, "rms_eps_outside_sqrt": bool(rms_eps_outside_sqrt),
+                "hc_eps": hc_eps, "sinkhorn_iters": sinkhorn_iters, "norm_eps": norm_eps,
                 "lagged_mix": pre_mix is not None})
         parameters = (weights.fn, weights.scale, weights.base)
 

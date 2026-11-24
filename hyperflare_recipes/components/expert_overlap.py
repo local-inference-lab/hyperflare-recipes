@@ -68,6 +68,8 @@ def _run_shared_expert(source, weights, scales, gains, scale_kinds, outputs,
         project(source, 0, gate_up)
         if activation == "relu2":
             torch.ops.b12x.hyperconnection_relu2(gate_up, intermediate, plans[-1])
+        elif activation == "situ":
+            torch.ops.b12x.hyperconnection_situ(gate_up, intermediate, plans[-1])
         else:
             torch.ops.b12x.hyperconnection_swiglu(gate_up, intermediate, limit, round_silu, plans[-1])
         project(intermediate, 1, projected)
@@ -161,8 +163,8 @@ class ConcurrentSharedExpert:
         if not isinstance(workspace, ScratchArena) or not parallel_plans:
             raise ValueError("shared-expert overlap requires an arena and concurrent main-stream plans")
         self.activation = getattr(mlp, "activation", "swiglu")
-        if self.activation not in ("swiglu", "relu2"):
-            raise ValueError("shared-expert overlap requires SwiGLU or ReLU-squared activation")
+        if self.activation not in ("swiglu", "relu2", "situ"):
+            raise ValueError("shared-expert overlap requires SwiGLU, SiTU, or ReLU-squared activation")
         self.limit = getattr(mlp, "swiglu_limit", float("inf"))
         self.round_silu = getattr(mlp, "round_silu", True)
         self.mlp, self.parallel_plans, self.arena = mlp, tuple(parallel_plans), workspace

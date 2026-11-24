@@ -15,9 +15,10 @@ from ignition.preparation.tuning import declare, register_finalizer
 class PreparedGroupedOutputProjection:
     def __init__(self, source, weights, output, *, session, name, workspace,
                  inv_rope=False, heads_per_group=None, nope_dim=448, rope_dim=64,
-                 positions=None, cos_sin_cache=None):
+                 positions=None, cos_sin_cache=None, gate=None):
         self.weights, self.output, self.workspace = weights, output, workspace
         self.inv_rope = bool(inv_rope)
+        self.has_gate = gate is not None
         self._fused_inv_rope = self.inv_rope and hasattr(wo_projection, "run_inv_rope_out")
         if self.inv_rope:
             if (heads_per_group is None or positions is None or cos_sin_cache is None
@@ -47,6 +48,12 @@ class PreparedGroupedOutputProjection:
             if source.shape[1:] != (weights.groups, weights.group_width):
                 raise ValueError("attention output must match the packed projection groups and head width")
             invocation = {}
+        if self.has_gate:
+            if (gate.shape != (source.shape[0], weights.groups * weights.rank)
+                    or gate.dtype != torch.bfloat16 or gate.device != source.device
+                    or not gate.is_contiguous()):
+                raise ValueError("attention output gate must be contiguous BF16 [tokens, groups * rank]")
+            invocation["has_gate"] = True
         self.plan = wo_projection.plan(
             wo_projection.Caps(device=source.device, max_tokens=source.shape[0],
                 groups=weights.groups, group_width=weights.group_width, rank=weights.rank, hidden=weights.hidden),
@@ -62,11 +69,11 @@ class PreparedGroupedOutputProjection:
             record_numeric_tensor(tensor)
 
         if self._fused_inv_rope:
-            def call(state, values, pos, cs, out, *, produce=None, owners=()):
+            def call(state, values, pos, cs, out, gate_t=None, *, produce=None, owners=()):
                 scratch = planned_scratch(state._scratch_state.scratch_specs(), workspace)
                 binding = state.bind_inv_rope(o=values, positions=pos, cos_sin_cache=cs,
                     weights=weights, heads_per_group=self.heads_per_group,
-                    nope_dim=self.nope_dim, rope_dim=self.rope_dim, scratch=scratch, out=out)
+                    nope_dim=self.nope_dim, rope_dim=self.rope_dim, gate=gate_t, scratch=scratch, out=out)
                 return PreparedCall(run=lambda: state.run_inv_rope(binding), output=out, produce=produce,
                     owners=(*owners, weights, *prime_owners(workspace, scratch, binding)))
 
@@ -77,19 +84,21 @@ class PreparedGroupedOutputProjection:
                 pos = torch.arange(source.shape[0], dtype=positions.dtype, device=source.device)
                 cs = torch.zeros(cos_sin_cache.shape, dtype=cos_sin_cache.dtype, device=source.device)
                 cs[:, :self.rope_dim // 2].fill_(1.0)
-                return call(state, values, pos, cs, out, produce=lambda: values.copy_(seed),
-                    owners=(values, out, seed, pos, cs))
+                gate_t = (torch.randn(gate.shape, dtype=gate.dtype, device=gate.device, generator=generator)
+                          if self.has_gate else None)
+                return call(state, values, pos, cs, out, gate_t, produce=lambda: values.copy_(seed),
+                    owners=(values, out, seed, pos, cs, *((gate_t,) if gate_t is not None else ())))
 
             declare(session, (self.plan.request(name=name,
-                prepare_call=lambda state: call(state, source, positions, cos_sin_cache, output),
+                prepare_call=lambda state: call(state, source, positions, cos_sin_cache, output, gate),
                 benchmark_call=benchmark),))
         else:
             plain_source = (source.view(source.shape[0], weights.groups, weights.group_width)
                             if self.inv_rope else source)
 
-            def call(state, values, out, *, produce=None, owners=()):
+            def call(state, values, out, gate_t=None, *, produce=None, owners=()):
                 scratch = planned_scratch(state._scratch_state.scratch_specs(), workspace)
-                binding = state.bind(source_tgd=values, weights=weights, scratch=scratch, out=out)
+                binding = state.bind(source_tgd=values, weights=weights, gate=gate_t, scratch=scratch, out=out)
                 return PreparedCall(run=lambda: state.run(binding), output=out, produce=produce,
                     owners=(*owners, weights, *prime_owners(workspace, scratch, binding)))
 
@@ -98,10 +107,13 @@ class PreparedGroupedOutputProjection:
                 seed = torch.randn(plain_source.shape, dtype=plain_source.dtype,
                                    device=plain_source.device, generator=generator) * .125
                 values, out = torch.empty_like(plain_source), torch.empty_like(output)
-                return call(state, values, out, produce=lambda: values.copy_(seed), owners=(values, out, seed))
+                gate_t = (torch.randn(gate.shape, dtype=gate.dtype, device=gate.device, generator=generator)
+                          if self.has_gate else None)
+                return call(state, values, out, gate_t, produce=lambda: values.copy_(seed),
+                    owners=(values, out, seed, *((gate_t,) if gate_t is not None else ())))
 
             declare(session, (self.plan.request(name=name,
-                prepare_call=lambda state: call(state, plain_source, output), benchmark_call=benchmark),))
+                prepare_call=lambda state: call(state, plain_source, output, gate), benchmark_call=benchmark),))
         register_finalizer(session, self.rebind, workspace=workspace)
 
     def rebind(self):
@@ -118,7 +130,7 @@ class PreparedGroupedOutputProjection:
         if self.inv_rope:
             self.positions = self.cos_sin_cache = None
 
-    def __call__(self, source, *, positions=None, cos_sin_cache=None):
+    def __call__(self, source, *, positions=None, cos_sin_cache=None, gate=None):
         output, scratch = self.output, self.scratch
         if output is None:
             shape, stride, dtype = self.output_layout
@@ -127,7 +139,7 @@ class PreparedGroupedOutputProjection:
         if self._fused_inv_rope:
             pos = self.positions if positions is None else positions
             cs = self.cos_sin_cache if cos_sin_cache is None else cos_sin_cache
-            wo_projection.run_inv_rope_out(source, pos, cs, self.weights, out=output, scratch=scratch, plan=self.plan)
+            wo_projection.run_inv_rope_out(source, pos, cs, self.weights, out=output, scratch=scratch, plan=self.plan, gate=gate)
         elif self.inv_rope:
             from hyperflare_recipes.components.rotary import _rotate_grouped
 
@@ -142,7 +154,7 @@ class PreparedGroupedOutputProjection:
                 -1, angles.ndim == 2, per_cta, num_warps=1)
             wo_projection.run_out(
                 rotated.view(rotated.shape[0], self.weights.groups, self.weights.group_width),
-                self.weights, out=output, scratch=scratch, plan=self.plan)
+                self.weights, out=output, scratch=scratch, plan=self.plan, gate=gate)
         else:
-            wo_projection.run_out(source, self.weights, out=output, scratch=scratch, plan=self.plan)
+            wo_projection.run_out(source, self.weights, out=output, scratch=scratch, plan=self.plan, gate=gate)
         return output

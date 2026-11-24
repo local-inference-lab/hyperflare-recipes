@@ -45,7 +45,10 @@ class PreparedMLP:
     def __init__(self, source, weights: MLPWeights, gate_up, intermediate, output, *,
                  session, name, workspace, swiglu_limit=float("inf"), round_silu=True,
                  activation_mode="auto", gate_up_bias=None, down_bias=None, clamp_after_silu=False,
-                 swiglu_alpha=1., swiglu_beta=0.):
+                 swiglu_alpha=1., swiglu_beta=0., activation="swiglu"):
+        if activation not in ("swiglu", "situ"):
+            raise ValueError("gated MLP activation must be swiglu or situ")
+        self.activation = activation
         self.gate_up, self.intermediate, self.output = gate_up, intermediate, output
         self.swiglu_limit, self.round_silu = swiglu_limit, round_silu
         if source.ndim != 2 or intermediate.ndim != 2:
@@ -73,14 +76,16 @@ class PreparedMLP:
 
         self.up_projection = projection(source, weights.gate_up, gate_up, "gate_up", gate_up_bias)
         self.down_projection = projection(intermediate, weights.down, output, "down", down_bias)
+        invocation = ({"operation": "situ"} if activation == "situ" else
+                      {"operation": "swiglu", "limit": swiglu_limit, "round_silu": round_silu,
+                       "clamp_after_silu": clamp_after_silu,
+                       "swiglu_alpha": swiglu_alpha, "swiglu_beta": swiglu_beta})
         self.activation_plan = hyperconnection.plan(
             hyperconnection.Caps(device=source.device, max_tokens=tokens, hidden_size=width),
-            invocation={"operation": "swiglu", "limit": swiglu_limit, "round_silu": round_silu,
-                        "clamp_after_silu": clamp_after_silu,
-                        "swiglu_alpha": swiglu_alpha, "swiglu_beta": swiglu_beta},
+            invocation=invocation,
         )
         declare(session, (self.activation_plan.request(
-            name=f"{name}.swiglu", prepare_call=lambda state: PreparedCall(
+            name=f"{name}.{activation}", prepare_call=lambda state: PreparedCall(
                 run=lambda: state.launch(gate_up, gate_up, intermediate),
             ),
         ),))
@@ -105,14 +110,20 @@ class PreparedMLP:
             gate_up = self.up_projection(source)
             intermediate = torch.empty_strided(intermediate_shape, intermediate_stride, dtype=intermediate_dtype,
                                                device=source.device)
-            hyperconnection.run_swiglu(gate_up, limit=self.swiglu_limit,
-                                      round_silu=self.round_silu, out=intermediate,
-                                      plan=self.activation_plan)
+            if self.activation == "situ":
+                hyperconnection.run_situ(gate_up, out=intermediate, plan=self.activation_plan)
+            else:
+                hyperconnection.run_swiglu(gate_up, limit=self.swiglu_limit,
+                                          round_silu=self.round_silu, out=intermediate,
+                                          plan=self.activation_plan)
             return self.down_projection(intermediate)
         self.up_projection(source)
-        hyperconnection.run_swiglu(self.gate_up, limit=self.swiglu_limit,
-                                  round_silu=self.round_silu, out=self.intermediate,
-                                  plan=self.activation_plan)
+        if self.activation == "situ":
+            hyperconnection.run_situ(self.gate_up, out=self.intermediate, plan=self.activation_plan)
+        else:
+            hyperconnection.run_swiglu(self.gate_up, limit=self.swiglu_limit,
+                                      round_silu=self.round_silu, out=self.intermediate,
+                                      plan=self.activation_plan)
         return self.down_projection(self.intermediate)
 
 

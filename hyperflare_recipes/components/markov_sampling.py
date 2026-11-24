@@ -251,6 +251,83 @@ def _resolve_previous(
 
 
 @triton.jit
+def _apply_multimax(
+    score,
+    MM_R0: tl.constexpr,
+    MM_R1: tl.constexpr,
+    MM_R2: tl.constexpr,
+    MM_R3: tl.constexpr,
+    MM_T0: tl.constexpr,
+    MM_T1: tl.constexpr,
+    MM_T2: tl.constexpr,
+    MM_T3: tl.constexpr,
+):
+    a = tl.where(MM_R0 - score <= 0.0, 0.0, MM_R0 - score)
+    b = tl.where(score - MM_R1 <= 0.0, 0.0, score - MM_R1)
+    c = tl.where(MM_R2 - score <= 0.0, 0.0, MM_R2 - score)
+    d = tl.where(score - MM_R3 <= 0.0, 0.0, score - MM_R3)
+    y = score + MM_T0 * a
+    y = y + MM_T1 * b
+    y = y + MM_T2 * (c * c)
+    y = y + MM_T3 * (d * d)
+    return y
+
+
+@triton.jit
+def _multimax_inplace_kernel(
+    Logits,
+    stride,
+    V,
+    BLOCK: tl.constexpr,
+    MM_R0: tl.constexpr,
+    MM_R1: tl.constexpr,
+    MM_R2: tl.constexpr,
+    MM_R3: tl.constexpr,
+    MM_T0: tl.constexpr,
+    MM_T1: tl.constexpr,
+    MM_T2: tl.constexpr,
+    MM_T3: tl.constexpr,
+):
+    offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < V
+    ptrs = Logits + tl.program_id(0).to(tl.int64) * stride + offs
+    x = tl.load(ptrs, mask=mask, other=0.0).to(tl.float32)
+    y = _apply_multimax(x, MM_R0, MM_R1, MM_R2, MM_R3, MM_T0, MM_T1, MM_T2, MM_T3)
+    y = tl.where(x == -float("inf"), -float("inf"), y)
+    tl.store(ptrs, y.to(Logits.dtype.element_ty), mask=mask)
+
+
+def apply_multimax_inplace(logits: torch.Tensor, multimax) -> torch.Tensor:
+    """Apply ERNIE MultiMax piecewise polynomial transform in place on 2D/3D CUDA logits."""
+    if multimax is None:
+        return logits
+    ranges, ts = multimax
+    r0, r1, r2, r3 = (float(v) for v in ranges)
+    t0, t1, t2, t3 = (float(v) for v in ts)
+    flat = logits.view(-1, logits.shape[-1])
+    rows, vocab = flat.shape
+    if rows and vocab:
+        block = 2048
+        torch.library.wrap_triton(_multimax_inplace_kernel)[(rows, triton.cdiv(vocab, block))](
+            flat,
+            flat.stride(0),
+            vocab,
+            BLOCK=block,
+            MM_R0=r0,
+            MM_R1=r1,
+            MM_R2=r2,
+            MM_R3=r3,
+            MM_T0=t0,
+            MM_T1=t1,
+            MM_T2=t2,
+            MM_T3=t3,
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+    return logits
+
+
+@triton.jit
 def _finish_markov_row(
     row,
     previous,
@@ -283,10 +360,21 @@ def _finish_markov_row(
     BLOCKS: tl.constexpr,
     CAPACITY: tl.constexpr,
     BLOCK: tl.constexpr,
+    USE_MULTIMAX: tl.constexpr = False,
+    MM_R0: tl.constexpr = 0.0,
+    MM_R1: tl.constexpr = 0.0,
+    MM_R2: tl.constexpr = 0.0,
+    MM_R3: tl.constexpr = 0.0,
+    MM_T0: tl.constexpr = 0.0,
+    MM_T1: tl.constexpr = 0.0,
+    MM_T2: tl.constexpr = 0.0,
+    MM_T3: tl.constexpr = 0.0,
 ):
     score = (
         tl.load(Base + row * base_row_stride + STEP * base_step_stride + token, inside, other=0.0).to(tl.float32) + bias
     )
+    if USE_MULTIMAX:
+        score = _apply_multimax(score, MM_R0, MM_R1, MM_R2, MM_R3, MM_T0, MM_T1, MM_T2, MM_T3)
     safe = tl.minimum(tl.maximum(tl.load(Slots + row).to(tl.int64), 0), CAPACITY - 1)
     temperature = tl.load(Params + safe * 6)
     repetition = tl.load(Params + safe * 6 + 3)
@@ -487,6 +575,15 @@ def _markov_step_batched(
     BLOCK: tl.constexpr,
     CHUNK: tl.constexpr,
     FP8: tl.constexpr,
+    USE_MULTIMAX: tl.constexpr = False,
+    MM_R0: tl.constexpr = 0.0,
+    MM_R1: tl.constexpr = 0.0,
+    MM_R2: tl.constexpr = 0.0,
+    MM_R3: tl.constexpr = 0.0,
+    MM_T0: tl.constexpr = 0.0,
+    MM_T1: tl.constexpr = 0.0,
+    MM_T2: tl.constexpr = 0.0,
+    MM_T3: tl.constexpr = 0.0,
 ):
     block = tl.program_id(0)
     r0 = tl.program_id(1) * 2
@@ -535,12 +632,14 @@ def _markov_step_batched(
         Seeds, Offsets, Histogram, Slots, Params, Grammar, GrammarEnabled,
         base_row_stride, base_step_stride, hist_stride, mask_stride,
         block, token, inside, V, DEPTH, STEP, BLOCKS, CAPACITY, BLOCK,
+        USE_MULTIMAX, MM_R0, MM_R1, MM_R2, MM_R3, MM_T0, MM_T1, MM_T2, MM_T3,
     )
     _finish_markov_row(
         r1, p1, b1, Base, Tokens, Scores, LseMax, LseSum, Bad, Maximum, Arg,
         Seeds, Offsets, Histogram, Slots, Params, Grammar, GrammarEnabled,
         base_row_stride, base_step_stride, hist_stride, mask_stride,
         block, token, inside, V, DEPTH, STEP, BLOCKS, CAPACITY, BLOCK,
+        USE_MULTIMAX, MM_R0, MM_R1, MM_R2, MM_R3, MM_T0, MM_T1, MM_T2, MM_T3,
     )
 
 
@@ -587,6 +686,15 @@ def _markov_step_batched4(
     BLOCK: tl.constexpr,
     CHUNK: tl.constexpr,
     FP8: tl.constexpr,
+    USE_MULTIMAX: tl.constexpr = False,
+    MM_R0: tl.constexpr = 0.0,
+    MM_R1: tl.constexpr = 0.0,
+    MM_R2: tl.constexpr = 0.0,
+    MM_R3: tl.constexpr = 0.0,
+    MM_T0: tl.constexpr = 0.0,
+    MM_T1: tl.constexpr = 0.0,
+    MM_T2: tl.constexpr = 0.0,
+    MM_T3: tl.constexpr = 0.0,
 ):
     block = tl.program_id(0)
     token = block * BLOCK + tl.arange(0, BLOCK)
@@ -660,24 +768,28 @@ def _markov_step_batched4(
         Seeds, Offsets, Histogram, Slots, Params, Grammar, GrammarEnabled,
         base_row_stride, base_step_stride, hist_stride, mask_stride,
         block, token, inside, V, DEPTH, STEP, BLOCKS, CAPACITY, BLOCK,
+        USE_MULTIMAX, MM_R0, MM_R1, MM_R2, MM_R3, MM_T0, MM_T1, MM_T2, MM_T3,
     )
     _finish_markov_row(
         1, p1, b1, Base, Tokens, Scores, LseMax, LseSum, Bad, Maximum, Arg,
         Seeds, Offsets, Histogram, Slots, Params, Grammar, GrammarEnabled,
         base_row_stride, base_step_stride, hist_stride, mask_stride,
         block, token, inside, V, DEPTH, STEP, BLOCKS, CAPACITY, BLOCK,
+        USE_MULTIMAX, MM_R0, MM_R1, MM_R2, MM_R3, MM_T0, MM_T1, MM_T2, MM_T3,
     )
     _finish_markov_row(
         2, p2, b2, Base, Tokens, Scores, LseMax, LseSum, Bad, Maximum, Arg,
         Seeds, Offsets, Histogram, Slots, Params, Grammar, GrammarEnabled,
         base_row_stride, base_step_stride, hist_stride, mask_stride,
         block, token, inside, V, DEPTH, STEP, BLOCKS, CAPACITY, BLOCK,
+        USE_MULTIMAX, MM_R0, MM_R1, MM_R2, MM_R3, MM_T0, MM_T1, MM_T2, MM_T3,
     )
     _finish_markov_row(
         3, p3, b3, Base, Tokens, Scores, LseMax, LseSum, Bad, Maximum, Arg,
         Seeds, Offsets, Histogram, Slots, Params, Grammar, GrammarEnabled,
         base_row_stride, base_step_stride, hist_stride, mask_stride,
         block, token, inside, V, DEPTH, STEP, BLOCKS, CAPACITY, BLOCK,
+        USE_MULTIMAX, MM_R0, MM_R1, MM_R2, MM_R3, MM_T0, MM_T1, MM_T2, MM_T3,
     )
 
 
@@ -724,6 +836,15 @@ def _markov_step_batched8(
     BLOCK: tl.constexpr,
     CHUNK: tl.constexpr,
     FP8: tl.constexpr,
+    USE_MULTIMAX: tl.constexpr = False,
+    MM_R0: tl.constexpr = 0.0,
+    MM_R1: tl.constexpr = 0.0,
+    MM_R2: tl.constexpr = 0.0,
+    MM_R3: tl.constexpr = 0.0,
+    MM_T0: tl.constexpr = 0.0,
+    MM_T1: tl.constexpr = 0.0,
+    MM_T2: tl.constexpr = 0.0,
+    MM_T3: tl.constexpr = 0.0,
 ):
     block = tl.program_id(0)
     token = block * BLOCK + tl.arange(0, BLOCK)
@@ -812,6 +933,7 @@ def _markov_step_batched8(
                 Seeds, Offsets, Histogram, Slots, Params, Grammar, GrammarEnabled,
                 base_row_stride, base_step_stride, hist_stride, mask_stride,
                 block, token, inside, V, DEPTH, STEP, BLOCKS, CAPACITY, BLOCK,
+                USE_MULTIMAX, MM_R0, MM_R1, MM_R2, MM_R3, MM_T0, MM_T1, MM_T2, MM_T3,
             )
     else:
         for r_idx in tl.static_range(8):
@@ -830,6 +952,7 @@ def _markov_step_batched8(
                 Seeds, Offsets, Histogram, Slots, Params, Grammar, GrammarEnabled,
                 base_row_stride, base_step_stride, hist_stride, mask_stride,
                 block, token, inside, V, DEPTH, STEP, BLOCKS, CAPACITY, BLOCK,
+                USE_MULTIMAX, MM_R0, MM_R1, MM_R2, MM_R3, MM_T0, MM_T1, MM_T2, MM_T3,
             )
 
 
@@ -876,6 +999,15 @@ def _markov_step(
     BLOCK: tl.constexpr,
     CHUNK: tl.constexpr,
     FP8: tl.constexpr,
+    USE_MULTIMAX: tl.constexpr = False,
+    MM_R0: tl.constexpr = 0.0,
+    MM_R1: tl.constexpr = 0.0,
+    MM_R2: tl.constexpr = 0.0,
+    MM_R3: tl.constexpr = 0.0,
+    MM_T0: tl.constexpr = 0.0,
+    MM_T1: tl.constexpr = 0.0,
+    MM_T2: tl.constexpr = 0.0,
+    MM_T3: tl.constexpr = 0.0,
 ):
     block, row = tl.program_id(0), tl.program_id(1)
     token = block * BLOCK + tl.arange(0, BLOCK)
@@ -920,6 +1052,8 @@ def _markov_step(
     score = (
         tl.load(Base + row * base_row_stride + STEP * base_step_stride + token, inside, other=0.0).to(tl.float32) + bias
     )
+    if USE_MULTIMAX:
+        score = _apply_multimax(score, MM_R0, MM_R1, MM_R2, MM_R3, MM_T0, MM_T1, MM_T2, MM_T3)
     safe = tl.minimum(tl.maximum(tl.load(Slots + row).to(tl.int64), 0), CAPACITY - 1)
     temperature = tl.load(Params + safe * 6)
     repetition = tl.load(Params + safe * 6 + 3)
@@ -1061,6 +1195,7 @@ class PreparedMarkovProposals:
         *,
         workspace=None,
         proposal_capacity=None,
+        multimax=None,
     ):
         if base.ndim != 3 or tokens.ndim != 2:
             raise ValueError("fused Markov logits require request, draft and vocabulary dimensions")
@@ -1115,6 +1250,23 @@ class PreparedMarkovProposals:
         self.seeds, self.offsets = seeds, offsets
         self.batch, self.depth, self.vocab = batch, depth, vocab
         self.block = 128
+        if multimax is not None:
+            ranges, ts = multimax
+            r_vals = [float(v) for v in (ranges.tolist() if isinstance(ranges, torch.Tensor) else ranges)]
+            t_vals = [float(v) for v in (ts.tolist() if isinstance(ts, torch.Tensor) else ts)]
+            if len(r_vals) != 4 or len(t_vals) != 4:
+                raise ValueError("multimax requires 4 range thresholds and 4 slope weights")
+            self.multimax_kwargs = dict(
+                USE_MULTIMAX=True,
+                MM_R0=r_vals[0], MM_R1=r_vals[1], MM_R2=r_vals[2], MM_R3=r_vals[3],
+                MM_T0=t_vals[0], MM_T1=t_vals[1], MM_T2=t_vals[2], MM_T3=t_vals[3],
+            )
+        else:
+            self.multimax_kwargs = dict(
+                USE_MULTIMAX=False,
+                MM_R0=0.0, MM_R1=0.0, MM_R2=0.0, MM_R3=0.0,
+                MM_T0=0.0, MM_T1=0.0, MM_T2=0.0, MM_T3=0.0,
+            )
         self.scratch = bind_scratch(self.scratch_layout(batch, depth, vocab, block=self.block), device=base.device, workspace=workspace)
         self.kernels = None
 
@@ -1138,6 +1290,7 @@ class PreparedMarkovProposals:
             BLOCK=block,
             CHUNK=chunk,
             FP8=self.head_scale is not None,
+            **self.multimax_kwargs,
             num_warps=step_warps,
             enable_fp_fusion=False,
         )
