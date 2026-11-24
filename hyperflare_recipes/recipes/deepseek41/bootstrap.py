@@ -50,7 +50,7 @@ from .decoder import PreparedDecoder, Scratch, DraftScratch
 from hyperflare_recipes.components.dspark import PreparedContext, PreparedMarkov
 from .dspark import PreparedDraft
 from .engram import Tables
-from hyperflare_recipes.components.paged_generation import PreparedGeneration
+from hyperflare_recipes.components.paged_generation import PreparedGeneration, PreparedPrefill
 from hyperflare_recipes.components.paged_maintenance import PreparedMaintenance
 from .pool import ContinuationPool, PAGE_TOKENS, continuation_layout, page_bytes
 from hyperflare_recipes.components.paged_resume import PreparedResume
@@ -118,6 +118,7 @@ class PreparationConfig(BasePreparationConfig):
     packed_verification: bool | None = None
     draft_prefix_selection: str | None = None
     speculation_reference_graphs: bool = False
+    deferred_prefill: bool = False
 
     def __post_init__(self):
         if self.mtp_only and (not self.dspark
@@ -158,6 +159,8 @@ class PreparationConfig(BasePreparationConfig):
             raise ValueError("DeepSeek V4.1 expert scale compression must be None or 'csf'")
         if type(self.stream_overlap) is not bool:
             raise TypeError("stream_overlap must be a boolean")
+        if type(self.deferred_prefill) is not bool:
+            raise TypeError("deferred_prefill must be a boolean")
         placements = tuple(zip(self.hosts or ("",) * len(self.devices), self.devices))
         if (not isinstance(self.devices, tuple) or len(self.devices) not in (3, 4, 6)
                 or len(set(placements)) != len(self.devices)
@@ -225,6 +228,15 @@ class PreparationConfig(BasePreparationConfig):
     @property
     def completion_token_capacity(self):
         return max(self.speculative_widths) if self.dspark else 1
+
+
+def deferred_prefill_enabled(config: PreparationConfig, sliding_window: int, *, decoder_start: int | None) -> bool:
+    """Return whether preparation emits separate intermediate and terminal prefill graphs."""
+    return (
+        config.deferred_prefill
+        and decoder_start is not None
+        and config.prefill_chunk_size > sliding_window
+    )
 
 
 def _prepare_speculation_catalog(config, speculation, *, add, buffers,
@@ -455,8 +467,21 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
     from ignition.preparation import runtime_core_pb2 as _pb2
 
     modes = serving_modes(config.dspark, config.mtp_only)
-    has_terminal_prefill = hasattr(_pb2, "TERMINAL_PREFILL") and weights.config.decoder_start is not None
-    terminal_prefill_count = sum(1 for capacity in config.prefill_capacities if capacity > 128) if has_terminal_prefill else 0
+    has_terminal_prefill_v4 = "terminal_prefill_min_tokens" in _pb2.GraphContract.DESCRIPTOR.fields_by_name
+    deferred_prefill = deferred_prefill_enabled(
+        config, weights.config.text["sliding_window"], decoder_start=weights.config.decoder_start
+    )
+    has_terminal_prefill = (
+        not deferred_prefill
+        and not has_terminal_prefill_v4
+        and hasattr(_pb2, "TERMINAL_PREFILL")
+        and weights.config.decoder_start is not None
+    )
+    terminal_prefill_count = (
+        len(config.prefill_capacities) if deferred_prefill
+        else sum(1 for capacity in config.prefill_capacities if capacity > 128) if has_terminal_prefill
+        else 0
+    )
     count = (len(modes) * (prefill_graph_count(config.prefill_capacities, scoring)
                            + terminal_prefill_count
                            + 4 * len(config.batch_capacities))
@@ -517,6 +542,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                             context_factory=PreparedContext if graph_kind == "scored_prefill" else _CONTEXT,
                             sample=sample)
                         fields = (*forward_inputs, "vision_token_indices", "vision_feature_slot") if mode == "prefill" and vision_state is not None else forward_inputs
+                        if graph_kind == "prefill" and deferred_prefill:
+                            add("terminal_" + name, forward, "terminal_prefill", rows, capacity, fields, enabled=enabled)
+                            forward = PreparedPrefill(decoder, batch, completion, frame, sequence,
+                                validation=forward.validation)
                         add(name, forward, graph_kind, rows, capacity if mode == "prefill" else 1, fields, enabled=enabled)
         confidence = _prepare_speculation_catalog(config, speculation, add=add, buffers=buffers,
             forward_inputs=forward_inputs,

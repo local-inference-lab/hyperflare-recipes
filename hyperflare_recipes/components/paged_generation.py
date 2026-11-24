@@ -4,8 +4,10 @@
 
 """Collective text execution and request completion."""
 
+import inspect
+
 from ignition.components.collectives import PreparedAllReduce
-from ignition.components.sampling import PreparedSampling
+from ignition.components.sampling import PreparedCompletion, PreparedSampling
 from ignition.components.state import save_hidden
 
 
@@ -104,3 +106,32 @@ class PreparedGeneration:
                 observed["target.hidden"] = hidden
                 observed["target.logits"] = logits
             return observed
+
+
+class PreparedPrefill:
+    """Consume prompt rows without publishing continuation or sampling outputs."""
+
+    def __init__(self, decoder, batch, records, frame, sequence, *, validation):
+        parameters = inspect.signature(decoder).parameters
+        terminal = parameters.get("terminal")
+        accepts_kwargs = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+        if not accepts_kwargs and (
+            terminal is None
+            or terminal.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.VAR_POSITIONAL)
+        ):
+            raise TypeError("PreparedPrefill requires a decoder accepting terminal=False")
+        self.decoder, self.batch = decoder, batch
+        self.validation = validation
+        b, rows = batch.inputs, batch.rows
+        self.completion = PreparedCompletion(batch.requests, b.row_slot_ids[:rows],
+            b.row_generations[:rows], b.live_rows, records, frame, sequence)
+        self.completion.prepare()
+        decoder.release_outputs()
+        self.batch.functional()
+
+    def __call__(self):
+        validation, present = self.batch.validate()
+        metadata = self.batch.begin(self.validation(validation), present=present)
+        self.decoder(metadata, terminal=False)
+        self.batch.finish(metadata)
+        self.completion()
