@@ -16,7 +16,7 @@ from ignition.components.engram import EngramInputs, PreparedEngramLookup, Prepa
 from ignition.components.readiness import ReadinessTimings
 from hyperflare_recipes.components.embedding_partition import EmbeddingHeadPartition
 from hyperflare_recipes.components.linear import QuantizedProjection
-from ignition.components.collectives import PreparedChunkedAllReduce
+from ignition.components.collectives import PreparedAllGather, PreparedChunkedAllReduce
 from ignition.components.state import gather_rows, save_hidden
 from ignition.preparation.runtime_core import FileSource
 from ignition.preparation.persistent import persistent_copy
@@ -201,7 +201,7 @@ class EngramScratch:
 
 class PreparedEngram:
     def __init__(self, layer, weights, tables, source, output, metadata, pool, *, scratch, session, name, workspace,
-                 runtime=None, coordinator=None, examples=None):
+                 runtime=None, coordinator=None, examples=None, defer_reduce_functional=False):
         self.pool = pool
         tokens, device = metadata.token_ids.numel(), source.device
         self.mask, self.gathered, self.projected = scratch.mask, scratch.gathered, scratch.projected
@@ -220,11 +220,54 @@ class PreparedEngram:
         self.lookup = PreparedEngramLookup(tables.inputs[layer], self.gathered, metadata.live_counts[:1],
             layer=layer, token_map=tables.token_map, geometry=tables.geometry,
             session=session, name=name + ".lookup", runtime=tables.readiness_runtime, coordinator=coordinator).functional(session=session)
-        self.projection = QuantizedProjection(self.local, weights["projection"], self.partial,
-            session=session, name=name + ".projection", workspace=workspace, activation_mode="auto",
-            examples=examples, example_role="engram.projection").functional(session=session)
-        self.reduce = (PreparedChunkedAllReduce(self.partial.view(-1, 5120), self.projected.view(-1, 5120), runtime=runtime,
-            session=session, coordinator=coordinator, name=name + ".reduce").functional(session=session) if self.sharded else None)
+        from b12x.comm import pcie
+        # For prefills >= 512 tokens on local PCIe DMA runtimes, gather the 6144-col
+        # Engram activations first and run one full projection (`projection_full`).
+        # Note: the full projection accumulates across all 24 heads in FP32 before a
+        # single BF16 round, whereas the sharded <512-token path rounds each rank's
+        # partial sum to BF16 before the all-reduce. The two paths share identical
+        # weights/precision but are not bit-identical across the 512-token boundary.
+        self.use_all_gather = (
+            self.sharded
+            and isinstance(runtime, pcie.DmaAllReduce)
+            and "projection_full" in weights
+            and tokens >= 512
+        )
+        self.gather_parts = ()
+        self.gather_bounds = ()
+        if self.use_all_gather:
+            world = tables.shard.world_size
+            local_cols = 6144 // world
+            max_rows = runtime.shard_capacity // (local_cols * 2)
+            if max_rows < 1:
+                raise ValueError("DMA runtime shard capacity is too small for Engram all-gather")
+            chunks = max(1, (tokens + max_rows - 1) // max_rows)
+            step = (tokens + chunks - 1) // chunks
+            self.gather_bounds = tuple((start, min(start + step, tokens)) for start in range(0, tokens, step))
+            self.gather_parts = tuple(
+                PreparedAllGather(
+                    self.local[begin:end],
+                    self.gathered[begin:end].view(world, end - begin, local_cols),
+                    runtime=runtime, session=session, coordinator=coordinator,
+                    name=name + ".gather" if len(self.gather_bounds) == 1 else f"{name}.gather.{index}",
+                )
+                for index, (begin, end) in enumerate(self.gather_bounds)
+            )
+            if not defer_reduce_functional:
+                for part in self.gather_parts:
+                    part.functional(session=session)
+            self.projection = QuantizedProjection(self.gathered, weights["projection_full"], self.projected,
+                session=session, name=name + ".projection", workspace=workspace, activation_mode="auto",
+                examples=examples, example_role="engram.projection").functional(session=session)
+            self.reduce = None
+        else:
+            self.projection = QuantizedProjection(self.local, weights["projection"], self.partial,
+                session=session, name=name + ".projection", workspace=workspace, activation_mode="auto",
+                examples=examples, example_role="engram.projection").functional(session=session)
+            self.reduce = (PreparedChunkedAllReduce(self.partial.view(-1, 5120), self.projected.view(-1, 5120), runtime=runtime,
+                session=session, coordinator=coordinator, name=name + ".reduce") if self.sharded else None)
+            if self.reduce is not None and not defer_reduce_functional:
+                self.reduce.functional(session=session)
         self.norm_weight = weights["weight"].view(-1)
         self.eps = pool.config.text["rms_norm_eps"]
         self.mix_plan = hyperconnection.plan(hyperconnection.Caps(device=device, max_tokens=tokens, hidden_size=5120),
@@ -235,14 +278,33 @@ class PreparedEngram:
                                       mask, output.view(tokens, -1), eps=self.eps))),))
         self.mask = self.gathered = self.projected = self.local = self.partial = None
 
-    def __call__(self, source, metadata):
-        mask = (metadata.positions >= 0) & (metadata.token_ids < 129280)
+    def lookup_local(self, source, metadata):
         gathered = self.lookup(source, metadata.live_counts[:1])
-        local = torch.index_select(gathered, 1, self.columns) if self.sharded else gathered
-        projected = self.projection(local)
-        if self.sharded:
-            projected = self.reduce(projected.view(-1, 5120)).view(source.shape[0], 25600)
-        output = torch.zeros_like(source)
+        return torch.index_select(gathered, 1, self.columns) if self.sharded else gathered
+
+    def project_gathered(self, gathered_chunks):
+        reordered = [chunk.permute(1, 0, 2).reshape(chunk.shape[1], 6144) for chunk in gathered_chunks]
+        full = reordered[0].contiguous() if len(reordered) == 1 else torch.cat(reordered, dim=0)
+        return self.projection(full)
+
+    def project(self, source, metadata):
+        local = self.lookup_local(source, metadata)
+        return self.projection(local)
+
+    def mix(self, source, projected, metadata):
+        mask = (metadata.positions >= 0) & (metadata.token_ids < 129280)
+        output = torch.empty_like(source)
         hyperconnection.run_engram_mix(source.view(source.shape[0], -1), projected, self.norm_weight,
             eps=self.eps, plan=self.mix_plan, out=output.view(source.shape[0], -1), token_mask=mask)
         return output
+
+    def __call__(self, source, metadata):
+        if self.use_all_gather:
+            local = self.lookup_local(source, metadata)
+            chunks = [part(local[begin:end]) for (begin, end), part in zip(self.gather_bounds, self.gather_parts, strict=True)]
+            projected = self.project_gathered(chunks)
+            return self.mix(source, projected, metadata)
+        projected = self.project(source, metadata)
+        if self.sharded:
+            projected = self.reduce(projected.view(-1, 5120)).view(source.shape[0], 25600)
+        return self.mix(source, projected, metadata)

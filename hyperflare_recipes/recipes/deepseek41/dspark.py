@@ -57,7 +57,7 @@ class PreparedDraft:
         residual, = incoming
         head_hidden = (residual[metadata.sample_indices].float()
                        * pre_mix[metadata.sample_indices, :, None]).sum(1).bfloat16()
-        hidden = torch.zeros_like(head_hidden)
+        hidden = torch.empty_like(head_hidden)
         normalize(head_hidden, self.weights.draft.norm, hidden, self.weights.config.text["rms_norm_eps"])
         features = {"head_hidden": head_hidden.view(metadata.starts.numel(), -1, head_hidden.shape[-1])}
         return self.head(hidden), None, features

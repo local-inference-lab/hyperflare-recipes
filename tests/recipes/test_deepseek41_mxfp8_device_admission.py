@@ -45,18 +45,18 @@ def test_attention_selects_architecture_compatible_mxfp8_preparation(monkeypatch
         monkeypatch.setattr(attention, name,
                             lambda *args, **kwargs: Component(plan=object()))
 
-    metadata = Metadata.allocate(1, 1, 1, "cpu", max_query_tokens=1)
-    scratch = AttentionScratch.allocate(1, 4, "cpu")
+    metadata = Metadata.allocate(32, 1, 1, "cpu", max_query_tokens=32)
+    scratch = AttentionScratch.allocate(32, 4, "cpu")
     config = SimpleNamespace(text={"compress_ratios": [0], "rms_norm_eps": 1e-20, "candidate_source_layer_id": 0},
                              source=lambda layer: None)
     pool = SimpleNamespace(config=config,
-                           window=lambda *args, **kwargs: torch.zeros((2, 128 * 528), dtype=torch.uint8))
+                           window=lambda *args, **kwargs: torch.zeros((2, (128 + 32) * 528), dtype=torch.uint8))
     weights = {"qkv_a": SimpleNamespace(weight=PackedMXFP8()),
                "q_b": SimpleNamespace(weight=PackedMXFP8()),
                "q_norm": torch.ones(1280, dtype=torch.bfloat16),
                "kv_norm": torch.ones(512, dtype=torch.bfloat16),
                "output": object(), "sink": object()}
-    prepared = PreparedAttention(0, weights, torch.zeros((1, 5120), dtype=torch.bfloat16),
+    prepared = PreparedAttention(0, weights, torch.zeros((32, 5120), dtype=torch.bfloat16),
                                  scratch, metadata, pool, None, mode="decode", world=4,
                                  session=None, name="attention", workspace=None)
 

@@ -395,12 +395,12 @@ wheels = [
 [[package]]
 name = "flare-heliopause"
 version = "0.1.0"
-source = { directory = "heliopause" }
+source = { git = "https://github.com/NVIDIA/hyperflare-inference.git?subdirectory=heliopause&branch=main#425ab2d4696caee841b1fc8165ff8d806a5af7e9" }
 
 [[package]]
 name = "flashinfer-python"
 version = "0.7.3"
-source = { git = "https://github.com/local-inference-lab/flashinfer.git?branch=main#994df9c4f32256c9d9281fc39ae7c646dedd42b3" }
+source = { git = "https://github.com/local-inference-lab/flashinfer.git?branch=main#f975f6c2e6b88764e3b8a75752952e6e1f07078e" }
 dependencies = [
     { name = "apache-tvm-ffi" },
     { name = "click" },
@@ -514,6 +514,36 @@ wheels = [
 ]
 
 [[package]]
+name = "hyperflare-recipes"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "ignition", extra = ["prepare"] },
+]
+
+[package.optional-dependencies]
+api-test = [
+    { name = "anthropic" },
+    { name = "openai" },
+    { name = "pytest" },
+]
+test = [
+    { name = "pytest" },
+    { name = "tiktoken" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "anthropic", marker = "extra == 'api-test'", specifier = ">=0.70,<1" },
+    { name = "ignition", extras = ["prepare"], git = "https://github.com/NVIDIA/hyperflare-inference.git?branch=main" },
+    { name = "openai", marker = "extra == 'api-test'", specifier = ">=2,<3" },
+    { name = "pytest", marker = "extra == 'api-test'", specifier = ">=9,<10" },
+    { name = "pytest", marker = "extra == 'test'", specifier = ">=9,<10" },
+    { name = "tiktoken", marker = "extra == 'test'", specifier = ">=0.12,<1" },
+]
+provides-extras = ["test", "api-test"]
+
+[[package]]
 name = "idna"
 version = "3.20"
 source = { registry = "https://pypi.org/simple" }
@@ -525,14 +555,9 @@ wheels = [
 [[package]]
 name = "ignition"
 version = "0.1.0"
-source = { editable = "." }
+source = { git = "https://github.com/NVIDIA/hyperflare-inference.git?branch=main#425ab2d4696caee841b1fc8165ff8d806a5af7e9" }
 
 [package.optional-dependencies]
-api-test = [
-    { name = "anthropic" },
-    { name = "openai" },
-    { name = "pytest" },
-]
 prepare = [
     { name = "accelerate" },
     { name = "cryptography" },
@@ -550,35 +575,6 @@ prepare = [
     { name = "torchvision" },
     { name = "transformers", extra = ["chat-template", "torch", "vision"] },
 ]
-test = [
-    { name = "pytest" },
-    { name = "tiktoken" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "accelerate", marker = "extra == 'prepare'", specifier = "==1.14.0" },
-    { name = "anthropic", marker = "extra == 'api-test'", specifier = ">=0.70,<1" },
-    { name = "cryptography", marker = "extra == 'prepare'", specifier = ">=46,<52" },
-    { name = "cuda-python", marker = "extra == 'prepare'", specifier = "==13.3.1" },
-    { name = "cuda-tile", extras = ["tileiras"], marker = "extra == 'prepare'", specifier = "==1.6.0" },
-    { name = "flare-heliopause", marker = "extra == 'prepare'", directory = "heliopause" },
-    { name = "flashinfer-python", extras = ["b12x"], marker = "extra == 'prepare'", git = "https://github.com/local-inference-lab/flashinfer.git?branch=main" },
-    { name = "huggingface-hub", marker = "extra == 'prepare'", specifier = "==1.33.0" },
-    { name = "openai", marker = "extra == 'api-test'", specifier = ">=2,<3" },
-    { name = "pillow", marker = "extra == 'prepare'", specifier = "==12.3.0" },
-    { name = "protobuf", marker = "extra == 'prepare'", specifier = ">=7.36.2,<8" },
-    { name = "pytest", marker = "extra == 'api-test'", specifier = ">=9,<10" },
-    { name = "pytest", marker = "extra == 'test'", specifier = ">=9,<10" },
-    { name = "rich", marker = "extra == 'prepare'", specifier = ">=13" },
-    { name = "safetensors", marker = "extra == 'prepare'", specifier = "==0.8.0" },
-    { name = "tiktoken", marker = "extra == 'test'", specifier = ">=0.12,<1" },
-    { name = "tokenizers", marker = "extra == 'prepare'", specifier = "==0.23.2" },
-    { name = "torch", marker = "extra == 'prepare'", specifier = "==2.14.1+cu132", index = "https://download.pytorch.org/whl/cu132" },
-    { name = "torchvision", marker = "extra == 'prepare'", specifier = "==0.29.1+cu132", index = "https://download.pytorch.org/whl/cu132" },
-    { name = "transformers", extras = ["torch", "vision", "chat-template"], marker = "extra == 'prepare'", specifier = "==5.23.0" },
-]
-provides-extras = ["test", "api-test", "prepare"]
 
 [[package]]
 name = "iniconfig"

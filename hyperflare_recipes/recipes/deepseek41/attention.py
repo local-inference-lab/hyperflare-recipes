@@ -19,14 +19,20 @@ from hyperflare_recipes.components.attention_output import PreparedGroupedOutput
 from hyperflare_recipes.components.linear import QuantizedProjection, UnquantizedProjection
 from hyperflare_recipes.components.mla_norm_quant import PreparedMLANormQuant
 from hyperflare_recipes.components.mxfp4_indexer import PreparedMXFP4Indexer
-from hyperflare_recipes.components.projection_overlap import ConcurrentProjectionChain
+from hyperflare_recipes.components.projection_overlap import (
+    ConcurrentAttentionAux,
+    register_tc_gemv_rope,
+    run_mxfp8_projection_rope,
+)
 from hyperflare_recipes.components.rms_norm import PreparedRMSNorm
 from ignition.components.state import gather_rows, gather_rows_three, save_hidden
 from hyperflare_recipes.components.window_indices import PreparedWindowIndices, WindowIndices
+from ignition.preparation.persistent import persistent_copy
+from ignition.preparation.tensor_metadata import record_numeric_tensor
 from ignition.preparation.tuning import declare, register_finalizer
 from ignition.preparation.scratch import ScratchArena
 
-from hyperflare_recipes.components.rotary import CompressedRotary as Rotary
+from hyperflare_recipes.components.rotary import CompressedRotary as Rotary, PreparedRotaryAngles
 from hyperflare_recipes.components.parallel import TensorParallelShard
 
 from .pool import PAGE_TOKENS
@@ -49,13 +55,14 @@ class CompressionGeometry:
 class AttentionGeometry(WindowIndices):
     position: torch.Tensor
     ratios: dict
+    angles: dict = None
 
     def compressed(self, ratio):
         return self.ratios[ratio]
 
 
 class AttentionIndices(PreparedWindowIndices):
-    """Window and compression addresses shared by layers with identical metadata."""
+    """Window, compression, and shared rotary angles for layers with identical metadata."""
 
     def __init__(self, metadata, *, mode, tokens, page_size, width, ratios=(), visible=None,
                  replay_start=None):
@@ -71,6 +78,18 @@ class AttentionIndices(PreparedWindowIndices):
             index_lengths=torch.zeros(tokens, dtype=torch.int32, device=metadata.positions.device),
             active_width=torch.zeros(1, dtype=torch.int32, device=metadata.positions.device),
             position=torch.zeros_like(metadata.positions)) for ratio in self.ratio_ids}
+        self.angles = {}
+        self.token_offsets = persistent_copy(torch.arange(tokens, dtype=torch.int64, device=metadata.positions.device))
+        record_numeric_tensor(self.token_offsets)
+
+    def rotary_angles(self, rotary, *, compressed, ratio=0):
+        if rotary is None:
+            return None
+        key = (bool(compressed), int(ratio))
+        if key not in self.angles:
+            positions = self.position if ratio == 0 else self.compressed(ratio).position
+            self.angles[key] = PreparedRotaryAngles(positions, rotary.frequencies[bool(compressed)], split=True)
+        return self.angles[key]
 
     def compressed(self, ratio):
         if ratio not in self.ratios:
@@ -80,6 +99,8 @@ class AttentionIndices(PreparedWindowIndices):
     def functional(self):
         super().functional()
         self.position = self.ratios = None
+        for operation in self.angles.values():
+            operation.functional()
         return self
 
     def __call__(self, metadata, visible=None, replay_start=None):
@@ -95,13 +116,93 @@ class AttentionIndices(PreparedWindowIndices):
                 active_width=lengths.amax().view(1),
                 slots=torch.where(live, pages.long() * (PAGE_TOKENS // ratio) + (position % PAGE_TOKENS) // ratio, -1),
                 position=(position + 1) // ratio * ratio - ratio)
+        angles = {key: operation(position if key[1] == 0 else ratios[key[1]].position)
+                  for key, operation in self.angles.items()}
         return AttentionGeometry(window.window_slots, window.window_indices, window.window_lengths,
-                                 window.window_page_size, position, ratios)
+                                 window.window_page_size, position, ratios, angles)
 
 
 def normalize(source, weight, out, eps):
     value = source.float()
     out.copy_((value * torch.rsqrt(value.square().mean(-1, keepdim=True) + eps)) * weight.float())
+
+
+@triton.jit
+def _q_kv_norm_rope_kernel(X, QW, KW, ANGLES, Q_OUT, KV_OUT, EPS: tl.constexpr):
+    """Fused Q RMSNorm (1280) + KV RMSNorm (512) + KV RoPE (last 64), bit-exact BF16 seam."""
+    row = tl.program_id(0).to(tl.int64)
+    task = tl.program_id(1)
+    if task == 0:
+        qc = tl.arange(0, 2048)
+        qm = qc < 1280
+        qx = tl.load(X + row * 1792 + qc, mask=qm, other=0.0).to(tl.float32)
+        qw = tl.load(QW + qc, mask=qm, other=0.0).to(tl.float32)
+        qinv = tl.rsqrt(tl.sum(qx * qx, 0) / 1280.0 + EPS)
+        tl.store(Q_OUT + row * 1280 + qc, (qx * qinv * qw).to(tl.bfloat16), mask=qm)
+    else:
+        kc = tl.arange(0, 512)
+        kx = tl.load(X + row * 1792 + 1280 + kc).to(tl.float32)
+        kw = tl.load(KW + kc).to(tl.float32)
+        kinv = tl.rsqrt(tl.sum(kx * kx, 0) / 512.0 + EPS)
+        tl.store(KV_OUT + row * 512 + kc, (kx * kinv * kw).to(tl.bfloat16), mask=kc < 448)
+        pair = tl.arange(0, 32)
+        xa = tl.load(X + row * 1792 + 1280 + 448 + 2 * pair).to(tl.float32)
+        xb = tl.load(X + row * 1792 + 1280 + 448 + 2 * pair + 1).to(tl.float32)
+        wa = tl.load(KW + 448 + 2 * pair).to(tl.float32)
+        wb = tl.load(KW + 448 + 2 * pair + 1).to(tl.float32)
+        a = (xa * kinv * wa).to(tl.bfloat16).to(tl.float32)
+        b = (xb * kinv * wb).to(tl.bfloat16).to(tl.float32)
+        cos = tl.load(ANGLES + row * 64 + pair)
+        sin = tl.load(ANGLES + row * 64 + 32 + pair)
+        tl.store(KV_OUT + row * 512 + 448 + 2 * pair, (a * cos - b * sin).to(tl.bfloat16))
+        tl.store(KV_OUT + row * 512 + 448 + 2 * pair + 1, (a * sin + b * cos).to(tl.bfloat16))
+
+
+def _q_kv_norm_rope(projected, qw, kw, angles, eps):
+    rows = projected.shape[0]
+    query_low = torch.empty((rows, 1280), dtype=torch.bfloat16, device=projected.device)
+    window_values = torch.empty((rows, 512), dtype=torch.bfloat16, device=projected.device)
+    torch.library.wrap_triton(_q_kv_norm_rope_kernel)[(rows, 2)](
+        projected, qw, kw, angles, query_low, window_values, eps, num_warps=4)
+    return query_low, window_values
+
+
+@triton.jit
+def _index_norm_and_rotate_kernel(KEYS_IN, KW, ANGLES, KEYS_OUT, LATENT, EPS: tl.constexpr):
+    """Fused index_k RMSNorm (128) + index_k RoPE (last 64) + latent RoPE (last 64)."""
+    row = tl.program_id(0).to(tl.int64)
+    task = tl.program_id(1)
+    pair = tl.arange(0, 32)
+    cos = tl.load(ANGLES + row * 64 + pair)
+    sin = tl.load(ANGLES + row * 64 + 32 + pair)
+    if task == 0:
+        kc = tl.arange(0, 128)
+        kx = tl.load(KEYS_IN + row * 128 + kc).to(tl.float32)
+        kw = tl.load(KW + kc).to(tl.float32)
+        kinv = tl.rsqrt(tl.sum(kx * kx, 0) / 128.0 + EPS)
+        tl.store(KEYS_OUT + row * 128 + kc, (kx * kinv * kw).to(tl.bfloat16), mask=kc < 64)
+        xa = tl.load(KEYS_IN + row * 128 + 64 + 2 * pair).to(tl.float32)
+        xb = tl.load(KEYS_IN + row * 128 + 64 + 2 * pair + 1).to(tl.float32)
+        wa = tl.load(KW + 64 + 2 * pair).to(tl.float32)
+        wb = tl.load(KW + 64 + 2 * pair + 1).to(tl.float32)
+        ka = (xa * kinv * wa).to(tl.bfloat16).to(tl.float32)
+        kb = (xb * kinv * wb).to(tl.bfloat16).to(tl.float32)
+        tl.store(KEYS_OUT + row * 128 + 64 + 2 * pair, (ka * cos - kb * sin).to(tl.bfloat16))
+        tl.store(KEYS_OUT + row * 128 + 64 + 2 * pair + 1, (ka * sin + kb * cos).to(tl.bfloat16))
+    else:
+        base = LATENT + row * 512 + 448 + 2 * pair
+        la = tl.load(base).to(tl.float32)
+        lb = tl.load(base + 1).to(tl.float32)
+        tl.store(base, (la * cos - lb * sin).to(tl.bfloat16))
+        tl.store(base + 1, (la * sin + lb * cos).to(tl.bfloat16))
+
+
+def _index_norm_and_rotate(keys_raw, kw, latent, angles, eps):
+    rows = keys_raw.shape[0]
+    keys = torch.empty((rows, 128), dtype=torch.bfloat16, device=keys_raw.device)
+    torch.library.wrap_triton(_index_norm_and_rotate_kernel)[(rows, 2)](
+        keys_raw, kw, angles, keys, latent, eps, num_warps=4)
+    return keys
 
 
 @dataclass(frozen=True)
@@ -154,7 +255,8 @@ class PreparedCompressor:
         self.output = zeros((tokens, 512), torch.bfloat16)
         self.emitted = zeros(tokens, torch.bool)
         self.slots = zeros(tokens, torch.int64).fill_(-1)
-        self.state_ids = torch.arange(rows, dtype=torch.int64, device=device)
+        self.state_ids = persistent_copy(torch.arange(rows, dtype=torch.int64, device=device))
+        record_numeric_tensor(self.state_ids)
         self.arguments = dict(values=self.values, weight=weights["norm"], query_start_loc=metadata.query_start_loc,
             positions=metadata.starts, state_ids=self.state_ids, destination_slots=slots,
             live_counts=metadata.live_counts, out=self.output, emitted=self.emitted, emitted_slots=self.slots)
@@ -188,7 +290,7 @@ class PreparedCompressor:
         return self
 
     def release_examples(self):
-        self.values = self.output = self.emitted = self.slots = self.state_ids = self.arguments = None
+        self.values = self.output = self.emitted = self.slots = self.arguments = None
         if self.ratio == 2:
             self.gates = self.pending = None
 
@@ -196,13 +298,13 @@ class PreparedCompressor:
         from b12x.attention.mla_compress._impl import _run_ratio1, _run_ratio2
 
         m = metadata
-        output = torch.zeros((source.shape[0], 512), dtype=torch.bfloat16, device=source.device)
-        emitted = torch.zeros(source.shape[0], dtype=torch.bool, device=source.device)
-        emitted_slots = torch.full((source.shape[0],), -1, dtype=torch.int64, device=source.device)
-        state_ids = torch.arange(m.starts.numel(), dtype=torch.int64, device=source.device)
+        output = torch.empty((source.shape[0], 512), dtype=torch.bfloat16, device=source.device)
+        emitted = torch.empty(source.shape[0], dtype=torch.bool, device=source.device)
+        emitted_slots = torch.empty((source.shape[0],), dtype=torch.int64, device=source.device)
+        state_ids = self.state_ids
         gates = None
         if self.ratio == 2:
-            pending = {key: torch.zeros((m.starts.numel(), 512) if key != "pending_position" else (m.starts.numel(),),
+            pending = {key: torch.empty((m.starts.numel(), 512) if key != "pending_position" else (m.starts.numel(),),
                 dtype=torch.float32 if key != "pending_position" else torch.int64, device=source.device)
                 for key in ("pending_values", "pending_gates", "pending_position")}
             gather_rows_three(tuple(self.pool.region(f"layer{self.layer}.{key}") for key in pending),
@@ -245,24 +347,41 @@ class PreparedGlobalKV:
         if indices.metadata is not metadata or indices.position.shape != (source.shape[0],):
             raise ValueError("global KV indices must describe every source row")
         slots = indices.compressed(self.ratio).slots
+        self.angles = indices.rotary_angles(rotary, compressed=True, ratio=self.ratio)
         self.compressor = PreparedCompressor(layer, weights["compressor"], source, metadata,
             pool, slots, session=session, name=f"{name}.compress", deferred=deferred)
         self.index_key = UnquantizedProjection(self.compressor.output, weights["index_k"], scratch.index_keys,
             session=session, name=f"{name}.index_key").functional(session=session)
-        self.index_norm = PreparedRMSNorm(scratch.index_keys, weights["index_norm"], scratch.normalized_keys,
-            eps=pool.config.text["rms_norm_eps"], session=session, name=name + ".index_norm").functional()
+        self.eps = pool.config.text["rms_norm_eps"]
+        self.index_norm_weight = weights["index_norm"]
+        record_numeric_tensor(self.index_norm_weight)
+        self.index_norm = (None if self.angles.split else PreparedRMSNorm(
+            scratch.index_keys, weights["index_norm"], scratch.normalized_keys,
+            eps=self.eps, session=session, name=name + ".index_norm").functional())
         self.writer = PreparedCompressedCacheWriter(self.compressor.output,
             pool.pages[f"layer{layer}.latent_page"], self.compressor.slots,
             page_size=PAGE_TOKENS // self.ratio, kind="indexed", session=session,
             name=f"{name}.compressed_write").functional(session=session)
         self.compressor.functional(session=session)
 
-    def __call__(self, source, indexer, metadata, geometry):
+    def __call__(self, source, indexer, metadata, geometry, angles=None):
         latent, slots, records = self.compressor(source, metadata, geometry.slots)
-        keys = self.index_norm(self.index_key(latent))
-        self.rotary.apply(keys, geometry.position, compressed=True)
-        indexer.write_keys(keys, slots)
-        self.rotary.apply(latent, geometry.position, compressed=True)
+        keys_raw = self.index_key(latent)
+        if angles is not None and self.angles.split:
+            keys = _index_norm_and_rotate(keys_raw, self.index_norm_weight, latent, angles, self.eps)
+            indexer.write_keys(keys, slots)
+        elif angles is not None:
+            keys = self.index_norm(keys_raw)
+            self.angles.apply(keys, angles)
+            indexer.write_keys(keys, slots)
+            self.angles.apply(latent, angles)
+        else:
+            keys = torch.empty_like(keys_raw) if self.index_norm is None else self.index_norm(keys_raw)
+            if self.index_norm is None:
+                normalize(keys_raw, self.index_norm_weight, keys, self.eps)
+            self.rotary.apply(keys, geometry.position, compressed=True)
+            indexer.write_keys(keys, slots)
+            self.rotary.apply(latent, geometry.position, compressed=True)
         self.writer(latent, slots)
         return records
 
@@ -283,16 +402,26 @@ def _commit_window(Staged, Window, State, Starts, Lengths, STRIDE: tl.constexpr,
 class PreparedAttention:
     def __init__(self, layer, weights, source, scratch, metadata, pool, rotary, *, mode,
                  world, session, name, workspace, replay_start=None, window_staging=None,
-                 mla_compute_mode="auto", window_metadata=None, examples=None):
+                 mla_compute_mode="auto", window_metadata=None, examples=None, pipelined_mode=None):
         self.layer, self.weights, self.scratch, self.metadata = layer, weights, scratch, metadata
         self.pool, self.rotary, self.mode = pool, rotary, mode
         self.replay_start = replay_start
+        if pipelined_mode not in (None, "full", "mla_wo"):
+            raise ValueError(f"unsupported pipelined attention mode: {pipelined_mode!r}")
+        if pipelined_mode == "full" and ("compressor" in weights or "index_q" in weights):
+            raise ValueError("full pipelined attention requires a non-source, non-indexer layer")
+        self.pipelined_mode = pipelined_mode
         config = pool.config
         draft = mode == "draft"
         self.ratio = 0 if draft else config.text["compress_ratios"][layer]
         self.source = None if draft else config.source(layer)
         self.eps = config.text["rms_norm_eps"]
         tokens, device = source.shape[0], source.device
+        if pipelined_mode is not None and (tokens < 2 or tokens % 2 != 0):
+            raise ValueError("pipelined attention requires an even token capacity >= 2")
+        self.half_tokens = tokens // 2
+        prefix_tokens = self.half_tokens if pipelined_mode == "full" else tokens
+        mla_tokens = self.half_tokens if pipelined_mode in ("full", "mla_wo") else tokens
         rows = metadata.starts.numel()
         def zeros(shape, dtype):
             return torch.zeros(shape, dtype=dtype, device=device)
@@ -323,7 +452,10 @@ class PreparedAttention:
         self.window_slots = window_metadata.window_slots
         self.window_indices = window_metadata.window_indices
         self.window_lengths = window_metadata.window_lengths
-        self.token_offsets = torch.arange(tokens, device=device)
+        self.token_offsets = window_metadata.token_offsets
+        self.angles = window_metadata.rotary_angles(rotary, compressed=bool(self.ratio), ratio=0)
+        self.index_angles = (window_metadata.rotary_angles(rotary, compressed=True, ratio=0)
+                             if "index_q" in weights else None)
         geometry = window_metadata.compressed(self.ratio) if self.ratio else None
         self.lengths = zeros(tokens, torch.int32) if geometry is None else geometry.lengths
         self.active_width = zeros(1, torch.int32) if geometry is None else geometry.active_width
@@ -333,32 +465,53 @@ class PreparedAttention:
         use_b12x_mxfp8 = not sm103_projection.is_sm103(device)
         paired_mxfp8 = use_b12x_mxfp8 and all(isinstance(getattr(weights[key], "weight", None), mxfp8.MXFP8Rows)
                            for key in ("qkv_a", "q_b"))
-        self.norm_quant = (PreparedMLANormQuant(scratch.projected,
-            (weights["q_norm"], weights["kv_norm"]), scratch.query_low, scratch.window_values,
+        use_a16_qkv = (paired_mxfp8 and prefix_tokens <= 28
+                       and not getattr(session, "native_dense_activations", False))
+        self.norm_quant = (PreparedMLANormQuant(scratch.projected[:prefix_tokens],
+            (weights["q_norm"], weights["kv_norm"]), scratch.query_low[:prefix_tokens],
+            scratch.window_values[:prefix_tokens],
             eps=self.eps, session=session, name=name + ".qkv_norm",
-            release_dependents=tokens <= 8, examples=examples)
-            if paired_mxfp8 and self.eps == 1e-20 and mla_norm_mxfp8.is_supported(device) else None)
+            release_dependents=prefix_tokens <= 8, examples=examples)
+            if paired_mxfp8 and not use_a16_qkv and self.eps == 1e-20 and mla_norm_mxfp8.is_supported(device) else None)
         for key, values, out in (
-            ("qkv_a", source, scratch.projected), ("q_b", scratch.query_low, scratch.query.view(tokens, -1)),
+            ("qkv_a", source[:prefix_tokens], scratch.projected[:prefix_tokens]),
+            ("q_b", scratch.query_low[:prefix_tokens], scratch.query[:prefix_tokens].view(prefix_tokens, -1)),
         ):
             packed_mxfp8 = use_b12x_mxfp8 and isinstance(
                 getattr(weights[key], "weight", None), mxfp8.MXFP8Rows)
+            use_quantized_seam = packed_mxfp8 and not use_a16_qkv
             self.projections[key] = QuantizedProjection(values, weights[key], out,
                 session=session, name=f"{name}.{key}", workspace=workspace, activation_mode="auto",
-                mxfp8_min_amax=(1e-4 if packed_mxfp8 and (key != "q_b" or self.norm_quant is None)
+                mxfp8_min_amax=(1e-4 if use_quantized_seam and (key != "q_b" or self.norm_quant is None)
                                 else None),
                 encoded=self.norm_quant.encoded if key == "q_b" and self.norm_quant is not None else None,
-                rhs_prefetch_ready=packed_mxfp8,
+                rhs_prefetch_ready=use_quantized_seam,
                 allow_bf16_atomic_reduction=not packed_mxfp8,
                 examples=examples, example_role="attention." + key)
-        self.query_norm = (PreparedRMSNorm(scratch.projected[:, :1280], weights["q_norm"], scratch.query_low,
-            eps=self.eps, session=session, name=name + ".q_norm") if self.norm_quant is None else None)
-        self.window_norm = (PreparedRMSNorm(scratch.projected[:, 1280:], weights["kv_norm"], scratch.window_values,
-            eps=self.eps, session=session, name=name + ".kv_norm") if self.norm_quant is None else None)
-        self.output_projection = PreparedGroupedOutputProjection(scratch.attended.view(tokens, -1, 4096),
-            weights["output"], scratch.output, session=session, name=name + ".output", workspace=workspace)
-        self.window_writer = PreparedCompressedCacheWriter(scratch.window_values, self.window_cache,
-            self.window_slots, page_size=self.window_page_size, kind="swa", session=session,
+        self.fused_qkv_norm_rope = (self.norm_quant is None and self.angles is not None and self.angles.split)
+        if self.fused_qkv_norm_rope:
+            self.q_norm_weight = weights["q_norm"]
+            self.kv_norm_weight = weights["kv_norm"]
+            record_numeric_tensor(self.q_norm_weight)
+            record_numeric_tensor(self.kv_norm_weight)
+            self.query_norm = self.window_norm = None
+        else:
+            self.q_norm_weight = self.kv_norm_weight = None
+            self.query_norm = (PreparedRMSNorm(scratch.projected[:prefix_tokens, :1280], weights["q_norm"],
+                scratch.query_low[:prefix_tokens], eps=self.eps, session=session, name=name + ".q_norm")
+                if self.norm_quant is None else None)
+            self.window_norm = (PreparedRMSNorm(scratch.projected[:prefix_tokens, 1280:], weights["kv_norm"],
+                scratch.window_values[:prefix_tokens], eps=self.eps, session=session, name=name + ".kv_norm")
+                if self.norm_quant is None else None)
+        self.output_projection = PreparedGroupedOutputProjection(
+            scratch.attended[:mla_tokens], weights["output"], scratch.output[:mla_tokens],
+            session=session, name=name + ".output", workspace=workspace,
+            inv_rope=self.angles is not None,
+            heads_per_group=scratch.attended.shape[1] // getattr(weights["output"], "groups", 1),
+            nope_dim=448, rope_dim=64, positions=self.token_offsets[:mla_tokens],
+            cos_sin_cache=None if self.angles is None else self.angles.values[:mla_tokens])
+        self.window_writer = PreparedCompressedCacheWriter(scratch.window_values[:prefix_tokens], self.window_cache,
+            self.window_slots[:prefix_tokens], page_size=self.window_page_size, kind="swa", session=session,
             name=f"{name}.window_write",
             history=self.window if mode in ("verify", "draft") else None,
             history_rows=metadata.state_rows if mode in ("verify", "draft") else None,
@@ -393,11 +546,12 @@ class PreparedAttention:
                     mode="prefill" if mode == "prefill" else "decode", **candidates)
                 self.selectors.append(selector)
         indexed = {} if not self.ratio else dict(indexed=pool.pages[f"layer{self.source.layer}.latent_page"],
-            indexed_indices=scratch.selected, indexed_lengths=self.index_lengths,
-            page_table=self.page_table,
+            indexed_indices=scratch.selected[:mla_tokens], indexed_lengths=self.index_lengths[:mla_tokens],
+            page_table=self.page_table[:mla_tokens],
             indexed_page_size=128 // self.ratio)
-        self.attention = PreparedCompressedMLA(scratch.query, self.window_cache, self.window_indices,
-            self.window_lengths, weights["sink"], scratch.attended,
+        self.attention = PreparedCompressedMLA(scratch.query[:mla_tokens], self.window_cache,
+            self.window_indices[:mla_tokens], self.window_lengths[:mla_tokens], weights["sink"],
+            scratch.attended[:mla_tokens],
             window_page_size=self.window_page_size,
             # Speculative rows use explicit indices into staged caches. Their
             # prepared row bound belongs to the decode contract, including
@@ -407,8 +561,15 @@ class PreparedAttention:
             session=session, name=f"{name}.attention",
             workspace=workspace, compute_mode=mla_compute_mode, **indexed)
         self.concurrent_query = None
+        overlap_indexer = False
         if (mode in ("decode", "verify", "draft") and not (mode == "decode" and tokens == 1)
-                and isinstance(workspace, ScratchArena) and workspace.overlap):
+                and isinstance(workspace, ScratchArena) and workspace.overlap
+                and self.angles is not None and self.angles.split
+                and not (self.projections["q_b"].encoded is not None
+                         and self.projections["q_b"].quantizer_plan is not None)):
+            overlap_indexer = (self.global_kv is not None and bool(self.selectors)
+                               and self.index_angles is not None and self.index_angles.split
+                               and self.index_query.encoded is None)
             parallel_plans = [self.window_writer.plan]
             if self.window_norm is not None:
                 parallel_plans.append(self.window_norm.plan)
@@ -416,17 +577,26 @@ class PreparedAttention:
                 global_kv = self.global_kv
                 compressor = global_kv.compressor
                 parallel_plans.extend((compressor.project_values.plan, compressor.plan,
-                    global_kv.index_key.plan, global_kv.index_norm.plan, global_kv.writer.plan))
+                    global_kv.index_key.plan, global_kv.writer.plan))
+                if global_kv.index_norm is not None:
+                    parallel_plans.append(global_kv.index_norm.plan)
                 if hasattr(compressor, "project_gates"):
                     parallel_plans.append(compressor.project_gates.plan)
-            if self.selectors:
+            if self.selectors and not overlap_indexer:
                 parallel_plans.extend((self.index_query.plan, self.index_weight.plan))
                 parallel_plans.extend(selector.plan for selector in self.selectors)
-            self.concurrent_query = ConcurrentProjectionChain((self.projections["q_b"],),
-                parallel_plans=parallel_plans, session=session, workspace=workspace)
+            self.concurrent_query = ConcurrentAttentionAux(
+                self.projections["q_b"], parallel_plans=parallel_plans, session=session,
+                workspace=workspace,
+                index_query=self.index_query if overlap_indexer else None,
+                index_weight=self.index_weight if overlap_indexer else None,
+                selectors=self.selectors if overlap_indexer else (),
+                selector_rows=INDEXER_QUERY_ROWS)
 
-        self.query_shape = tuple(scratch.query.shape)
+        self.query_shape = (prefix_tokens, scratch.query.shape[1], scratch.query.shape[2])
         self.candidate_source = config.text["candidate_source_layer_id"]
+        self.q_b_fused_rope = False
+        self.index_query_fused_rope = False
         self.projections["qkv_a"].functional(session=session)
         if self.concurrent_query is None:
             self.projections["q_b"].functional(session=session)
@@ -434,71 +604,144 @@ class PreparedAttention:
             self.concurrent_query.functional(session=session)
         if self.norm_quant is not None:
             self.norm_quant.functional(session=session)
-        else:
-            self.query_norm.functional()
-            self.window_norm.functional()
+        elif not self.fused_qkv_norm_rope:
+            self.query_norm = self.query_norm.functional()
+            self.window_norm = self.window_norm.functional()
         self.output_projection.functional(session=session)
         self.window_writer.functional(session=session, cache=None)
         self.attention.functional(session=session, window=None)
-        if self.selectors:
+        if self.selectors and not overlap_indexer:
             self.index_query.functional(session=session)
             self.index_weight.functional(session=session)
             for selector in self.selectors:
                 selector.functional(session=session)
         if self.owns_window_metadata:
             self.window_metadata.functional()
+        register_finalizer(session, self._finalize_standalone_rope)
         register_finalizer(session, self.release_examples)
+
+    def _finalize_standalone_rope(self):
+        if (self.concurrent_query is None and self.angles is not None and self.angles.split
+                and self.projections["q_b"].encoded is None
+                and self.projections["q_b"].encoded_layout is None):
+            self.q_b_fused_rope = register_tc_gemv_rope(
+                self.projections["q_b"].plan, head_dim=512, rope_dim=64)
+        if (self.selectors and (self.concurrent_query is None or not self.concurrent_query.has_indexer)
+                and self.index_angles is not None and self.index_angles.split
+                and self.index_query.encoded is None and self.index_query.encoded_layout is None):
+            self.index_query_fused_rope = register_tc_gemv_rope(
+                self.index_query.plan, head_dim=128, rope_dim=64)
+
+    def plans(self):
+        result = []
+        for proj in self.projections.values():
+            result.append(proj.plan)
+            if getattr(proj, "quantizer_plan", None) is not None:
+                result.append(proj.quantizer_plan)
+        if self.norm_quant is not None:
+            result.append(self.norm_quant.plan)
+        else:
+            if self.query_norm is not None:
+                result.append(self.query_norm.plan)
+            if self.window_norm is not None:
+                result.append(self.window_norm.plan)
+        result.append(self.window_writer.plan)
+        if self.global_kv is not None:
+            global_kv = self.global_kv
+            compressor = global_kv.compressor
+            result.extend((compressor.project_values.plan, compressor.plan,
+                global_kv.index_key.plan, global_kv.writer.plan))
+            if global_kv.index_norm is not None:
+                result.append(global_kv.index_norm.plan)
+            if hasattr(compressor, "project_gates"):
+                result.append(compressor.project_gates.plan)
+        if self.selectors:
+            result.extend((self.index_query.plan, self.index_weight.plan))
+            if getattr(self.index_query, "quantizer_plan", None) is not None:
+                result.append(self.index_query.quantizer_plan)
+            result.extend(selector.plan for selector in self.selectors)
+        result.extend((self.attention.plan, self.output_projection.plan))
+        return tuple(plan for plan in result if plan is not None)
 
     def release_examples(self):
         self.scratch = self.metadata = self.replay_start = self.window_cache = None
-        self.window_slots = self.window_indices = self.window_lengths = self.token_offsets = None
+        self.window_slots = self.window_indices = self.window_lengths = None
         self.lengths = self.active_width = self.index_lengths = self.page_table = None
 
-    def __call__(self, source, metadata, selection, *, indices=None, replay_start=None, window_cache=None):
-        output, record, selection, _ = self._run(source, metadata, selection, indices=indices,
-                                               replay_start=replay_start, window_cache=window_cache)
-        return output, record, selection
-
-    def _run(self, source, metadata, selection, *, indices=None, replay_start=None, window_cache=None):
-        m = metadata
-        indices = (self.window_metadata(m, replay_start=replay_start)
-                   if self.owns_window_metadata else indices)
-        position = indices.position
-        if window_cache is None:
-            window_cache = self.window if self.mode == "decode" else torch.zeros(
-                (m.starts.numel(), self.window_page_size * 528), dtype=torch.uint8, device=source.device)
+    def init_window_cache(self, metadata, device):
+        window_cache = torch.empty(
+            (metadata.starts.numel(), self.window_page_size * 528), dtype=torch.uint8, device=device)
         if self.mode == "prefill":
-            gather_rows(self.window, m.state_rows, window_cache[:, :128 * 528])
+            gather_rows(self.window, metadata.state_rows, window_cache[:, :128 * 528])
+        return window_cache
+
+    def run_half(self, source_half, metadata, selection, *, indices, window_cache, half_idx):
+        """Run one half-chunk [h, 5120] through QKV, SWA cache write, MLA, and Wo."""
+        m = metadata
+        h = self.half_tokens
+        sl = slice(0, h) if half_idx == 0 else slice(h, 2 * h)
         qkv = self.projections["qkv_a"]
         qkv_encoded_bases = (None if qkv.encoded_layout is None else tuple(
-            torch.zeros(shape, dtype=dtype, device=source.device) for shape, dtype in qkv.encoded_layout))
-        projected = qkv(source, encoded_bases=qkv_encoded_bases)
+            torch.empty(shape, dtype=dtype, device=source_half.device) for shape, dtype in qkv.encoded_layout))
+        projected = qkv(source_half, encoded_bases=qkv_encoded_bases)
         encoded_bases = None
-        if self.norm_quant is None:
+        layer_angles = indices.angles[(bool(self.ratio), 0)][sl]
+        if self.fused_qkv_norm_rope:
+            query_low, window_values = _q_kv_norm_rope(
+                projected, self.q_norm_weight, self.kv_norm_weight, layer_angles, self.eps)
+        elif self.norm_quant is None:
             query_low = self.query_norm(projected[:, :1280])
+            window_values = self.window_norm(projected[:, 1280:])
+            self.angles.apply(window_values, layer_angles)
         else:
             query_low, window_values, encoded_bases = self.norm_quant(projected)
-        pending = None
-        if self.concurrent_query is not None:
-            pending = self.concurrent_query.start(query_low, encoded_bases=encoded_bases)
-        if self.window_norm is not None:
+            self.angles.apply(window_values, layer_angles)
+        query = self.projections["q_b"](query_low, encoded_bases=encoded_bases).view(self.query_shape)
+        self.angles.apply(query, layer_angles)
+        self.window_writer(window_values, indices.window_slots[sl], cache=window_cache)
+        selected, _, _ = selection
+        geometry = indices.compressed(self.ratio) if self.ratio else None
+        attended = self.attention(query, indices.window_indices[sl], indices.window_lengths[sl],
+            indexed_indices=selected[sl] if self.ratio else None,
+            indexed_lengths=geometry.index_lengths[sl] if self.ratio else None,
+            page_table=m.token_page_table[sl] if self.ratio else None, window=window_cache)
+        return self.output_projection(attended, positions=self.token_offsets[:h], cos_sin_cache=layer_angles)
+
+    def run_prefix(self, source, metadata, selection, *, indices, window_cache=None):
+        """Run full-chunk QKV, window write, global KV compression, and indexer before half-MLA."""
+        m = metadata
+        if window_cache is None:
+            window_cache = self.init_window_cache(m, source.device)
+        qkv = self.projections["qkv_a"]
+        qkv_encoded_bases = (None if qkv.encoded_layout is None else tuple(
+            torch.empty(shape, dtype=dtype, device=source.device) for shape, dtype in qkv.encoded_layout))
+        projected = qkv(source, encoded_bases=qkv_encoded_bases)
+        encoded_bases = None
+        layer_angles = indices.angles[(bool(self.ratio), 0)]
+        if self.fused_qkv_norm_rope:
+            query_low, window_values = _q_kv_norm_rope(
+                projected, self.q_norm_weight, self.kv_norm_weight, layer_angles, self.eps)
+        elif self.norm_quant is None:
+            query_low = self.query_norm(projected[:, :1280])
             window_values = self.window_norm(projected[:, 1280:])
-        if self.concurrent_query is None:
-            query = self.projections["q_b"](query_low, encoded_bases=encoded_bases).view(self.query_shape)
-            self.rotary.apply(query, position, compressed=bool(self.ratio))
-        self.rotary.apply(window_values, position, compressed=bool(self.ratio))
-        self.window_writer(window_values, indices.window_slots,
-                           history_rows=m.state_rows if self.mode in ("verify", "draft") else None, cache=window_cache)
-        dependency = window_cache
+            self.angles.apply(window_values, layer_angles)
+        else:
+            query_low, window_values, encoded_bases = self.norm_quant(projected)
+            self.angles.apply(window_values, layer_angles)
+        query = self.projections["q_b"](query_low, encoded_bases=encoded_bases).view(self.query_shape)
+        self.angles.apply(query, layer_angles)
+        self.window_writer(window_values, indices.window_slots, cache=window_cache)
         selected, candidates, candidate_counts = selection
         records = None
+        geometry = None
         if self.ratio:
             geometry = indices.compressed(self.ratio)
             if self.global_kv is not None:
-                records = self.global_kv(source, self.selectors[0], m, geometry)
+                records = self.global_kv(source, self.selectors[0], m, geometry,
+                    angles=indices.angles[(True, self.ratio)])
             if self.selectors:
                 index_query = self.index_query(query_low).view(source.shape[0], 32, 128)
-                self.rotary.apply(index_query, position, compressed=True)
+                self.index_angles.apply(index_query, indices.angles[(True, 0)])
                 index_weights = self.index_weight(source)
                 index_weights.mul_(128 ** -.5 * 32 ** -.5)
                 outputs, candidate_outputs, count_outputs = [], [], []
@@ -518,16 +761,122 @@ class PreparedAttention:
                 if self.layer == self.candidate_source:
                     candidates = torch.cat(candidate_outputs, dim=0)
                     candidate_counts = torch.cat(count_outputs, dim=0)
-                dependency = selected
+        return (query, window_cache, (selected, candidates, candidate_counts), geometry, layer_angles, records)
+
+    def run_mla_wo_half(self, prefix_state, metadata, *, indices, half_idx):
+        """Run one half-chunk [h] through MLA and Wo after run_prefix."""
+        query, window_cache, selection, geometry, layer_angles, _ = prefix_state
+        selected, _, _ = selection
+        h = self.half_tokens
+        sl = slice(0, h) if half_idx == 0 else slice(h, 2 * h)
+        attended = self.attention(query[sl], indices.window_indices[sl], indices.window_lengths[sl],
+            indexed_indices=selected[sl] if self.ratio else None,
+            indexed_lengths=geometry.index_lengths[sl] if self.ratio else None,
+            page_table=metadata.token_page_table[sl] if self.ratio else None, window=window_cache)
+        return self.output_projection(attended, positions=self.token_offsets[:h], cos_sin_cache=layer_angles[sl])
+
+    def __call__(self, source, metadata, selection, *, indices=None, replay_start=None, window_cache=None):
+        output, record, selection, _ = self._run(source, metadata, selection, indices=indices,
+                                               replay_start=replay_start, window_cache=window_cache)
+        return output, record, selection
+
+    def _run(self, source, metadata, selection, *, indices=None, replay_start=None, window_cache=None):
+        m = metadata
+        indices = (self.window_metadata(m, replay_start=replay_start)
+                   if self.owns_window_metadata else indices)
+        position = indices.position
+        if window_cache is None:
+            window_cache = self.window if self.mode == "decode" else torch.empty(
+                (m.starts.numel(), self.window_page_size * 528), dtype=torch.uint8, device=source.device)
+        if self.mode == "prefill":
+            gather_rows(self.window, m.state_rows, window_cache[:, :128 * 528])
+        qkv = self.projections["qkv_a"]
+        qkv_encoded_bases = (None if qkv.encoded_layout is None else tuple(
+            torch.empty(shape, dtype=dtype, device=source.device) for shape, dtype in qkv.encoded_layout))
+        projected = qkv(source, encoded_bases=qkv_encoded_bases)
+        encoded_bases = None
+        layer_angles = indices.angles[(bool(self.ratio), 0)]
+        if self.fused_qkv_norm_rope:
+            query_low, window_values = _q_kv_norm_rope(
+                projected, self.q_norm_weight, self.kv_norm_weight, layer_angles, self.eps)
+        elif self.norm_quant is None:
+            query_low = self.query_norm(projected[:, :1280])
+        else:
+            query_low, window_values, encoded_bases = self.norm_quant(projected)
+        pending = None
         if self.concurrent_query is not None:
+            pending = self.concurrent_query.start(
+                query_low, source, layer_angles,
+                index_angles=indices.angles[(True, 0)] if self.concurrent_query.has_indexer else None,
+                encoded_bases=encoded_bases)
+        if not self.fused_qkv_norm_rope:
+            if self.window_norm is not None:
+                window_values = self.window_norm(projected[:, 1280:])
+            self.angles.apply(window_values, layer_angles)
+        if self.concurrent_query is None:
+            if self.q_b_fused_rope:
+                query = run_mxfp8_projection_rope(
+                    self.projections["q_b"], query_low, layer_angles, head_dim=512).view(self.query_shape)
+            else:
+                query = self.projections["q_b"](query_low, encoded_bases=encoded_bases).view(self.query_shape)
+                self.angles.apply(query, layer_angles)
+        self.window_writer(window_values, indices.window_slots,
+                           history_rows=m.state_rows if self.mode in ("verify", "draft") else None, cache=window_cache)
+        dependency = window_cache
+        selected, candidates, candidate_counts = selection
+        records = None
+        joined_query = False
+        if self.ratio:
+            geometry = indices.compressed(self.ratio)
+            global_dep = None
+            if self.global_kv is not None:
+                records = self.global_kv(source, self.selectors[0], m, geometry,
+                    angles=indices.angles[(True, self.ratio)])
+                global_dep = self.selectors[0].cache
+            if self.selectors:
+                quantized_list = None
+                if self.concurrent_query is not None and self.concurrent_query.has_indexer:
+                    q_flat, iq_flat, index_weights, quantized_list = self.concurrent_query.finish(
+                        pending, window_cache, global_dependency=global_dep)
+                    query = q_flat.view(self.query_shape)
+                    index_query = iq_flat.view(source.shape[0], 32, 128)
+                    joined_query = True
+                else:
+                    if self.index_query_fused_rope:
+                        index_query = run_mxfp8_projection_rope(
+                            self.index_query, query_low, indices.angles[(True, 0)], head_dim=128
+                        ).view(source.shape[0], 32, 128)
+                    else:
+                        index_query = self.index_query(query_low).view(source.shape[0], 32, 128)
+                        self.index_angles.apply(index_query, indices.angles[(True, 0)])
+                    index_weights = self.index_weight(source)
+                    index_weights.mul_(128 ** -.5 * 32 ** -.5)
+                outputs, candidate_outputs, count_outputs = [], [], []
+                for ordinal, selector in enumerate(self.selectors):
+                    first = ordinal * INDEXER_QUERY_ROWS
+                    last = min(source.shape[0], first + INDEXER_QUERY_ROWS)
+                    result = selector(index_query[first:last], index_weights[first:last],
+                        m.token_page_table[first:last], geometry.lengths[first:last], geometry.active_width,
+                        candidates=None if self.layer <= self.candidate_source else candidates[first:last],
+                        counts=None if self.layer <= self.candidate_source else candidate_counts[first:last],
+                        quantized=None if quantized_list is None else quantized_list[ordinal])
+                    if self.layer == self.candidate_source:
+                        result, next_candidates, next_counts = result
+                        candidate_outputs.append(next_candidates)
+                        count_outputs.append(next_counts)
+                    outputs.append(result)
+                selected = torch.cat(outputs, dim=0)
+                if self.layer == self.candidate_source:
+                    candidates = torch.cat(candidate_outputs, dim=0)
+                    candidate_counts = torch.cat(count_outputs, dim=0)
+                dependency = selected
+        if self.concurrent_query is not None and not joined_query:
             query = self.concurrent_query.finish(pending, dependency).view(self.query_shape)
-            self.rotary.apply(query, position, compressed=bool(self.ratio))
         attended = self.attention(query, indices.window_indices, indices.window_lengths,
             indexed_indices=selected if self.ratio else None,
             indexed_lengths=geometry.index_lengths if self.ratio else None,
             page_table=m.token_page_table if self.ratio else None, window=window_cache)
-        self.rotary.apply(attended, position, compressed=bool(self.ratio), inverse=True)
-        output = self.output_projection(attended.view(source.shape[0], -1, 4096))
+        output = self.output_projection(attended, positions=self.token_offsets, cos_sin_cache=layer_angles)
         record = window_cache, records
         if self.mode == "prefill":
             self.commit(m.lengths, record, m)

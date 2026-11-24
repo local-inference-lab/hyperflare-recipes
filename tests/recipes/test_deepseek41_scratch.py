@@ -60,12 +60,19 @@ def test_suffix_declarations_preserve_full_prefill_sources():
 
 
 @pytest.mark.parametrize("capacity,dspark,draft_width,expected", [
-    (32, True, 6, 160), (32, False, 1, 32), (1, True, 6, 6),
+    (32, True, 6, 256), (32, False, 1, 256), (1, True, 6, 256),
 ])
 def test_oneshot_capacity_excludes_prefills_assigned_to_dma(capacity, dspark, draft_width, expected):
     config = PreparationConfig(max_active=capacity, dspark=dspark,
         speculative_widths=tuple(range(1, draft_width + 1)), speculative_token_capacity=64)
     assert config.all_reduce_tokens == expected
+
+
+def test_oneshot_capacity_tracks_draft_requirement_below_dma_cutoff():
+    config = PreparationConfig(max_active=32, dspark=True,
+        speculative_widths=tuple(range(1, 7)), speculative_token_capacity=64,
+        prefill_chunk_size=64)
+    assert config.all_reduce_tokens == 160
 
 
 def test_short_prefill_still_fits_the_oneshot_channel():

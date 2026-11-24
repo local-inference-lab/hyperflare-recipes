@@ -73,7 +73,7 @@ class PreparedMLANormQuant:
 
     def __call__(self, projected):
         if self.query is None:
-            query, kv, *bases = (torch.zeros(shape, dtype=dtype, device=projected.device)
+            query, kv, *bases = (torch.empty(shape, dtype=dtype, device=projected.device)
                                  for shape, dtype in self.layouts)
             mla_norm_mxfp8.run(projected, *self.weights, query, kv, *bases, plan=self.plan)
             return query, kv, tuple(bases)

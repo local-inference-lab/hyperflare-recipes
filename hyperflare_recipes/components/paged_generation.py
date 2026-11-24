@@ -24,8 +24,10 @@ class PreparedGeneration:
         name,
         workspace,
         context_factory=None,
+        sample=True,
     ):
         self.decoder, self.batch = decoder, batch
+        self.sample = bool(sample)
         self.validation = PreparedAllReduce(
             batch.validation_input,
             batch.validation_sum,
@@ -46,12 +48,13 @@ class PreparedGeneration:
         )
         self.completion = PreparedSampling(decoder.scratch.logits, *args, sample_enabled=b.sample_enabled[:rows])
         self.completion.prepare()
-        self.completion.prepare_broadcast(runtime=decoder.head.gather.runtime, session=session,
-            coordinator=coordinator, name=name + ".sampling")
+        if self.sample:
+            self.completion.prepare_broadcast(runtime=decoder.head.gather.runtime, session=session,
+                coordinator=coordinator, name=name + ".sampling")
         self.completion.functional(session=session)
-        self.compilation_variant = "sample"
+        self.compilation_variant = "sample" if self.sample else "record"
         self.context = None
-        if decoder.weights.draft is not None:
+        if self.sample and decoder.weights.draft is not None:
             if context_factory is None:
                 raise ValueError("speculative generation requires a draft context factory")
             self.context = context_factory(
@@ -80,17 +83,24 @@ class PreparedGeneration:
         validation, present = self.batch.validate()
         metadata = self.batch.begin(self.validation(validation), present=present)
         hidden, logits, auxiliary, _ = self.decoder(metadata)
-        save_hidden(
-            hidden,
-            self.decoder.pool.last_hidden,
-            metadata.state_rows,
-            metadata.lengths > 0,
-        )
-        self.batch.finish(metadata)
-        self.completion.run(logits)
-        if self.context is not None:
-            self.context(auxiliary, metadata.lengths, metadata)
+        if self.sample:
+            save_hidden(
+                hidden,
+                self.decoder.pool.last_hidden,
+                metadata.state_rows,
+                metadata.lengths > 0,
+            )
+            self.batch.finish(metadata)
+            self.completion.run(logits)
+            if self.context is not None:
+                self.context(auxiliary, metadata.lengths, metadata)
+        else:
+            self.batch.finish(metadata)
+            self.completion.record_completion()
         if observe:
-            return {"target.hidden": hidden, "target.logits": logits,
-                    **{"target." + name: getattr(metadata, name) for name in
-                       ("live_counts", "starts", "lengths", "query_start_loc", "token_ids", "positions")}}
+            observed = {"target." + name: getattr(metadata, name) for name in
+                        ("live_counts", "starts", "lengths", "query_start_loc", "token_ids", "positions")}
+            if self.sample:
+                observed["target.hidden"] = hidden
+                observed["target.logits"] = logits
+            return observed

@@ -263,7 +263,7 @@ class ConcurrentSharedExpert:
             outputs = [torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
                        for shape, stride, dtype in self.output_layouts]
             workspace = torch.empty(self.workspace_nbytes, dtype=torch.uint8, device=source.device)
-            encoded = [torch.zeros(shape, dtype=dtype, device=source.device) for shape, dtype in self.encoded_layouts]
+            encoded = [torch.empty(shape, dtype=dtype, device=source.device) for shape, dtype in self.encoded_layouts]
             pending = PendingSharedExpert(source, outputs, workspace, encoded)
             _start_shared_expert(source, self.weights, self.scales, self.gains, self.scale_kinds,
                 outputs, workspace, self.plans, self.activation, self.limit, self.round_silu,

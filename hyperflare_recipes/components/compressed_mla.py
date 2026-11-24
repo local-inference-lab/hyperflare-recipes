@@ -157,7 +157,7 @@ class PreparedCompressedMLA:
         if self.inputs is not None:
             return self._bound_call()
         shape, stride, dtype = self.output_layout
-        output = torch.empty_strided(shape, stride, dtype=dtype, device=query.device).zero_()
+        output = torch.empty_strided(shape, stride, dtype=dtype, device=query.device)
         scratch, = (torch.empty(shape, dtype=dtype, device=query.device) for shape, dtype in self.scratch_layout)
         _attend(query, self.window if window is None else window, indices, lengths, self.indexed, indexed_indices, indexed_lengths,
                 page_table, self.sink, output, scratch, self.scale, self.plan.handle)

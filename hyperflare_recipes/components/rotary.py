@@ -12,24 +12,34 @@ import triton.language as tl
 
 
 @triton.jit
-def _angles(Positions, Frequencies, Angles):
+def _angles(Positions, Frequencies, Angles, SPLIT: tl.constexpr = False):
     row = tl.program_id(0)
     pair = tl.arange(0, 32)
     position = tl.maximum(tl.load(Positions + row), 0).to(tl.float32)
     angle = position * tl.load(Frequencies + pair)
-    tl.store(Angles + row * 64 + 2 * pair, tl.cos(angle))
-    tl.store(Angles + row * 64 + 2 * pair + 1, tl.sin(angle))
+    cos = tl.cos(angle)
+    sin = tl.sin(angle)
+    if SPLIT:
+        tl.store(Angles + row * 64 + pair, cos)
+        tl.store(Angles + row * 64 + 32 + pair, sin)
+    else:
+        tl.store(Angles + row * 64 + 2 * pair, cos)
+        tl.store(Angles + row * 64 + 2 * pair + 1, sin)
 
 
 @triton.jit
 def _rotate(Values, Positions, Frequencies, ROW_STRIDE, HEAD_STRIDE, OFFSET, SIGN: tl.constexpr,
-            Angles=None, SHARED_ANGLES: tl.constexpr=False):
+            Angles=None, SHARED_ANGLES: tl.constexpr=False, SPLIT_ANGLES: tl.constexpr=False):
     """Rotate one row's head in place: its last 64 values hold 32 interleaved pairs."""
     row, head = tl.program_id(0), tl.program_id(1)
     pair = tl.arange(0, 32)
     if SHARED_ANGLES:
-        cos = tl.load(Angles + row * 64 + 2 * pair)
-        sin = tl.load(Angles + row * 64 + 2 * pair + 1) * SIGN
+        if SPLIT_ANGLES:
+            cos = tl.load(Angles + row * 64 + pair)
+            sin = tl.load(Angles + row * 64 + 32 + pair) * SIGN
+        else:
+            cos = tl.load(Angles + row * 64 + 2 * pair)
+            sin = tl.load(Angles + row * 64 + 2 * pair + 1) * SIGN
     else:
         angle = tl.load(Positions + row).to(tl.float32) * tl.load(Frequencies + pair)
         cos, sin = tl.cos(angle), tl.sin(angle) * SIGN
@@ -40,13 +50,39 @@ def _rotate(Values, Positions, Frequencies, ROW_STRIDE, HEAD_STRIDE, OFFSET, SIG
     tl.store(base + 1, (a * sin + b * cos).to(Values.dtype.element_ty))
 
 
+@triton.jit
+def _rotate_grouped(Values, Angles, ROW_STRIDE, HEAD_STRIDE, OFFSET, HEADS,
+                    SIGN: tl.constexpr, SPLIT_ANGLES: tl.constexpr, HEADS_PER_CTA: tl.constexpr):
+    """Rotate HEADS_PER_CTA heads per CTA, reusing shared FP32 (cos, sin) in registers."""
+    row, h_block = tl.program_id(0), tl.program_id(1)
+    pair = tl.arange(0, 32)
+    if SPLIT_ANGLES:
+        cos = tl.load(Angles + row * 64 + pair)
+        sin = tl.load(Angles + row * 64 + 32 + pair) * SIGN
+    else:
+        cos = tl.load(Angles + row * 64 + 2 * pair)
+        sin = tl.load(Angles + row * 64 + 2 * pair + 1) * SIGN
+    row_base = Values + row * ROW_STRIDE + OFFSET + 2 * pair
+    h0 = h_block * HEADS_PER_CTA
+    for hi in tl.static_range(HEADS_PER_CTA):
+        h = h0 + hi
+        if h < HEADS:
+            base = row_base + h * HEAD_STRIDE
+            a = tl.load(base).to(tl.float32)
+            b = tl.load(base + 1).to(tl.float32)
+            tl.store(base, (a * cos - b * sin).to(Values.dtype.element_ty))
+            tl.store(base + 1, (a * sin + b * cos).to(Values.dtype.element_ty))
+
+
 class PreparedRotaryAngles:
     """Compute FP32 sine/cosine pairs once for consumers sharing token positions and frequencies."""
 
-    def __init__(self, positions, frequencies, *, buffers=None):
+    def __init__(self, positions, frequencies, *, buffers=None, split=False):
         self.positions, self.frequencies = positions, frequencies
-        self.values = (torch.zeros((positions.numel(), 32, 2), dtype=torch.float32, device=positions.device)
-                       if buffers is None else buffers.zeros((positions.numel(), 32, 2), torch.float32))
+        self.split = bool(split)
+        shape = (positions.numel(), 64) if self.split else (positions.numel(), 32, 2)
+        self.values = (torch.zeros(shape, dtype=torch.float32, device=positions.device)
+                       if buffers is None else buffers.zeros(shape, torch.float32))
 
     def functional(self):
         self.rows = self.positions.numel()
@@ -57,9 +93,10 @@ class PreparedRotaryAngles:
         positions = self.positions if positions is None else positions
         values = self.values
         if values is None:
-            values = torch.empty((self.rows, 32, 2), dtype=torch.float32, device=positions.device)
+            shape = (self.rows, 64) if self.split else (self.rows, 32, 2)
+            values = torch.empty(shape, dtype=torch.float32, device=positions.device)
         torch.library.wrap_triton(_angles)[(positions.numel(),)](
-            positions, self.frequencies, values)
+            positions, self.frequencies, values, self.split)
         return values
 
     def apply(self, tensor, values=None, *, inverse=False):
@@ -68,10 +105,16 @@ class PreparedRotaryAngles:
                 or tensor.stride(-1) != 1 or tensor.shape[-1] < 64):
             raise ValueError("shared rotary angles require matching rows and unit-column-stride heads")
         heads = tensor.shape[1] if tensor.ndim == 3 else 1
-        torch.library.wrap_triton(_rotate)[(tensor.shape[0], heads)](
-            tensor, values, self.frequencies, tensor.stride(0),
-            tensor.stride(1) if tensor.ndim == 3 else 0, tensor.shape[-1] - 64,
-            -1 if inverse else 1, values, True)
+        if heads >= 4:
+            per_cta = 8 if heads % 8 == 0 else 4
+            torch.library.wrap_triton(_rotate_grouped)[(tensor.shape[0], triton.cdiv(heads, per_cta))](
+                tensor, values, tensor.stride(0), tensor.stride(1), tensor.shape[-1] - 64, heads,
+                -1 if inverse else 1, self.split, per_cta, num_warps=1)
+        else:
+            torch.library.wrap_triton(_rotate)[(tensor.shape[0], heads)](
+                tensor, values, self.frequencies, tensor.stride(0),
+                tensor.stride(1) if tensor.ndim == 3 else 0, tensor.shape[-1] - 64,
+                -1 if inverse else 1, values, True, self.split)
 
 
 @torch.library.custom_op("flare::cached_rotary", mutates_args=("q_out", "k_out"))

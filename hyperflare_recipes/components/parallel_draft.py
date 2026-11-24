@@ -43,6 +43,7 @@ class DraftProposalState:
     features: dict[str, torch.Tensor] | None = None
     # Each row's rotary offset from its token index, for a pool that declares the region.
     rotary_offsets: torch.Tensor | None = None
+    tile_masses: torch.Tensor | None = None
 
 
 class PreparedParallelDraftRound:
@@ -161,9 +162,13 @@ class PreparedParallelDraftRound:
 
         local_vocab = o.scratch.local_logits.shape[-1] if self.vocabulary_parallel else o.requests.vocab_size
         self.probability_shape = (b, w - 1, local_vocab)
+        self.draft_mass_shape = (b, w - 1, (local_vocab + 255) // 256)
+        self.target_mass_shape = (b, w, (local_vocab + 255) // 256)
         self.logits = (torch.zeros((b, 1, local_vocab), dtype=torch.float32, device=device)
                        if generate_proposals and not self.vocabulary_parallel else None)
         self.probabilities = torch.zeros(self.probability_shape, dtype=torch.float32, device=device)
+        self.draft_tile_masses = (torch.zeros(self.draft_mass_shape, dtype=torch.float32, device=device)
+                                  if self.vocabulary_parallel else None)
         self.valid = torch.zeros((b, w - 1), dtype=torch.bool, device=device)
         self.seed, self.offset, self.base_offset, self.sampled = (
             torch.zeros_like(self.before) for _ in range(4)
@@ -335,7 +340,8 @@ class PreparedParallelDraftRound:
         self.metadata = self.draft_metadata = None
         self.rows = self.draft_positions = None
         for name in ("draft_inputs", "markov_token", "before", "active", "candidates", "drafts",
-                     "valid", "seed", "offset", "base_offset", "sampled", "logits", "probabilities"):
+                     "valid", "seed", "offset", "base_offset", "sampled", "logits", "probabilities",
+                     "draft_tile_masses"):
             setattr(self, name, None)
 
     def _prepare_vocabulary_parallel(self):
@@ -355,7 +361,8 @@ class PreparedParallelDraftRound:
             self.full_proposal = PreparedVocabularySoftmax(base, self.probabilities, self.valid, *args,
                 self.drafts, **options, name=self.name + ".proposal", workspace=None,
                 **transition,
-                pending=self.markov_token, seeds=self.seed, offsets=self.base_offset, tokens=self.drafts)
+                pending=self.markov_token, seeds=self.seed, offsets=self.base_offset, tokens=self.drafts,
+                tile_masses=self.draft_tile_masses, token_limits=o.inputs.query_lengths[:b])
             self.full_proposal.prepare()
         if self.proposal_only:
             self.operations = None, (), None, None
@@ -365,13 +372,16 @@ class PreparedParallelDraftRound:
         from ignition.preparation.scratch import bind_scratch
 
         retained = bind_scratch(dict(probabilities=(tuple(logits.shape), torch.float32),
-            valid=((b, w), torch.bool)), device=logits.device, workspace=None)
+            valid=((b, w), torch.bool),
+            tile_masses=(self.target_mass_shape, torch.float32)), device=logits.device, workspace=None)
         target = PreparedVocabularySoftmax(logits, retained["probabilities"], retained["valid"], *args,
-            self.drafts, **options, name=self.name + ".target", workspace=None)
+            self.drafts, **options, name=self.name + ".target", workspace=None,
+            tile_masses=retained["tile_masses"], token_limits=o.inputs.query_lengths[:b])
         target.prepare()
         verify = PreparedVocabularyBlockVerification(self.probabilities, self.drafts, target.probabilities, *args,
             **options, name=self.name + ".verification", rng=o.rng, draft_valid=self.valid,
-            target_valid=target.valid, token_limits=o.inputs.query_lengths[:b], workspace=None)
+            target_valid=target.valid, token_limits=o.inputs.query_lengths[:b], workspace=None,
+            draft_tile_masses=self.draft_tile_masses, target_tile_masses=retained["tile_masses"])
         verify.prepare()
         from .vocabulary_logprobs import PreparedVocabularyParallelLogprobs
 
@@ -439,6 +449,8 @@ class PreparedParallelDraftRound:
         seed = o.requests.seed.view(torch.int64)[safe] ^ DRAFT_RNG_DOMAIN
         sampled = torch.zeros(b, dtype=torch.int64, device=device)
         draft_metadata = features = None
+        draft_tile_masses = (torch.empty(self.draft_mass_shape, dtype=torch.float32, device=device)
+                             if self.vocabulary_parallel else None)
         if self.draft is not None:
             block = o.block_size
             draft_inputs = torch.full((b, block), o.weights.config.draft.noise_token, dtype=torch.int64, device=device)
@@ -472,11 +484,12 @@ class PreparedParallelDraftRound:
                         scores[:, index].copy_(logits)
                         self.full_proposal.run_step(index, scores, drafts, pending=markov_token,
                             seeds=seed, offsets=base_offset, probabilities=probabilities, valid=valid,
-                            tokens=drafts)
+                            tokens=drafts, tile_masses=draft_tile_masses, token_limits=limits)
                         markov_token = drafts[:, index].clone()
                 elif self.vocabulary_parallel:
                     self.full_proposal.run(base, drafts, pending=markov_token, seeds=seed, offsets=base_offset,
-                        probabilities=probabilities, valid=valid, tokens=drafts)
+                        probabilities=probabilities, valid=valid, tokens=drafts,
+                        tile_masses=draft_tile_masses, token_limits=limits)
                 else:
                     self.full_proposal.run(base, markov_token, drafts, probabilities, valid, seed, base_offset)
                 positions = torch.arange(w - 1, device=device)
@@ -531,7 +544,7 @@ class PreparedParallelDraftRound:
                     self.proposal_block.finish(block_state, drafts, probabilities, valid, sampled, active, limits)
         candidates[:, 1:].copy_(drafts)
         proposal = DraftProposalState(before, active, candidates, drafts, valid, base_offset, draft_metadata, features,
-            offsets)
+            offsets, draft_tile_masses)
         if advance_rng and self.draft is not None:
             self.commit_draft_rng(proposal=proposal)
         return proposal
@@ -559,9 +572,20 @@ class PreparedParallelDraftRound:
             sample_count=b * w, max_query_tokens=w, rotary_offset=proposal.rotary_offsets)
         hidden, logits, auxiliary, records = self.decoder(metadata)
         if self.vocabulary_parallel:
-            target_probabilities, target_valid, _ = target.run(logits.view(b, w, -1), proposal.drafts)
+            target_tile_masses = torch.empty(self.target_mass_shape, dtype=torch.float32, device=logits.device)
+            query_limits = o.inputs.query_lengths[:b]
+            target_probabilities, target_valid, _ = target.run(logits.view(b, w, -1), proposal.drafts,
+                tile_masses=target_tile_masses, token_limits=query_limits)
+            if proposal.tile_masses is None:
+                if w > 1:
+                    raise ValueError(
+                        "vocabulary-parallel verification requires proposal.tile_masses when width > 1"
+                    )
+                draft_masses = torch.empty(self.draft_mass_shape, dtype=torch.float32, device=logits.device)
+            else:
+                draft_masses = proposal.tile_masses
             acceptance = verify.run(probabilities, proposal.drafts, target_probabilities, proposal.valid, target_valid,
-                token_limits=o.inputs.query_lengths[:b])
+                token_limits=query_limits, draft_tile_masses=draft_masses, target_tile_masses=target_tile_masses)
         else:
             target_scratch = {name: torch.empty(shape, dtype=dtype, device=logits.device)
                               for name, (shape, dtype) in target.layout.items()}

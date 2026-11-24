@@ -82,11 +82,12 @@ class ModelWeights:
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, dspark=False, confidence=False,
              expert_scale_compression=None, draft_head_quantization=None, markov_head_quantization=None,
-             vocabulary_parallel_sampling=False):
+             vocabulary_parallel_sampling=False, engram_full_projection=None):
         config = ModelConfig.load(manifest.metadata_path)
         before = allocated_tensor_bytes(device)
         with DeepSeekWeightLoader(manifest, device, shard=shard, progress=progress, dspark=dspark,
-                                 expert_scale_compression=expert_scale_compression) as loader:
+                                 expert_scale_compression=expert_scale_compression,
+                                 engram_full_projection=engram_full_projection) as loader:
             embedding, norm = loader.load_tensors(("embed.weight", "norm.weight"))
             head = loader.load_padded_tensor("head.weight", rows=shard.padded_partition(129280, alignment=64))
             layers = tuple(loader.load_layer(i) for i in range(config.layers))
@@ -111,11 +112,15 @@ class ModelWeights:
 
 class DeepSeekWeightLoader(BlockFP8WeightLoader):
     def __init__(self, manifest, device, *, shard, progress=None, prefixes=None, dspark=False,
-                 expert_scale_compression=None):
+                 expert_scale_compression=None, engram_full_projection=None):
         if expert_scale_compression not in (None, "csf"):
             raise ValueError("DeepSeek V4.1 expert scale compression must be None or 'csf'")
         self.dspark = dspark
         self.expert_scale_compression = expert_scale_compression
+        self.engram_full_projection = (
+            shard.world_size > 1 if engram_full_projection is None
+            else bool(engram_full_projection) and shard.world_size > 1
+        )
         super().__init__(manifest, device, progress=progress, prefixes=prefixes)
         self.config = ModelConfig.load(manifest.metadata_path)
         self.shard = shard
@@ -183,4 +188,9 @@ class DeepSeekWeightLoader(BlockFP8WeightLoader):
                 ((head * 256, (head + 1) * 256) for head in range(shard.rank, 24, shard.world_size))),
                 "weight": persistent_copy(self.load_tensor(prefix + ".engram.q_weight", dtype=torch.float32, temporary=True)
                           * self.load_tensor(prefix + ".engram.k_weight", dtype=torch.float32, temporary=True))}
+            if self.engram_full_projection:
+                engram["projection_full"] = self.load_linear_columns(prefix + ".engram.wkv",
+                    ((head * 256, (head + 1) * 256)
+                     for r in range(shard.world_size)
+                     for head in range(r, 24, shard.world_size)))
         return LayerWeights(result, routed, residual, engram)

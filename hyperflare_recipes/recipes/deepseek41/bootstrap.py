@@ -84,7 +84,7 @@ def _can_race_contextual_plans(config, signatures, device):
 
     if not mla_norm_mxfp8.is_supported(device):
         raise ValueError("--joint-tuning requires fused MXFP8 query normalization on the selected device")
-    if not any(signature.kind in ("prefill", "scored_prefill", "decode", "speculative")
+    if not any(signature.kind in ("prefill", "terminal_prefill", "scored_prefill", "decode", "speculative")
                for signature in signatures.values()):
         raise ValueError("--joint-tuning requires prepared text graphs")
     return True
@@ -220,7 +220,7 @@ class PreparationConfig(BasePreparationConfig):
     @property
     def all_reduce_tokens(self):
         return max(self.decode_tokens, self.request_capacity * self.draft_tokens,
-                   *(capacity for capacity in self.prefill_capacities if capacity < 128))
+                   *(capacity for capacity in self.prefill_capacities if capacity < 512))
 
     @property
     def completion_token_capacity(self):
@@ -302,8 +302,9 @@ def _collective_runtimes(config, group, device, *, coordinator, core_storage, ve
         return runtime, runtime, runtime, runtime if layouts else None, runtime if config.dspark else None
     ipc = core_storage.peer_storage
     collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=config.all_reduce_tokens, hidden_size=5120, ipc=ipc)
+    dma_tokens = ((config.prefill_chunk_size * 6 + 4) // 5 + 63) // 64 * 64
     prefill = create_dma_all_reduce_runtime(group, device,
-        max_tokens=config.prefill_chunk_size, hidden_size=5120, ipc=ipc)
+        max_tokens=dma_tokens, hidden_size=5120, ipc=ipc)
     _, local_vocab = TensorParallelShard(0, len(config.devices)).padded_partition(129280, alignment=64)
     vocabulary = create_all_gather_runtime(group, device, max_rows=sample_rows,
         columns=local_vocab * len(config.devices) * 2, ipc=ipc)
@@ -325,13 +326,20 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
     with phase(progress, "Inspect checkpoint"):
         manifest = inspect_indexed_checkpoint(snapshot)
     metadata_path = manifest.metadata_path
+    coordinator = CollectivePreparation(group)
+    load_engram_full = (
+        shard.world_size > 1
+        and not coordinator.spans_hosts
+        and max(config.prefill_capacities, default=0) >= 512
+    )
     with core_storage.transient():
         weights = ModelWeights.load(manifest, device, shard=shard, progress=progress, dspark=config.dspark,
                                     confidence=config.draft_tokens > 0,
                                     expert_scale_compression=config.expert_scale_compression,
                                     draft_head_quantization=config.draft_head_quantization,
                                     markov_head_quantization=config.markov_head_quantization,
-                                    vocabulary_parallel_sampling=config.vocabulary_parallel_sampling)
+                                    vocabulary_parallel_sampling=config.vocabulary_parallel_sampling,
+                                    engram_full_projection=load_engram_full)
         release_unused()
     if progress is not None:
         progress("Target head: BF16 checkpoint weights with FP32 accumulation and logits")
@@ -365,7 +373,6 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         admission = AdmissionBuffers.allocate(device, vocab_size=129280, capacity=slots)
         commands = StateCommands.allocate(device, capacity=slots)
         completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + config.completion_token_capacity), device=device)
-        coordinator = CollectivePreparation(group)
         verification_samples = (slots * max(config.speculative_widths)
                                 if config.packed_verification else config.decode_tokens)
         collective, prefill_collective, vocabulary_collective, result_collective, draft_vocabulary_collective = _collective_runtimes(
@@ -445,8 +452,13 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
     scoring = PromptScoring.allocate(config, device, buffers, frame=frame, group=group,
         ipc=core_storage.peer_storage, runtime=collective, coordinator=coordinator)
     del manifest
+    from ignition.preparation import runtime_core_pb2 as _pb2
+
     modes = serving_modes(config.dspark, config.mtp_only)
+    has_terminal_prefill = hasattr(_pb2, "TERMINAL_PREFILL") and weights.config.decoder_start is not None
+    terminal_prefill_count = sum(1 for capacity in config.prefill_capacities if capacity > 128) if has_terminal_prefill else 0
     count = (len(modes) * (prefill_graph_count(config.prefill_capacities, scoring)
+                           + terminal_prefill_count
                            + 4 * len(config.batch_capacities))
              + len(config.speculative_shapes) + len(config.packed_speculative_shapes)
              + (len(config.batch_capacities) if False in modes else 0))
@@ -475,28 +487,37 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             for kind, mode, capacities in prefill_modes(
                     config.prefill_capacities, () if enabled else config.batch_capacities, scoring):
                 for capacity in capacities:
-                    rows = 1 if mode == "prefill" else capacity
-                    name = f"{kind}{capacity}" + (suffix if mode == "prefill" else "")
-                    metadata[name] = Metadata.allocate(capacity, rows, blocks, device)
-                    storage = prefill_storage if mode == "prefill" else decoder_storage
-                    if kind == "scored_prefill":
-                        storage = scored_storage
-                    scratch[name] = storage.rows(capacity, rows)
-                    decoder = decoder_factory(mode_weights, tables, scratch[name], metadata[name], pool,
-                        mode=mode,
-                        scoring=scoring if kind == "scored_prefill" else None,
-                        runtime=prefill_collective if mode == "prefill" and capacity >= 128 else collective,
-                        vocabulary_runtime=vocabulary_collective,
-                        coordinator=coordinator, session=session, name=name, workspace=arena)
-                    batch = PreparedBatch(inputs, requests, metadata[name], mode=mode, shard=shard, pool=pool,
-                        input_vocabulary=INPUT_VOCABULARY if vision_state is not None else None,
-                        validate_prefill=vision_state.validate_prefill if vision_state is not None and mode == "prefill" else None,
-                        )
-                    forward = PreparedGeneration(decoder, batch, completion, frame, sequence, runtime=collective,
-                        coordinator=coordinator, session=session, name=name + ".generation", workspace=arena,
-                        context_factory=PreparedContext if kind == "scored_prefill" else _CONTEXT)
-                    fields = (*forward_inputs, "vision_token_indices", "vision_feature_slot") if mode == "prefill" and vision_state is not None else forward_inputs
-                    add(name, forward, kind, rows, capacity if mode == "prefill" else 1, fields, enabled=enabled)
+                    variants = (
+                        (("prefill", True, False), ("terminal_prefill", False, True))
+                        if has_terminal_prefill and kind == "prefill" and capacity > 128
+                        else ((kind, False, True),)
+                    )
+                    for graph_kind, encoder_only, sample in variants:
+                        rows = 1 if mode == "prefill" else capacity
+                        name = f"{graph_kind}{capacity}" + (suffix if mode == "prefill" else "")
+                        metadata[name] = Metadata.allocate(capacity, rows, blocks, device)
+                        storage = prefill_storage if mode == "prefill" else decoder_storage
+                        if graph_kind == "scored_prefill":
+                            storage = scored_storage
+                        scratch[name] = storage.rows(capacity, rows)
+                        decoder = decoder_factory(mode_weights, tables, scratch[name], metadata[name], pool,
+                            mode=mode,
+                            scoring=scoring if graph_kind == "scored_prefill" else None,
+                            runtime=prefill_collective if mode == "prefill" and capacity >= 512 else collective,
+                            suffix_runtime=collective if mode == "prefill" and capacity >= 512 else None,
+                            vocabulary_runtime=vocabulary_collective,
+                            coordinator=coordinator, session=session, name=name, workspace=arena,
+                            encoder_only=encoder_only)
+                        batch = PreparedBatch(inputs, requests, metadata[name], mode=mode, shard=shard, pool=pool,
+                            input_vocabulary=INPUT_VOCABULARY if vision_state is not None else None,
+                            validate_prefill=vision_state.validate_prefill if vision_state is not None and mode == "prefill" else None,
+                            )
+                        forward = PreparedGeneration(decoder, batch, completion, frame, sequence, runtime=collective,
+                            coordinator=coordinator, session=session, name=name + ".generation", workspace=arena,
+                            context_factory=PreparedContext if graph_kind == "scored_prefill" else _CONTEXT,
+                            sample=sample)
+                        fields = (*forward_inputs, "vision_token_indices", "vision_feature_slot") if mode == "prefill" and vision_state is not None else forward_inputs
+                        add(name, forward, graph_kind, rows, capacity if mode == "prefill" else 1, fields, enabled=enabled)
         confidence = _prepare_speculation_catalog(config, speculation, add=add, buffers=buffers,
             forward_inputs=forward_inputs,
             host_allocate=core_storage.host_allocate, device=device)
@@ -575,7 +596,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             pool=graph_pool, collective=collective, coordinator=coordinator, compile_decoder=config.compile_decoder,
             progress=progress, cache_root=config.kernel_cache, retain_graphs=config.retain_graphs,
             materialize=materialize, warmup_storage=core_storage,
-            compile_kinds=("prefill", "scored_prefill", "decode", "resume", "speculative", "vision"))
+            compile_kinds=("prefill", "terminal_prefill", "scored_prefill", "decode", "resume", "speculative", "vision"))
     finally:
         if feature_pool is not None:
             feature_pool.materialize()

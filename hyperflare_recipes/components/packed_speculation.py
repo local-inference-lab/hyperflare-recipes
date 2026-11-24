@@ -91,9 +91,13 @@ class PreparedPackedSpeculativeRound:
         admitted = admitted & (~submitted | (agreement[0, :batch] == self.world)).all()
         o.inputs.query_lengths[:batch].copy_(torch.where(admitted, o.inputs.query_lengths[:batch], 0))
         pad = t.width - s.width
+        tile_masses = (None if proposal.tile_masses is None
+                       else (proposal.tile_masses if pad == 0
+                             else torch.nn.functional.pad(proposal.tile_masses, (0, 0, 0, pad))))
         proposal = replace(proposal, active=proposal.active & admitted,
             candidates=torch.nn.functional.pad(proposal.candidates, (0, pad)),
             drafts=torch.nn.functional.pad(proposal.drafts, (0, pad)),
-            valid=torch.nn.functional.pad(proposal.valid, (0, pad)))
+            valid=torch.nn.functional.pad(proposal.valid, (0, pad)),
+            tile_masses=tile_masses)
         probabilities = torch.nn.functional.pad(probabilities, (0, 0, 0, pad))
         return t.verify(admitted, probabilities=probabilities, proposal=proposal)

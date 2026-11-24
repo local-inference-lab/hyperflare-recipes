@@ -110,16 +110,22 @@ class PreparedMXFP4Indexer:
         self.scratch_layout = tuple((tuple(spec.shape), spec.dtype) for spec in self.plan.scratch_specs())
         self.query = self.output = self.packed = self.scales = self.arguments = self.workspace = self.scratch = None
 
-    def __call__(self, query=None, weights=None, pages=None, lengths=None, active=None, *, candidates=None, counts=None):
+    def __call__(self, query=None, weights=None, pages=None, lengths=None, active=None, *,
+                 candidates=None, counts=None, quantized=None):
         if self.arguments is None:
-            def allocate(name, fill):
+            def allocate(name):
                 layout = self.layouts[name]
-                return None if layout is None else torch.empty_strided(layout[0], layout[1], dtype=layout[2], device=query.device).fill_(fill)
-            packed, scales = allocate("q_mxfp4", 0), allocate("q_scales", 127)
-            output = allocate("output_indices", -1)
-            candidates_out, counts_out = allocate("candidate_output", -1), allocate("candidate_output_lengths", 0)
+                if layout is None:
+                    return None
+                return torch.empty_strided(layout[0], layout[1], dtype=layout[2], device=query.device)
+            if quantized is None:
+                packed, scales = allocate("q_mxfp4"), allocate("q_scales")
+                _quantize(query, packed, scales, self.plan.handle)
+            else:
+                packed, scales = quantized
+            output = allocate("output_indices")
+            candidates_out, counts_out = allocate("candidate_output"), allocate("candidate_output_lengths")
             scratch, = (torch.empty(shape, dtype=dtype, device=query.device) for shape, dtype in self.scratch_layout)
-            _quantize(query, packed, scales, self.plan.handle)
             _select(packed, scales, weights, self.cache, pages, lengths, active, output, scratch,
                     candidates, counts, candidates_out, counts_out, self.plan.handle)
             return output if candidates_out is None else (output, candidates_out, counts_out)

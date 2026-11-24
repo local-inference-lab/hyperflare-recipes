@@ -25,10 +25,25 @@ _REQUESTED = 65
 
 
 @triton.jit
-def _statistics(Logits, Records, Frame, Requested, Slots, Epochs, Live, Stats,
+def _check_requested(Requested, Slots, Live, Gate,
+                     BATCH: tl.constexpr, SLOTS: tl.constexpr, PAD: tl.constexpr):
+    live = tl.load(Live)
+    rows = tl.arange(0, PAD)
+    in_bounds = (rows < BATCH) & (rows < live)
+    slot = tl.load(Slots + rows, in_bounds, other=-1)
+    valid = in_bounds & (slot >= 0) & (slot < SLOTS)
+    req = tl.load(Requested + slot, valid, other=0) != 0
+    any_req = tl.sum(req.to(tl.int32), 0) > 0
+    tl.store(Gate, any_req.to(tl.int32))
+
+
+@triton.jit
+def _statistics(Logits, Records, Frame, Requested, Slots, Epochs, Live, Stats, Gate,
                 LOCAL: tl.constexpr, V: tl.constexpr, Offset,
                 WIDTH: tl.constexpr, TILES: tl.constexpr, SLOTS: tl.constexpr,
                 FIELDS: tl.constexpr, BLOCK: tl.constexpr):
+    if tl.load(Gate) == 0:
+        return
     row, col, tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     offset = tl.load(Offset)
     _, _, valid = _position(Records, Frame, Requested, Slots, Epochs, Live, row, col, SLOTS, FIELDS)
@@ -44,9 +59,11 @@ def _statistics(Logits, Records, Frame, Requested, Slots, Epochs, Live, Stats,
 
 
 @triton.jit
-def _local_normalization(Records, Frame, Requested, Slots, Epochs, Live, Stats, Summary,
+def _local_normalization(Records, Frame, Requested, Slots, Epochs, Live, Stats, Summary, Gate,
                          WIDTH: tl.constexpr, TILES: tl.constexpr, SLOTS: tl.constexpr,
                          FIELDS: tl.constexpr, BLOCK: tl.constexpr, WORDS: tl.constexpr):
+    if tl.load(Gate) == 0:
+        return
     row, col = tl.program_id(0), tl.program_id(1)
     _, _, valid = _position(Records, Frame, Requested, Slots, Epochs, Live, row, col, SLOTS, FIELDS)
     maximum = -float("inf")
@@ -63,9 +80,11 @@ def _local_normalization(Records, Frame, Requested, Slots, Epochs, Live, Stats, 
 
 
 @triton.jit
-def _global_normalization(Records, Frame, Requested, Slots, Epochs, Live, Gathered, Lse,
+def _global_normalization(Records, Frame, Requested, Slots, Epochs, Live, Gathered, Lse, Gate,
                           WIDTH: tl.constexpr, SLOTS: tl.constexpr, FIELDS: tl.constexpr,
                           WORLD: tl.constexpr, BLOCK: tl.constexpr, WORDS: tl.constexpr):
+    if tl.load(Gate) == 0:
+        return
     row, col = tl.program_id(0), tl.program_id(1)
     _, _, valid = _position(Records, Frame, Requested, Slots, Epochs, Live, row, col, SLOTS, FIELDS)
     if valid:
@@ -79,10 +98,12 @@ def _global_normalization(Records, Frame, Requested, Slots, Epochs, Live, Gather
 
 
 @triton.jit
-def _candidates(Logits, Records, Frame, Requested, Slots, Epochs, Live, Counts, Lse, Keys,
+def _candidates(Logits, Records, Frame, Requested, Slots, Epochs, Live, Counts, Lse, Keys, Gate,
                 LOCAL: tl.constexpr, V: tl.constexpr, Offset,
                 WIDTH: tl.constexpr, TILES: tl.constexpr, SLOTS: tl.constexpr,
                 FIELDS: tl.constexpr, BLOCK: tl.constexpr, CANDIDATES: tl.constexpr):
+    if tl.load(Gate) == 0:
+        return
     row, col, tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     offset = tl.load(Offset)
     slot, _, valid = _position(Records, Frame, Requested, Slots, Epochs, Live, row, col, SLOTS, FIELDS)
@@ -100,11 +121,13 @@ def _candidates(Logits, Records, Frame, Requested, Slots, Epochs, Live, Counts, 
 
 
 @triton.jit
-def _pack(Logits, Records, Frame, Requested, Slots, Epochs, Live, Counts, TokenIds, Keys, Summary,
+def _pack(Logits, Records, Frame, Requested, Slots, Epochs, Live, Counts, TokenIds, Keys, Summary, Gate,
           LOCAL: tl.constexpr, V: tl.constexpr, Offset, WIDTH: tl.constexpr,
           TILES: tl.constexpr, SLOTS: tl.constexpr, FIELDS: tl.constexpr,
           BLOCK: tl.constexpr, CANDIDATES: tl.constexpr, IDS: tl.constexpr,
           WORDS: tl.constexpr, CHOSEN: tl.constexpr, REQUESTED: tl.constexpr):
+    if tl.load(Gate) == 0:
+        return
     row, col = tl.program_id(0), tl.program_id(1)
     offset = tl.load(Offset)
     slot, token, valid = _position(Records, Frame, Requested, Slots, Epochs, Live, row, col, SLOTS, FIELDS)
@@ -130,12 +153,14 @@ def _pack(Logits, Records, Frame, Requested, Slots, Epochs, Live, Counts, TokenI
 
 
 @triton.jit
-def _finish(Records, Frame, Requested, Slots, Epochs, Live, Counts, TokenIds, Gathered, Lse, Output,
+def _finish(Records, Frame, Requested, Slots, Epochs, Live, Counts, TokenIds, Gathered, Lse, Output, Gate,
             LOCAL: tl.constexpr, V: tl.constexpr, WIDTH: tl.constexpr, SLOTS: tl.constexpr,
             FIELDS: tl.constexpr, WORLD: tl.constexpr, WORDS: tl.constexpr,
             CANDIDATES: tl.constexpr, BLOCK: tl.constexpr, TOP: tl.constexpr, IDS: tl.constexpr,
             CHOSEN: tl.constexpr, REQUESTED: tl.constexpr, OUTPUT_TOKENS: tl.constexpr,
             OUTPUT_FIELDS: tl.constexpr, PAIR_FIELDS: tl.constexpr):
+    if tl.load(Gate) == 0:
+        return
     row, col = tl.program_id(0), tl.program_id(1)
     slot, token, valid = _position(Records, Frame, Requested, Slots, Epochs, Live, row, col, SLOTS, FIELDS)
     if valid:
@@ -192,28 +217,32 @@ class PreparedVocabularyParallelLogprobs:
         self.keys = torch.zeros((batch, width, tiles, _CANDIDATES), dtype=torch.uint64, device=logits.device)
         self.summary = torch.zeros((batch * width, _SUMMARY), dtype=torch.float32, device=logits.device)
         self.gathered = torch.zeros((batch * width, world * _SUMMARY), dtype=torch.float32, device=logits.device)
+        self.gate = torch.ones((1,), dtype=torch.int32, device=logits.device)
         self.summary_bits = self.summary.view(torch.bfloat16)
         self.gathered_bits = self.gathered.view(torch.bfloat16)
         self.exchange = PreparedAllGather(self.summary_bits, self.gathered_bits,
-            runtime=runtime, session=session, coordinator=coordinator, name=name + ".exchange")
+            runtime=runtime, session=session, coordinator=coordinator, name=name + ".exchange",
+            has_gate=True)
         self.logits = logits
         self.row_inputs = dict(slots=slots, generations=epochs, live_rows=live)
         common = (logits, completion.records, frame, completion.requested, slots, epochs, live)
         geometry = (local, vocabulary, self.offset, width, tiles, completion.records.shape[1], completion.records.shape[2])
         rows = (batch, width, 1)
         self._preparation = (
-            (_statistics, (*common, self.stats, *geometry, _TILE), (batch, width, tiles), 4),
-            (_local_normalization, (*common[1:], self.stats, self.summary, *geometry[3:],
+            (_check_requested, (completion.requested, slots, live, self.gate, batch,
+                completion.records.shape[1], max(16, triton.next_power_of_2(batch))), (1, 1, 1), 1),
+            (_statistics, (*common, self.stats, self.gate, *geometry, _TILE), (batch, width, tiles), 4),
+            (_local_normalization, (*common[1:], self.stats, self.summary, self.gate, *geometry[3:],
                 triton.next_power_of_2(tiles), _SUMMARY), rows, 4),
-            (_global_normalization, (*common[1:], self.gathered, self.lse, width, *geometry[5:],
+            (_global_normalization, (*common[1:], self.gathered, self.lse, self.gate, width, *geometry[5:],
                 world, triton.next_power_of_2(world), _SUMMARY), rows, 4),
-            (_candidates, (*common, completion.token_id_counts, self.lse, self.keys, *geometry,
+            (_candidates, (*common, completion.token_id_counts, self.lse, self.keys, self.gate, *geometry,
                 _TILE, _CANDIDATES), (batch, width, tiles), 4),
-            (_pack, (*common, completion.token_id_counts, completion.token_ids, self.keys, self.summary,
+            (_pack, (*common, completion.token_id_counts, completion.token_ids, self.keys, self.summary, self.gate,
                 *geometry, triton.next_power_of_2(tiles * _CANDIDATES), _CANDIDATES,
                 MAX_LOGPROB_TOKEN_IDS, _SUMMARY, _CHOSEN, _REQUESTED), rows, 8),
             (_finish, (*common[1:], completion.token_id_counts, completion.token_ids,
-                self.gathered, self.lse, completion.logprobs, local, vocabulary, width,
+                self.gathered, self.lse, completion.logprobs, self.gate, local, vocabulary, width,
                 *geometry[5:], world, _SUMMARY, _CANDIDATES,
                 triton.next_power_of_2(world * _CANDIDATES), MAX_TOP_LOGPROBS, MAX_LOGPROB_TOKEN_IDS,
                 _CHOSEN, _REQUESTED, completion.token_capacity, LOGPROB_FIELDS, LOGPROB_PAIR_FIELDS), rows, 8),
@@ -229,7 +258,7 @@ class PreparedVocabularyParallelLogprobs:
     def functional(self, *, session, dynamic_inputs=False):
         if not self.operations:
             raise RuntimeError("vocabulary logprobs require preparation before functional conversion")
-        values = {name: getattr(self, name) for name in ("logits", "stats", "lse", "keys", "summary", "gathered")}
+        values = {name: getattr(self, name) for name in ("logits", "stats", "lse", "keys", "summary", "gathered", "gate")}
         self.local_layout = {name: (tuple(value.shape), value.dtype) for name, value in values.items()}
         names = {id(value): name for name, value in {**values, **self.row_inputs}.items()}
         for operation in self.operations:
@@ -254,8 +283,8 @@ class PreparedVocabularyParallelLogprobs:
             if local[name] is None:
                 raise ValueError("vocabulary logprobs require runtime row operands")
         for index, operation in enumerate(self.operations):
-            if index in (2, 5):
-                local["gathered"] = self.exchange(local["summary"].view(torch.bfloat16)).view(torch.float32)
+            if index in (3, 6):
+                local["gathered"] = self.exchange(local["summary"].view(torch.bfloat16), gate=local["gate"]).view(torch.float32)
             args = list(operation.args)
             for slot, name in operation.local_slots:
                 args[slot] = local[name]
@@ -264,12 +293,13 @@ class PreparedVocabularyParallelLogprobs:
     def __call__(self):
         if not self.operations:
             raise RuntimeError("vocabulary-parallel logprob preparation must finish before capture")
-        stats, local, global_lse, candidates, pack, finish = self.operations
+        check, stats, local, global_lse, candidates, pack, finish = self.operations
+        check()
         stats()
         local()
-        self.exchange(self.summary_bits)
+        self.exchange(self.summary_bits, gate=self.gate)
         global_lse()
         candidates()
         pack()
-        self.exchange(self.summary_bits)
+        self.exchange(self.summary_bits, gate=self.gate)
         finish()

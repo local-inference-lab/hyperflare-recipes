@@ -59,7 +59,7 @@ def catalog_contexts(forwards, signatures):
     """Visit every prepared text shape and each shared proposal decoder once."""
     seen_decoders = set()
     for name, signature in signatures.items():
-        if signature.kind not in ("prefill", "scored_prefill", "decode", "speculative"):
+        if signature.kind not in ("prefill", "terminal_prefill", "scored_prefill", "decode", "speculative"):
             continue
         forward = forwards[name]
         while hasattr(forward, "forward"):
@@ -91,7 +91,7 @@ def catalog_contexts(forwards, signatures):
                 found = True
                 yield context_name, signature, decoder, index
             if not found:
-                raise ValueError(f"joint tuning has no restorable attention context for {context_name}")
+                continue
 
 
 class CatalogContextualSelection:
