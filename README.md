@@ -49,6 +49,9 @@ qualification drivers for preparing runtime cores served by
 
 ## Usage
 
+For fixed SDXL and PixArt-Alpha image-generation profiles, see
+[diffusion preparation and comparison](docs/diffusion.md).
+
 Install dependencies (including `ignition[prepare]` and `flare-heliopause` from
 `NVIDIA/hyperflare-inference`) and export a model core:
 

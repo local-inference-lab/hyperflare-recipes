@@ -1,3 +1,8 @@
+[ ] Qualify the SDXL four/thirty-step and PixArt-Alpha twenty-step module
+    commands with the packaged dependency environment, including Transformers
+    5.23.0. Require exact eager composition and canonical/captured/native
+    comparisons for both declared prompt/seed pairs, including saved repeats.
+
 [ ] Compare Inkling 2 effort-zero generation with the canonical target using
     the static NVFP4 checkpoint. Native TP4 emits analysis in content_text and
     violates exact-output prompts; a long-prefix lookup also intermittently
