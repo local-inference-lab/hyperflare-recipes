@@ -9,6 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
 
+from hyperflare_recipes.components.trellismx_release import TRELLISMX_OVERLAY
 from ignition.declaration import Checkpoint, RankCosts, RankUsage, Recipe, SamplingDefaults, SamplingRange, Speculation
 
 # Each sparse-attention layer stores four latent blocks and one index block per
@@ -64,14 +65,18 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         mtp=speculation is not None, **drafting)
     # A refusal or a failed template download is reported here, before any rank starts, so that its guidance
     # reaches the command line at every rank count; a rank that fails during preparation prints a traceback.
-    if speculation is not None and any(gpu.capability == (10, 3) for gpu in plan.gpus):
+    from ignition.preparation.checkpoint import checkpoint_assets_root
+
+    assets_root = checkpoint_assets_root(Path(snapshot).resolve(), plan.checkpoint.overlay)
+    if (speculation is not None and plan.checkpoint.overlay is None
+            and any(gpu.capability == (10, 3) for gpu in plan.gpus)):
         from ignition.preparation.quantization import quantized_layers
 
         from .weights import require_draft_experts_supported
 
         require_draft_experts_supported(
-            quantized_layers(json.loads((Path(snapshot) / "config.json").read_text())), sm103=True)
-    config = replace(config, chat_template=chat_template_asset(Path(snapshot).resolve(), cache_dir=plan.hub_cache))
+            quantized_layers(json.loads((assets_root / "config.json").read_text())), sm103=True)
+    config = replace(config, chat_template=chat_template_asset(assets_root, cache_dir=plan.hub_cache))
     if plan.world_size == 1:
         return prepare_rank(snapshot, config, rank=0, group=None, progress=progress, core_storage=core_storage)
     return prepare_group(snapshot, config, prepare_rank, progress=progress, core_storage=core_storage,
@@ -104,7 +109,23 @@ RECIPE = Recipe(
         # 154,880 x 4096 head, 4-bit values, one E4M3 scale per 16 values with each TP4 shard's rows padded
         # to 128 for the swizzle, and an FP32 gain per shard, summed over four shards. Weights estimates add
         # it without speculation too, which overstates them by 89 MB per rank at TP4 with --no-mtp.
-        expansion_bytes=356_909_072),),
+        expansion_bytes=356_909_072),
+        # The TrellisMX release overlays its routed experts on the pinned carrier: the
+        # carrier's 19_339_670_136 payload bytes plus 165_721_576_928 bytes of sidecars,
+        # one per layer and rank of a TP4 partition, so only TP4 can load it. Tensors stay
+        # as stored, but preparation keeps more than the stored bytes: each sidecar's b12x
+        # bundle holds 1_021_002_880 bytes (its payload, one repacked copy of both UE8M0
+        # scale planes, and the intermediate rotations; measured on the CPU-prepared
+        # bundle). The attached P8 runtime's repacked planes replace the bundle's
+        # byte-identical copies, and the runtime adds 905_348 bytes of its own, almost all
+        # its packed boundary vectors (measured on a CPU-attached runtime). The 172 sidecars
+        # thus occupy 1_021_908_228 bytes each, 58 MB beyond their stored size.
+        Checkpoint(
+            alias="glm-5.3-flash-trellismx", repository="brandonmusic/glm-5.3-flash-tr3-fp8",
+            revision="80cbe535eabbeddfbd567e376a09ac559bcbac75", architecture="Glm5NextForConditionalGeneration",
+            stored_bytes=185_061_247_064, device_bytes=185_061_247_064, expansion_bytes=10_046_638_288,
+            # Layer 45's four sidecars, as prepared, plus its 25 non-expert tensors.
+            draft_bytes=4_457_303_696, tensor_parallel=(4,), overlay=TRELLISMX_OVERLAY),),
     context=1048576, page_tokens=256, concurrency=32, max_concurrency=64, prefill_chunk=4096,
     speculation=Speculation(draft_tokens=5, token_capacity=128), max_draft_tokens=7, verification_rows=0,
     # Shared experts, KDA gate projections, and decode query chains run on an auxiliary stream.
