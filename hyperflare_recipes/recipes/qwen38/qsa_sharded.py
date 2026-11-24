@@ -1067,7 +1067,81 @@ class PreparedShardedQSA:
         )
         return attended, selected
 
+    def select_row_runtime(self, source, bindings, dynamic, full_workspace_bytes):
+        """Run local row-split cache update and representative selection before AllGather."""
+        if self.mode != "row":
+            raise ValueError("select_row_runtime requires row-split QSA sharding")
+        device = source.device
+        cache_workspace = torch.empty(full_workspace_bytes, dtype=torch.uint8, device=device)
+        cache_reads = (
+            [bindings[name] for name in self.cache_read_names]
+            + [bindings["output"], bindings["selected_positions"]]
+            + [dynamic[name] for name in _FULL_DYNAMIC_FIELDS]
+        )
+        cache_writes = [bindings[name] for name in _CACHE_MUTABLE_FIELDS]
+        _qsa_cache_only_op(source, cache_reads, cache_writes, cache_workspace, self.handle)
+        del cache_workspace
+
+        common_constants = [
+            bindings["main_k_cache"], bindings["main_v_cache"], bindings["compressed_k_cache"],
+            bindings["raw_k_ring"], bindings["raw_logical_positions"],
+            bindings["raw_rope_positions"], bindings["raw_interval_start_positions"],
+            bindings["index_q_norm_weight"], bindings["index_k_norm_weight"],
+            bindings["rope_cos"], bindings["rope_sin"],
+            bindings["k_descale"], bindings["v_descale"],
+        ]
+        local_index_q = dynamic["index_query"].index_select(0, self.row_indices)
+        local_req = dynamic["request_ids"].index_select(0, self.row_indices)
+        local_pos = dynamic["query_positions"].index_select(0, self.row_indices)
+        local_rope = dynamic["rope_positions"].index_select(0, self.row_indices)
+        select_workspace = torch.empty(self.select_workspace_bytes, dtype=torch.uint8, device=device)
+        send = torch.empty(self.send_shape, dtype=torch.bfloat16, device=device)
+        select_reads = common_constants + [
+            bindings["main_block_table"], bindings["compressed_block_table"],
+            bindings["output"], bindings["selected_positions"],
+            local_index_q, local_req, local_pos, local_rope, dynamic["sequence_lengths"],
+        ]
+        _qsa_select_sharded_op(select_reads, send, select_workspace, self.handle)
+        del select_workspace
+        return common_constants, send
+
+    def finish_row_runtime(self, bindings, dynamic, common_constants, send, full_workspace_bytes, *,
+                           gather_dependencies=()):
+        """Gather row-split group IDs, expand positions, and run sparse attention."""
+        if self.mode != "row":
+            raise ValueError("finish_row_runtime requires row-split QSA sharding")
+        device = send.device
+        gathered = self.gather(send, dependencies=gather_dependencies)
+        selected_positions = bindings["selected_positions"]
+        gathered_ids = gathered.view(torch.int32)
+        _launch(
+            _expand_row_split_groups_kernel,
+            (self.tokens,),
+            (
+                gathered_ids, dynamic["request_ids"], dynamic["query_positions"],
+                dynamic["sequence_lengths"], selected_positions,
+                gathered_ids.stride(0), selected_positions.stride(0),
+            ),
+            WORLD=self.world_size, ROW_BLOCK=ROW_BLOCK,
+            GROUP_BUDGET=GROUP_BUDGET, COMPRESS_RATIO=COMPRESS_RATIO,
+            SELECTION_WIDTH=SELECTION_WIDTH, BLOCK_W=triton.next_power_of_2(SELECTION_WIDTH),
+            num_warps=8,
+        )
+        if not self.selection_only:
+            attend_workspace = torch.empty(full_workspace_bytes, dtype=torch.uint8, device=device)
+            attend_reads = common_constants + [
+                bindings["main_block_table"], bindings["compressed_block_table"],
+                bindings["raw_state_slot_ids"], selected_positions,
+                dynamic["query"], dynamic["request_ids"], dynamic["query_positions"],
+            ]
+            _qsa_attend_selected_op(attend_reads, bindings["output"], attend_workspace, self.handle)
+
     def __call__(self, source, bindings, dynamic, full_workspace_bytes):
+        if self.mode == "row":
+            common_constants, send = self.select_row_runtime(source, bindings, dynamic, full_workspace_bytes)
+            self.finish_row_runtime(bindings, dynamic, common_constants, send, full_workspace_bytes)
+            return
+
         device = source.device
         # 1) Update replicated compressed_k_cache and raw_k_ring on all ranks.
         # Keep cache_workspace, select_workspace, and attend_workspace disjoint in lifetime
@@ -1091,42 +1165,32 @@ class PreparedShardedQSA:
             bindings["rope_cos"], bindings["rope_sin"],
             bindings["k_descale"], bindings["v_descale"],
         ]
-        if self.mode == "row":
-            local_index_q = dynamic["index_query"].index_select(0, self.row_indices)
-            local_req = dynamic["request_ids"].index_select(0, self.row_indices)
-            local_pos = dynamic["query_positions"].index_select(0, self.row_indices)
-            local_rope = dynamic["rope_positions"].index_select(0, self.row_indices)
-            local_seq_len = dynamic["sequence_lengths"]
-            main_table = bindings["main_block_table"]
-            comp_table = bindings["compressed_block_table"]
-            global_eligible = None
-        else:
-            half_width = self.table_width // self.world_size
-            half_table = torch.empty((self.batch, half_width), dtype=torch.int32, device=device)
-            local_pos = torch.empty_like(dynamic["query_positions"])
-            local_seq_len = torch.empty_like(dynamic["sequence_lengths"])
-            global_eligible = torch.empty((self.tokens,), dtype=torch.int32, device=device)
-            block_t = 256
-            tiles = triton.cdiv(half_width, block_t)
-            _launch(
-                _prepare_group_inputs_kernel,
-                (self.batch * tiles + 1,),
-                (
-                    bindings["compressed_block_table"], half_table,
-                    dynamic["request_ids"], dynamic["query_positions"], dynamic["sequence_lengths"],
-                    self.rank_tensor, local_pos, local_seq_len, global_eligible,
-                    bindings["compressed_block_table"].stride(0), half_table.stride(0),
-                ),
-                HALF_WIDTH=half_width, TILES=tiles, BATCH=self.batch, ROWS=self.tokens,
-                BLOCK_T=block_t, BLOCK_R=triton.next_power_of_2(self.tokens),
-                BLOCK_B=triton.next_power_of_2(self.batch),
-                PAGE_GROUPS=COMPRESSED_PAGE_SIZE, WORLD=self.world_size, num_warps=4,
-            )
-            local_index_q = dynamic["index_query"]
-            local_req = dynamic["request_ids"]
-            local_rope = dynamic["rope_positions"]
-            main_table = half_table
-            comp_table = half_table
+        half_width = self.table_width // self.world_size
+        half_table = torch.empty((self.batch, half_width), dtype=torch.int32, device=device)
+        local_pos = torch.empty_like(dynamic["query_positions"])
+        local_seq_len = torch.empty_like(dynamic["sequence_lengths"])
+        global_eligible = torch.empty((self.tokens,), dtype=torch.int32, device=device)
+        block_t = 256
+        tiles = triton.cdiv(half_width, block_t)
+        _launch(
+            _prepare_group_inputs_kernel,
+            (self.batch * tiles + 1,),
+            (
+                bindings["compressed_block_table"], half_table,
+                dynamic["request_ids"], dynamic["query_positions"], dynamic["sequence_lengths"],
+                self.rank_tensor, local_pos, local_seq_len, global_eligible,
+                bindings["compressed_block_table"].stride(0), half_table.stride(0),
+            ),
+            HALF_WIDTH=half_width, TILES=tiles, BATCH=self.batch, ROWS=self.tokens,
+            BLOCK_T=block_t, BLOCK_R=triton.next_power_of_2(self.tokens),
+            BLOCK_B=triton.next_power_of_2(self.batch),
+            PAGE_GROUPS=COMPRESSED_PAGE_SIZE, WORLD=self.world_size, num_warps=4,
+        )
+        local_index_q = dynamic["index_query"]
+        local_req = dynamic["request_ids"]
+        local_rope = dynamic["rope_positions"]
+        main_table = half_table
+        comp_table = half_table
 
         # 3) Run rank-local scoring & top-k selection on select_plan.
         select_workspace = torch.empty(self.select_workspace_bytes, dtype=torch.uint8, device=device)
@@ -1143,22 +1207,7 @@ class PreparedShardedQSA:
 
         # 5) Expand gathered groups into selected_positions [tokens, 2051].
         selected_positions = bindings["selected_positions"]
-        if self.mode == "row":
-            gathered_ids = gathered.view(torch.int32)
-            _launch(
-                _expand_row_split_groups_kernel,
-                (self.tokens,),
-                (
-                    gathered_ids, dynamic["request_ids"], dynamic["query_positions"],
-                    dynamic["sequence_lengths"], selected_positions,
-                    gathered_ids.stride(0), selected_positions.stride(0),
-                ),
-                WORLD=self.world_size, ROW_BLOCK=ROW_BLOCK,
-                GROUP_BUDGET=GROUP_BUDGET, COMPRESS_RATIO=COMPRESS_RATIO,
-                SELECTION_WIDTH=SELECTION_WIDTH, BLOCK_W=triton.next_power_of_2(SELECTION_WIDTH),
-                num_warps=8,
-            )
-        elif self.world_size == 2:
+        if self.world_size == 2:
             _launch(
                 _merge_and_expand_group_candidates_2_kernel,
                 (self.tokens,),

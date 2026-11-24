@@ -212,7 +212,8 @@ class PreparedHyperconnection:
             "eps": following.eps, "zero_centered": False, "weight_dtype": "float32",
             "output_mode": "provided"}))
         arguments = (priming_state, self.scratch.block_input, self.scratch.injection_logits,
-                     following.norm_gain, self.scratch.gate_workspace, following.scratch.normalized)
+                     following.norm_gain, self.scratch.gate_workspace,
+                     following.scratch.normalized[:self.tokens])
         kwargs = {"eps": following.eps}
         declare(session, (plan.request(name=name,
             prepare_call=lambda state: PreparedCall(run=lambda: state.launch(*arguments, **kwargs)),
