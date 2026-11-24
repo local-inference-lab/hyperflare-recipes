@@ -14,6 +14,7 @@ from hyperflare_recipes.components.expert_overlap import ConcurrentSharedExpert
 from hyperflare_recipes.components.ring_commit import PreparedRingCommit
 from hyperflare_recipes.components.linear import UnquantizedProjection
 from hyperflare_recipes.components.mhc import MHCWeights, MHCScratch, PreparedMHC, PreparedMHCPost
+from hyperflare_recipes.components.mhc_overlap import SplitLaggedMHC
 from hyperflare_recipes.components.mlp import MLPScratch, PreparedMLP
 from hyperflare_recipes.components.moe import RouterScratch, PreparedRouter, PreparedRoutedExperts
 from hyperflare_recipes.components.vocabulary import PreparedVocabularyProjection
@@ -212,6 +213,23 @@ class PreparedLayer:
         source = s.engram_residual if self.engram is not None else s.residual
         options = dict(rms_eps=text["rms_norm_eps"], norm_eps=text["rms_norm_eps"], hc_eps=text["hc_eps"],
                        sinkhorn_iters=text["hc_sinkhorn_iters"])
+        from b12x.norm.mhc._split_lagged import supports_split_lagged
+
+        self.split_mhc = (
+            mode in ("decode", "verify", "draft")
+            and not self.pipelined_ffn
+            and not self.pipelined_attn_hc
+            and self.pipelined_attn is None
+            and boundary is None
+            and runtime is not None
+            and shard.world_size > 1
+            and isinstance(workspace, ScratchArena)
+            and workspace.overlap
+            and supports_split_lagged(
+                source.device, tokens, source.shape[-1], weights.residual["attn_norm.weight"].dtype)
+            and supports_split_lagged(
+                source.device, tokens, source.shape[-1], weights.residual["ffn_norm.weight"].dtype)
+        )
         if self.pipelined_attn_hc or self.pipelined_attn == "full":
             attn_incoming = ((s.mlp_output[:h], s.ffn_hc.residual[:h], s.ffn_hc.post[:h], s.ffn_hc.comb[:h])
                              if carry else (source[:h],))
@@ -219,6 +237,11 @@ class PreparedLayer:
                 attn_incoming, _mhc_weights(weights, "attn", "attn_norm"), s.attention_hc.rows(h),
                 session=session, name=name + ".attn_hc", workspace=workspace,
                 pre_mix=s.pre_mix[:h], pre_out=s.attn_mix[:h], **options)
+        elif self.split_mhc:
+            incoming = ((s.mlp_output, s.ffn_hc.residual, s.ffn_hc.post, s.ffn_hc.comb) if carry else (source,))
+            self.attention_hc = SplitLaggedMHC(
+                incoming, _mhc_weights(weights, "attn", "attn_norm"),
+                session=session, workspace=workspace, **options)
         else:
             incoming = ((s.mlp_output, s.ffn_hc.residual, s.ffn_hc.post, s.ffn_hc.comb) if carry else (source,))
             self.attention_hc = None if boundary is not None else PreparedMHC(
@@ -295,9 +318,6 @@ class PreparedLayer:
             self.cr_att_0 = self.cr_att_1 = self.cr_mlp_0 = self.cr_mlp_1 = None
             self.attention_reduce = PreparedAllReduce(s.attention.output, s.attention_output, runtime=runtime,
                 coordinator=coordinator, session=session, name=name + ".attention_reduce")
-            self.ffn_hc = PreparedMHC((s.attention_output, s.attention_hc.residual, s.attention_hc.post, s.attention_hc.comb),
-                _mhc_weights(weights, "ffn", "ffn_norm"), s.ffn_hc, session=session, name=name + ".ffn_hc", workspace=workspace,
-                pre_mix=s.attn_mix, pre_out=s.pre_mix, **options)
             self.router_projection = UnquantizedProjection(s.ffn_hc.normalized, weights.experts.router, s.router_logits,
                 session=session, name=name + ".router")
             self.router = PreparedRouter(s.router_logits, s.router, session=session, name=name + ".topk",
@@ -308,6 +328,15 @@ class PreparedLayer:
             self.experts = PreparedRoutedExperts(s.ffn_hc.normalized, weights.experts.experts, s.router.ids,
                 s.router.weights, s.routed, session=session, name=name + ".experts", workspace=workspace,
                 router_plan=self.router.plan)
+            if self.split_mhc:
+                self.ffn_hc = SplitLaggedMHC(
+                    (s.attention_output, s.attention_hc.residual, s.attention_hc.post, s.attention_hc.comb),
+                    _mhc_weights(weights, "ffn", "ffn_norm"),
+                    session=session, workspace=workspace, experts=self.experts, **options)
+            else:
+                self.ffn_hc = PreparedMHC((s.attention_output, s.attention_hc.residual, s.attention_hc.post, s.attention_hc.comb),
+                    _mhc_weights(weights, "ffn", "ffn_norm"), s.ffn_hc, session=session, name=name + ".ffn_hc", workspace=workspace,
+                    pre_mix=s.attn_mix, pre_out=s.pre_mix, **options)
             self.shared = PreparedMLP(s.ffn_hc.normalized, weights.experts.shared, s.shared.gate_up,
                 s.shared.intermediate, s.shared.output, session=session, name=name + ".shared", workspace=workspace,
                 swiglu_limit=text["swiglu_limit"], round_silu=False, activation_mode="auto")
@@ -468,8 +497,12 @@ class PreparedLayer:
                 normalized = torch.cat((norm_a, norm_b), dim=0)
                 residual = post = comb = attn_mix = None
             elif boundary is None:
-                attn_mix = torch.empty_like(pre_mix)
-                residual, post, comb, normalized = self.attention_hc(*incoming, pre_mix=pre_mix, pre_out=attn_mix)
+                if getattr(self, "split_mhc", False):
+                    residual, normalized, _, _ = self.attention_hc.post_y_norm(*incoming, pre_mix=pre_mix)
+                    post = comb = attn_mix = None
+                else:
+                    attn_mix = torch.empty_like(pre_mix)
+                    residual, post, comb, normalized = self.attention_hc(*incoming, pre_mix=pre_mix, pre_out=attn_mix)
             else:
                 (residual, post, comb, normalized), attn_mix = boundary
             attention_normalized = normalized
@@ -558,6 +591,34 @@ class PreparedLayer:
             observations = {"attention." + key: value for key, value in observations.items()}
             observations.update({"attention_hc.normalized": attention_normalized,
                                  "router.ids": torch.cat((route_a.ids, route_b.ids), dim=0),
+                                 "output": incoming[0]})
+            return incoming, next_mix, records, selection, observations
+
+        if getattr(self, "split_mhc", False):
+            pending_attn_hc = self.attention_hc.start_sinkhorn(residual, attended)
+            att_deps = (*att_reduce_deps, pending_attn_hc.pre_out)
+            attention_output = self.attention_reduce(attended, dependencies=att_deps)
+            post, comb, attn_mix = self.attention_hc.finish_sinkhorn(pending_attn_hc, attention_output)
+            residual, normalized, prequant_v, prequant_s = self.ffn_hc.post_y_norm(
+                attention_output, residual, post, comb, pre_mix=attn_mix)
+            pending = None if self.concurrent_shared is None else self.concurrent_shared.start(normalized)
+            router_logits = self.router_projection(normalized)
+            route = self.router(router_logits, image_mask=image_mask)
+            routed = self.experts(normalized, route.ids, route.weights, router_logits=router_logits,
+                                  selected_logits=route.selected_logits, image_mask=image_mask,
+                                  prequant_a_values=prequant_v, prequant_a_scales=prequant_s)
+            shared = (self.shared(normalized) if self.concurrent_shared is None
+                      else self.concurrent_shared.finish(pending, routed))
+            pending_ffn_hc = self.ffn_hc.start_sinkhorn(residual, shared, routed)
+            output = (self.mlp_reduce(routed, addend=shared, dependencies=(pending_ffn_hc.pre_out,))
+                      if getattr(self.mlp_reduce, "fused_addend", False)
+                      else self.mlp_reduce(routed + shared, dependencies=(pending_ffn_hc.pre_out,)))
+            post, comb, next_mix = self.ffn_hc.finish_sinkhorn(pending_ffn_hc, output)
+            incoming = ((self.post(output, residual, post, comb),) if self.post is not None
+                        else (output, residual, post, comb))
+            observations = {"attention." + key: value for key, value in observations.items()}
+            observations.update({"attention_hc.normalized": attention_normalized,
+                                 "router.ids": route.ids,
                                  "output": incoming[0]})
             return incoming, next_mix, records, selection, observations
 

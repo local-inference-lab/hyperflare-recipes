@@ -278,7 +278,9 @@ class PreparedRoutedExperts:
         return self
 
     def _finalize_functional(self):
-        from b12x.moe.fused_moe._binding_ops import scale_buffers, release_scale_templates, release_weight_views
+        from b12x.moe.fused_moe._binding_ops import (
+            release_scale_templates, release_weight_views, scale_buffers, supports_prequant_mxfp8,
+        )
 
         specs = self.plan.scratch_specs()
         if len(specs) != 1 or specs[0].dtype != torch.uint8:
@@ -286,6 +288,9 @@ class PreparedRoutedExperts:
         self.workspace_nbytes = specs[0].nbytes
         self.scale_inputs, storage = scale_buffers(self.binding)
         self.scale_layouts = tuple((tuple(t.shape), t.stride(), t.dtype) for t in storage)
+        self.accepts_prequant_mxfp8 = (
+            not self.integrated_routing and supports_prequant_mxfp8(self.plan, self.output_layout[0][0])
+        )
         release_weight_views(self.experts._impl)
         if self.experts.has_csf_blocks and self.preparation_arena is not None:
             self.preparation_arena.register_preparation_release(
@@ -306,9 +311,11 @@ class PreparedRoutedExperts:
             self.router(logits)
 
     def __call__(self, source=None, ids=None, weights=None, *, router_logits=None, selected_logits=None,
-                 image_mask=None, num_valid_tokens=None):
+                 image_mask=None, num_valid_tokens=None, prequant_a_values=None, prequant_a_scales=None):
         if self.output is None:
-            from b12x.moe.fused_moe._binding_ops import prepared_moe_out, prepared_routed_moe_out
+            from b12x.moe.fused_moe._binding_ops import (
+                prepared_moe_out, prepared_moe_prequant_out, prepared_routed_moe_out,
+            )
 
             if source is None or ids is None or weights is None:
                 raise ValueError("functional experts require source, expert IDs, and route weights")
@@ -325,6 +332,10 @@ class PreparedRoutedExperts:
                     scratch, self.scale_inputs, storage, self.plan.handle,
                     options.get("correction_bias"), options.get("image_correction_bias"),
                     options.get("image_mask"), options.get("num_valid_tokens"), False)
+            elif prequant_a_values is not None and prequant_a_scales is not None:
+                prepared_moe_prequant_out(source, prequant_a_values, prequant_a_scales, weights, ids, output,
+                    scratch, self.scale_inputs, storage, self.plan.handle, True, None, None, None, None, None,
+                    False, self.precision.get("a4_prefill"))
             else:
                 prepared_moe_out(source, weights, ids, output, scratch, self.scale_inputs, storage,
                     self.plan.handle, True, None, None, None, None, None, False,

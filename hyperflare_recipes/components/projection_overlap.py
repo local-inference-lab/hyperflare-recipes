@@ -17,7 +17,8 @@ _TC_GEMV_ROPE_RUNNERS: dict[tuple[int, int, int], tuple[object, object]] = {}
 
 def register_tc_gemv_rope(plan, *, head_dim: int, rope_dim: int = 64) -> bool:
     """Precompile a fused-RoPE MXFP8 TC-GEMV runner if `plan` selected tc_gemv."""
-    state = getattr(plan, "_prepared", None)
+    prepared = getattr(plan, "_prepared", None)
+    state = getattr(prepared, "state", prepared)
     if state is None:
         return False
     config = getattr(state, "config", None)
@@ -54,7 +55,17 @@ def register_tc_gemv_rope(plan, *, head_dim: int, rope_dim: int = 64) -> bool:
 def _run_mxfp8_with_rope(source, values, scales, gain, activation_scale, scale_kind,
                          output, workspace, plan_handle, angles, head_dim, rope_dim, stream):
     entry = _TC_GEMV_ROPE_RUNNERS.get((plan_handle, head_dim, rope_dim))
-    if entry is not None:
+    if entry is None:
+        from b12x.preparation.types import plan_from_handle
+
+        try:
+            plan = plan_from_handle(plan_handle)
+        except Exception:
+            plan = None
+        if plan is not None and register_tc_gemv_rope(plan, head_dim=head_dim, rope_dim=rope_dim):
+            entry = _TC_GEMV_ROPE_RUNNERS.get((plan_handle, head_dim, rope_dim))
+    if (entry is not None and source.stride(-1) == 1 and output.is_contiguous()
+            and angles.dtype == torch.float32 and angles.is_contiguous() and angles.shape[-1] == 64):
         runner, tc_flags = entry
         stream_handle = stream.cuda_stream if hasattr(stream, "cuda_stream") else stream
         runner(source, values, scales, output, angles,
