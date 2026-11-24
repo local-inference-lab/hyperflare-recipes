@@ -398,7 +398,9 @@ def test_qwen38_decoder_routes_ple_barrier_to_barrier_runtime(monkeypatch):
             value_proj=SimpleNamespace(weight=None),
         )
         return SimpleNamespace(
-            attn_hyper_connection=object(),
+            attn_hyper_connection=SimpleNamespace(
+                input_mix_weight_down=SimpleNamespace(weight=torch.empty((320, 10240)))
+            ),
             mlp_hyper_connection=object(),
             self_attn=object(),
             linear_attn=object(),

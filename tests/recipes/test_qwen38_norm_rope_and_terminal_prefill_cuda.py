@@ -35,8 +35,8 @@ def _requires_tp2():
 
 @pytest.mark.parametrize("q_heads,kv_heads", [(24, 2), (12, 1), (6, 1)])
 @pytest.mark.parametrize("tokens", [1, 7, 128, 512, 2048])
-def test_qk_head_norm_mrope_matches_canonical_bit_exact(q_heads, kv_heads, tokens):
-    """Fused Q/K RMSNorm + 3-axis interleaved MRoPE matches canonical PyTorch bit-for-bit."""
+def test_qk_head_norm_mrope_matches_canonical(q_heads, kv_heads, tokens):
+    """Fused Q/K RMSNorm + 3-axis interleaved MRoPE matches canonical PyTorch within BF16 rounding."""
     _requires_cuda()
     from transformers.models.qwen4_exp.modeling_qwen4_exp import (
         Qwen4ExpTextRMSNorm,
