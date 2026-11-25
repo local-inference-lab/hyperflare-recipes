@@ -155,3 +155,16 @@ def test_mini_rejects_undeclared_proposal_head_quantization():
                 ),
             ),
         )
+
+
+def test_mini_language_model_only_credits_vision_memory_to_kv_pages():
+    model = ResolvedModel(MINI_RECIPE, MINI_RECIPE.checkpoints[0])
+    vision_args = parse_args(["export", model.checkpoint.alias, "--no-mtp"], recipes=recipes())
+    lm_args = parse_args(["export", model.checkpoint.alias, "--no-mtp", "--language-model-only"], recipes=recipes())
+    vision_plan = derive(model=MINI_RECIPE, gpus=(gpu(0, 31),), selected=(0,),
+                         parameters=preparation.resolve_parameters(model, vision_args))
+    lm_plan = derive(model=MINI_RECIPE, gpus=(gpu(0, 31),), selected=(0,),
+                     parameters=preparation.resolve_parameters(model, lm_args))
+    assert vision_plan.fits and lm_plan.fits
+    assert lm_plan.pages > vision_plan.pages
+    assert vision_plan.graph_bytes - lm_plan.graph_bytes == 955_967_536 + 4 * 75_497_472

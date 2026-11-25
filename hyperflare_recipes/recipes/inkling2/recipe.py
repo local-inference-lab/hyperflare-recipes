@@ -72,6 +72,15 @@ RECIPE = Recipe(name="inkling2", served_model_name="Inkling-2-Small-NVFP4", prep
 # filter, and neutral penalties. The TML encoder supplies reasoning effort 0.9.
 MINI_SAMPLING_DEFAULTS = SamplingDefaults(temperature=1., top_p=1., top_k=-1)
 
+# Image feature slot: 16,384 BF16 vectors at Mini's language-model width 2,304.
+MINI_VISION_SLOT_BYTES = 16_384 * 2_304 * 2  # 75,497,472
+# Float32 patch upload and interpolation/position/counter buffers in VisionInputs.
+MINI_VISION_INPUT_BYTES = 318_767_152
+# Resident BF16 vision tower weights measured on RTX 5090 (vision=True - vision=False).
+MINI_VISION_TOWER_BYTES = 637_200_384
+# Fixed persistent vision storage credited back to KV pages under --language-model-only.
+MINI_VISION_BYTES = MINI_VISION_TOWER_BYTES + MINI_VISION_INPUT_BYTES
+
 MINI_RECIPE = replace(RECIPE, name="inkling2_mini", served_model_name="inkling-2-mini",
     sampling_defaults=MINI_SAMPLING_DEFAULTS,
     parameters=replace(RECIPE.parameters, max_concurrency_limit=8, prefill_chunk=8192,
@@ -83,6 +92,8 @@ MINI_RECIPE = replace(RECIPE, name="inkling2_mini", served_model_name="inkling-2
         )),
     checkpoints=(Checkpoint(alias="inkling-2-mini", repository="thinkingmachines/Inkling-2-Mini",
         revision="ed40e7da625f594fc9c4990f5f66be24873c22d7", architecture="Inkling2LoopForConditionalGeneration",
-        stored_bytes=19_525_870_752, device_bytes=20_263_810_112, draft_bytes=737_939_360),),
-    ranks=MappingProxyType({1: RankCosts(107_347_968, 2_621_440, 3 << 30)}),
-    plain_ranks=MappingProxyType({1: RankCosts(98_435_072, 2_097_152, 3 << 30)}))
+        stored_bytes=19_525_870_752, device_bytes=19_711_766_528, draft_bytes=776_215_552),),
+    ranks=MappingProxyType({1: RankCosts(107_347_968, 2_621_440, 3 << 30,
+        vision_bytes=MINI_VISION_BYTES, vision_slot_bytes=MINI_VISION_SLOT_BYTES)}),
+    plain_ranks=MappingProxyType({1: RankCosts(98_435_072, 2_097_152, 2 << 30,
+        vision_bytes=MINI_VISION_BYTES, vision_slot_bytes=MINI_VISION_SLOT_BYTES)}))
