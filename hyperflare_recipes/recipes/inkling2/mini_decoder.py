@@ -142,8 +142,19 @@ class PreparedLoopDecoder(PreparedDecoder):
             name=name + ".logit_gather").functional(session=session)
         self.head = SimpleNamespace(gather=SimpleNamespace(runtime=vocabulary_runtime))
         self.first_token = torch.full((1,), weights.rank * weights.embedding.shape[0], dtype=torch.int64, device=device)
-        self.auxiliary = (example("auxiliary", (tokens, len(weights.config.draft.taps), text.hidden))
-                          if weights.draft is not None else None)
+        self.context_capture = None
+        if weights.draft is not None and hasattr(weights.config.draft, "attention"):
+            from hyperflare_recipes.components.dflash2 import PreparedContextCapture
+
+            draft_cfg = weights.config.draft
+            self.context_capture = PreparedContextCapture(
+                metadata, text.hidden * len(draft_cfg.target_layers), draft_cfg.attention.window,
+                compact_prefill=(mode == "prefill"),
+            ).functional()
+            self.auxiliary = example("dflash_auxiliary", self.context_capture.shape)
+        else:
+            self.auxiliary = (example("auxiliary", (tokens, len(weights.config.draft.taps), text.hidden))
+                              if weights.draft is not None else None)
         self.local_logits = scratch.local_logits
         embedded = example("embedded", (tokens, text.hidden))
         self.embedding_norm = PreparedTorchRMSNorm(embedded, weights.embedding_norm, example("normalized_embedding", embedded.shape),
@@ -161,6 +172,8 @@ class PreparedLoopDecoder(PreparedDecoder):
             self.vision_state.inject(m, hidden)
         hidden = torch.where((m.positions >= 0)[:, None], hidden, 0)
         state, records, taps = ResidualState((), hidden), [], []
+        capture = self.context_capture.begin(m) if self.context_capture is not None else None
+        dflash_taps = () if self.context_capture is None else w.config.draft.target_layers
         prelude = cross_pass = None
         for visit, (layer, (index, pass_index)) in enumerate(zip(self.layers, self.visits, strict=True)):
             if t.loop is not None and index == t.loop.core_start:
@@ -170,17 +183,26 @@ class PreparedLoopDecoder(PreparedDecoder):
                     s0, s1 = (*state.blocks[len(prelude.blocks) + 1:], state.partial)
                     cross_pass = self.cross_pass_router(s0, s1)
                     state = prelude
-            if w.draft is not None and visit in w.config.draft.taps:
+            if self.context_capture is not None:
+                if visit in dflash_taps:
+                    self.context_capture(capture, state.partial, dflash_taps.index(visit) * t.hidden)
+            elif w.draft is not None and visit in w.config.draft.taps:
                 taps.append(state.partial)
             state, record = layer(state, m, cross_pass if pass_index > 0 else None)
             if self.mode == "verify":
                 records.append(record)
             del record
         normalized = self.output_mix((*state.blocks, state.partial))[0]
-        if w.draft is not None:
-            taps.append(normalized)
+        if self.context_capture is not None:
+            final_tap = len(self.visits)
+            if final_tap in dflash_taps:
+                self.context_capture(capture, normalized, dflash_taps.index(final_tap) * t.hidden)
+            auxiliary = capture[0]
+        else:
+            if w.draft is not None:
+                taps.append(normalized)
+            auxiliary = torch.stack(taps, dim=1) if taps else None
         sampled_hidden = normalized[m.sample_indices]
         local = self.logits(sampled_hidden)
         logits = local if self.vocabulary_parallel else self.gather(local.view(torch.bfloat16)).view(torch.float32)[:, :t.valid_vocabulary].contiguous()
-        auxiliary = torch.stack(taps, dim=1) if taps else None
         return sampled_hidden, logits, auxiliary, tuple(records)

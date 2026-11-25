@@ -35,7 +35,8 @@ class DFlash2Config:
         return cls.from_dict(json.loads((Path(snapshot) / "config.json").read_text()), **kwargs)
 
     @classmethod
-    def from_dict(cls, text, *, target_hidden, target_vocabulary, target_layers, expected):
+    def from_dict(cls, text, *, target_hidden, target_vocabulary, target_layers, expected,
+                  allow_final_norm_tap=False):
         required = dict(model_type="qwen3", architectures=["DFlash2DraftModel"], hidden_act="silu",
             dtype="bfloat16", attention_bias=False, attention_dropout=0., tie_word_embeddings=False,
             use_sliding_window=True, is_causal=False)
@@ -63,15 +64,34 @@ class DFlash2Config:
                 or text.get("num_target_layers") != target_layers):
             raise ValueError("DFlash2 draft does not match the target model")
         taps = options.get("target_layer_ids", [])
-        if (not taps or any(type(index) is not int or not 0 <= index < target_layers for index in taps)
-                or taps != sorted(set(taps))):
+        max_tap = target_layers if allow_final_norm_tap else target_layers - 1
+        if (not taps or any(type(index) is not int or not 0 <= index <= max_tap for index in taps)
+                or taps != sorted(set(taps))
+                or (allow_final_norm_tap and taps[-1] != target_layers)):
             raise ValueError("DFlash2 target layers must be distinct ordered decoder indices")
         if not 0 <= options.get("mask_token_id", -1) < target_vocabulary:
             raise ValueError("DFlash2 mask token must belong to the target vocabulary")
-        for name, value in (("output_multiplier", 1.), ("final_logit_softcapping", None)):
-            if text.get(name, value) != value or options.get(name, value) != value:
-                raise ValueError("unsupported DFlash2 output transform")
+        expected_options = expected.get("dflash_config", {})
+        expected_softcap = expected_options.get("final_logit_softcapping", None)
+        expected_mode = expected_options.get("selector_softcap_mode", "before_correction")
+        if text.get("output_multiplier", 1.) != 1. or options.get("output_multiplier", 1.) != 1.:
+            raise ValueError("unsupported DFlash2 output transform")
+        if text.get("final_logit_softcapping", None) not in (None, expected_softcap):
+            raise ValueError("unsupported DFlash2 output transform")
+        if options.get("final_logit_softcapping", None) != expected_softcap:
+            raise ValueError("unsupported DFlash2 output transform")
+        mode = options.get("selector_softcap_mode", "before_correction")
+        if mode not in ("before_correction", "after_correction") or mode != expected_mode:
+            raise ValueError("unsupported DFlash2 selector softcap mode")
         return cls(text)
+
+    @property
+    def final_logit_softcapping(self):
+        return self.text.get("dflash_config", {}).get("final_logit_softcapping")
+
+    @property
+    def selector_softcap_mode(self):
+        return self.text.get("dflash_config", {}).get("selector_softcap_mode", "before_correction")
 
     @property
     def layers(self):

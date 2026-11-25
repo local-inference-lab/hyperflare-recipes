@@ -57,11 +57,15 @@ class RankGeometry:
         return PAGE_TOKENS * self.kv_heads * self.head_dim * KV_DTYPE.itemsize
 
 
+def _is_dflash2(draft) -> bool:
+    return draft is not None and hasattr(draft, "attention")
+
+
 def page_specs(text, geometry: RankGeometry, draft=None):
     for layer in text.global_layers:
         for kind in ("key", "value"):
             yield f"layer{layer}.{kind}", (geometry.page_bytes,)
-    if draft is not None:
+    if draft is not None and not _is_dflash2(draft):
         for layer in range(draft.layers):
             if layer not in draft.local_layers:
                 for kind in ("key", "value"):
@@ -84,11 +88,18 @@ def continuation_layout(text, geometry: RankGeometry, draft=None):
             regions.append((f"layer{layer}.{kind}", (history, channels), torch.bfloat16))
     regions.extend((name, shape, torch.uint8) for name, shape in page_specs(text, geometry, draft))
     if draft is not None:
-        for layer in sorted(draft.local_layers):
-            for kind in ("key", "value"):
-                regions.append((f"draft{layer}.{kind}",
-                                (draft.window, geometry.kv_heads, geometry.head_dim), torch.bfloat16))
-        regions.append(("draft.rnn_context", (geometry.hidden,), torch.bfloat16))
+        if _is_dflash2(draft):
+            world = text.kv_heads // geometry.kv_heads
+            kv_heads = draft.attention.kv_heads // world
+            for layer in range(draft.layers):
+                for kind, width in (("key", draft.attention.key_dim), ("value", draft.attention.value_dim)):
+                    regions.append((f"draft{layer}.{kind}", (draft.attention.window, kv_heads, width), KV_DTYPE))
+        else:
+            for layer in sorted(draft.local_layers):
+                for kind in ("key", "value"):
+                    regions.append((f"draft{layer}.{kind}",
+                                    (draft.window, geometry.kv_heads, geometry.head_dim), torch.bfloat16))
+            regions.append(("draft.rnn_context", (geometry.hidden,), torch.bfloat16))
     regions.extend((("last_hidden", (geometry.hidden,), torch.bfloat16), ("consumed_tokens", (1,), torch.int64)))
     layout = StateLayout.from_specs(regions)
     # Ring pages of adjacent rows share one page stride when rows hold whole pages.

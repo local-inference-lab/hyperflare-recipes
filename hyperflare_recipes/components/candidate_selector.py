@@ -9,8 +9,9 @@ from .linear import UnquantizedProjection
 
 
 class PreparedCandidateSelector:
-    def __init__(self, hidden, weights, *, top_k, session, name):
-        self.weights, self.top_k = weights, top_k
+    def __init__(self, hidden, weights, *, top_k, session, name, post_softcap=None, valid_vocabulary=None):
+        self.weights, self.top_k, self.post_softcap = weights, top_k, post_softcap
+        self.valid_vocabulary = valid_vocabulary
         self.projected = torch.zeros((*hidden.shape[:-1], weights["projection"].shape[0]),
                                      dtype=hidden.dtype, device=hidden.device)
         self.unary = torch.empty((*hidden.shape[:-1], top_k), dtype=torch.float32, device=hidden.device)
@@ -56,8 +57,12 @@ class PreparedCandidateSelector:
         coded = self.weights["predecessor"][predecessor] * self.projected[:, position]
         successors = self.weights["successor"][ids]
         correction = torch.bmm(successors, coded.unsqueeze(-1)).squeeze(-1)
+        scores = unary + correction.float()
+        cap = getattr(self, "post_softcap", None)
+        if cap is not None:
+            scores = torch.where(torch.isfinite(scores), cap * torch.tanh(scores / cap), scores)
         logits.fill_(-torch.inf)
-        logits.scatter_(1, ids, unary + correction.float())
+        logits.scatter_(1, ids, scores)
 
     def apply_shortlist(self, logits, predecessor, position, selector_features=None, unary=None, ids=None):
         if not self.functional_mode:
@@ -79,13 +84,23 @@ class PreparedCandidateSelector:
         coded = self.weights["predecessor"][predecessor] * selector_features[:, position]
         row_ids = ids[:, position]
         vocab = self.weights["successor"].shape[0]
-        valid = (row_ids >= 0) & (row_ids < vocab)
+        valid_limit = getattr(self, "valid_vocabulary", None)
+        limit = vocab if valid_limit is None else min(vocab, valid_limit)
+        valid = (row_ids >= 0) & (row_ids < limit)
         successors = self.weights["successor"][row_ids.clamp(0, vocab - 1)]
         correction = torch.bmm(successors, coded.unsqueeze(-1)).squeeze(-1)
-        return torch.where(valid, unary[:, position] + correction.float(), -torch.inf)
+        scores = unary[:, position] + correction.float()
+        cap = getattr(self, "post_softcap", None)
+        if cap is not None:
+            scores = torch.where(torch.isfinite(scores), cap * torch.tanh(scores / cap), scores)
+        return torch.where(valid, scores, -torch.inf)
 
     def _functional_correct(self, logits, predecessor, position, selector_features, unary, ids):
         coded = self.weights["predecessor"][predecessor] * selector_features
         successors = self.weights["successor"][ids]
         correction = torch.bmm(successors, coded.unsqueeze(-1)).squeeze(-1)
-        return torch.full_like(logits, -torch.inf).scatter_(1, ids, unary + correction.float())
+        scores = unary + correction.float()
+        cap = getattr(self, "post_softcap", None)
+        if cap is not None:
+            scores = torch.where(torch.isfinite(scores), cap * torch.tanh(scores / cap), scores)
+        return torch.full_like(logits, -torch.inf).scatter_(1, ids, scores)

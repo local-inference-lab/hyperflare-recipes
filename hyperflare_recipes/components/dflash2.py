@@ -327,7 +327,11 @@ class PreparedDraft:
                  coordinator, session, name, workspace, embedding, head,
                  output_multiplier, final_logit_softcapping, examples=None,
                  convolution_runtime=None, templates=None, attention_factory=DraftAttention,
-                 shortlist_only=False, shortlist_runtime=None):
+                 shortlist_only=False, shortlist_runtime=None,
+                 selector_softcap_mode="before_correction", valid_vocabulary=None,
+                 embedding_norm_weight=None):
+        if selector_softcap_mode not in ("before_correction", "after_correction"):
+            raise ValueError(f"unsupported DFlash2 selector softcap mode: {selector_softcap_mode!r}")
         self.logit_shape = scratch.logit_shape
         self.logit_dtype, self.local_logit_dtype = torch.float32, torch.bfloat16
         self.local_logit_shape = (scratch.tokens, scratch.local_vocabulary_size)
@@ -357,6 +361,8 @@ class PreparedDraft:
             self.layers.append((_norm(layer.input_norm, c.text["rms_norm_eps"]), conv["attention_conv"], attention,
                 _norm(layer.post_attention_norm, c.text["rms_norm_eps"]), conv["mlp_conv"], mlp, reduction))
         self.norm = _norm(weights.draft.norm, c.text["rms_norm_eps"])
+        self.embedding_norm = (None if embedding_norm_weight is None
+                               else _norm(embedding_norm_weight, c.text["rms_norm_eps"]))
         self.top_k = c.text["dflash_config"]["selector_top_k"]
         self.world_size = weights.shard.world_size
         self.shortlist_output = bool(shortlist_only)
@@ -386,14 +392,16 @@ class PreparedDraft:
             self.vocab_offset = None
             self.shortlist_cols = 0
             self.shortlist_gather = None
+        post_softcap = final_logit_softcapping if selector_softcap_mode == "after_correction" else None
+        valid_vocab = scratch.vocabulary_size if valid_vocabulary is None else valid_vocabulary
         self.selector = PreparedCandidateSelector(s.hidden.view(-1, scratch.block_size, s.hidden.shape[-1]),
             weights.draft.selector, top_k=self.top_k, session=session,
-            name=name + ".selector").functional(session=session)
+            name=name + ".selector", post_softcap=post_softcap, valid_vocabulary=valid_vocab).functional(session=session)
         self.block_size = scratch.block_size
         self.hidden_size = scratch.hidden_size
-        self.vocabulary_size = scratch.vocabulary_size
+        self.vocabulary_size = valid_vocab
         self.multiplier = output_multiplier
-        self.softcap = final_logit_softcapping
+        self.softcap = final_logit_softcapping if selector_softcap_mode == "before_correction" else None
 
     def release_outputs(self):
         return self
@@ -443,6 +451,8 @@ class PreparedDraft:
     def forward(self, metadata):
         m = metadata
         embedding = self.embedding(token_ids=m.token_ids, num_rows=m.live_counts[:1])
+        if getattr(self, "embedding_norm", None) is not None:
+            embedding = self.embedding_norm(embedding)
         for norm, conv, attention, post_norm, mlp_conv, mlp, reduce in self.layers:
             normalized = norm(embedding)
             attention_input, attention_coefficients = conv.prepare(normalized)
