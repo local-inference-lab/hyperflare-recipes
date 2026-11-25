@@ -16,7 +16,9 @@ from ignition.components.engram import EngramInputs, PreparedEngramLookup, Prepa
 from ignition.components.readiness import ReadinessTimings
 from hyperflare_recipes.components.embedding_partition import EmbeddingHeadPartition
 from hyperflare_recipes.components.linear import QuantizedProjection
-from ignition.components.collectives import PreparedAllGather, PreparedChunkedAllReduce
+from ignition.components.collectives import (
+    PreparedAllGather, PreparedChunkedAllReduce, PreparedGatherShards, row_shard_surfaces,
+)
 from ignition.components.state import gather_rows, save_hidden
 from ignition.preparation.runtime_core import FileSource
 from ignition.preparation.persistent import persistent_copy
@@ -221,52 +223,93 @@ class PreparedEngram:
             layer=layer, token_map=tables.token_map, geometry=tables.geometry,
             session=session, name=name + ".lookup", runtime=tables.readiness_runtime, coordinator=coordinator).functional(session=session)
         from b12x.comm import pcie
-        # For prefills >= 512 tokens on local PCIe DMA runtimes, gather the 6144-col
-        # Engram activations first and run one full projection (`projection_full`).
+        # For prefills >= 512 tokens on local PCIe DMA runtimes (and RoCE row-sharded
+        # prefills with full projection), gather the 6144-col Engram activations first
+        # and run one full projection (`projection_full`).
         # Note: the full projection accumulates across all 24 heads in FP32 before a
         # single BF16 round, whereas the sharded <512-token path rounds each rank's
         # partial sum to BF16 before the all-reduce. The two paths share identical
         # weights/precision but are not bit-identical across the 512-token boundary.
-        self.use_all_gather = (
+        is_dma = isinstance(runtime, pcie.DmaAllReduce)
+        use_roce_gather = (
             self.sharded
-            and isinstance(runtime, pcie.DmaAllReduce)
+            and not is_dma
+            and row_shard is not None
+            and row_shard_surfaces(runtime)
             and "projection_full" in weights
             and tokens >= 512
         )
+        self.use_all_gather = (
+            self.sharded
+            and "projection_full" in weights
+            and tokens >= 512
+            and (is_dma or use_roce_gather)
+        )
+        self.world = tables.shard.world_size
+        self.local_cols = 6144 // self.world
         self.row_shard = True if (row_shard is not None and self.use_all_gather) else None
         if self.row_shard is not None:
-            rank, half_tokens, shard_rows = row_shard
-            if 2 * half_tokens != tokens or shard_rows <= 0 or rank < 0 or (rank + 1) * shard_rows > half_tokens:
-                raise ValueError("Engram row shard must partition both microbatch halves within the chunk")
-            s0 = rank * shard_rows
-            self.row_shard_indices = persistent_copy(torch.cat((
-                torch.arange(s0, s0 + shard_rows, dtype=torch.int64, device=device),
-                torch.arange(half_tokens + s0, half_tokens + s0 + shard_rows, dtype=torch.int64, device=device),
-            )))
-            mix_tokens = 2 * shard_rows
+            if len(row_shard) == 3:
+                rank, half_tokens, shard_rows = row_shard
+                if 2 * half_tokens != tokens or shard_rows <= 0 or rank < 0 or (rank + 1) * shard_rows > half_tokens:
+                    raise ValueError("Engram row shard must partition both microbatch halves within the chunk")
+                s0 = rank * shard_rows
+                self.row_shard_indices = persistent_copy(torch.cat((
+                    torch.arange(s0, s0 + shard_rows, dtype=torch.int64, device=device),
+                    torch.arange(half_tokens + s0, half_tokens + s0 + shard_rows, dtype=torch.int64, device=device),
+                )))
+                mix_tokens = 2 * shard_rows
+            elif len(row_shard) == 2:
+                rank, shard_rows = row_shard
+                if shard_rows <= 0 or rank < 0 or (rank + 1) * shard_rows > tokens or shard_rows * self.world != tokens:
+                    raise ValueError("Engram row shard must partition the chunk evenly across ranks")
+                s0 = rank * shard_rows
+                self.row_shard_indices = persistent_copy(
+                    torch.arange(s0, s0 + shard_rows, dtype=torch.int64, device=device)
+                )
+                mix_tokens = shard_rows
+            else:
+                raise ValueError("Engram row shard must be (rank, shard_rows) or (rank, half_tokens, shard_rows)")
         else:
             self.row_shard_indices = None
             mix_tokens = tokens
         self.gather_parts = ()
         self.gather_bounds = ()
         if self.use_all_gather:
-            world = tables.shard.world_size
-            local_cols = 6144 // world
-            max_rows = runtime.shard_capacity // (local_cols * 2)
-            if max_rows < 1:
-                raise ValueError("DMA runtime shard capacity is too small for Engram all-gather")
-            chunks = max(1, (tokens + max_rows - 1) // max_rows)
-            step = (tokens + chunks - 1) // chunks
-            self.gather_bounds = tuple((start, min(start + step, tokens)) for start in range(0, tokens, step))
-            self.gather_parts = tuple(
-                PreparedAllGather(
-                    self.local[begin:end],
-                    self.gathered[begin:end].view(world, end - begin, local_cols),
-                    runtime=runtime, session=session, coordinator=coordinator,
-                    name=name + ".gather" if len(self.gather_bounds) == 1 else f"{name}.gather.{index}",
+            world = self.world
+            local_cols = self.local_cols
+            if is_dma:
+                max_rows = runtime.shard_capacity // (local_cols * 2)
+                if max_rows < 1:
+                    raise ValueError("DMA runtime shard capacity is too small for Engram all-gather")
+                chunks = max(1, (tokens + max_rows - 1) // max_rows)
+                step = (tokens + chunks - 1) // chunks
+                self.gather_bounds = tuple((start, min(start + step, tokens)) for start in range(0, tokens, step))
+                self.gather_parts = tuple(
+                    PreparedAllGather(
+                        self.local[begin:end],
+                        self.gathered[begin:end].view(world, end - begin, local_cols),
+                        runtime=runtime, session=session, coordinator=coordinator,
+                        name=name + ".gather" if len(self.gather_bounds) == 1 else f"{name}.gather.{index}",
+                    )
+                    for index, (begin, end) in enumerate(self.gather_bounds)
                 )
-                for index, (begin, end) in enumerate(self.gather_bounds)
-            )
+            else:
+                max_rows = runtime.pipe_bytes // (world * local_cols * 2)
+                if max_rows < 1:
+                    raise ValueError("RoCE runtime pipe capacity is too small for Engram shard gather")
+                chunks = max(1, (tokens + max_rows - 1) // max_rows)
+                step = (tokens + chunks - 1) // chunks
+                self.gather_bounds = tuple((start, min(start + step, tokens)) for start in range(0, tokens, step))
+                self.gather_parts = tuple(
+                    PreparedGatherShards(
+                        self.local[begin:end],
+                        self.gathered[begin:end].view(world * (end - begin), local_cols),
+                        runtime=runtime, session=session, coordinator=coordinator,
+                        name=name + ".gather" if len(self.gather_bounds) == 1 else f"{name}.gather.{index}",
+                    )
+                    for index, (begin, end) in enumerate(self.gather_bounds)
+                )
             if not defer_reduce_functional:
                 for part in self.gather_parts:
                     part.functional(session=session)
@@ -298,7 +341,10 @@ class PreparedEngram:
         return torch.index_select(gathered, 1, self.columns) if self.sharded else gathered
 
     def project_gathered(self, gathered_chunks):
-        reordered = [chunk.permute(1, 0, 2).reshape(chunk.shape[1], 6144) for chunk in gathered_chunks]
+        reordered = [
+            chunk.view(self.world, -1, self.local_cols).permute(1, 0, 2).reshape(-1, 6144)
+            for chunk in gathered_chunks
+        ]
         full = reordered[0].contiguous() if len(reordered) == 1 else torch.cat(reordered, dim=0)
         if self.row_shard_indices is not None:
             full = torch.index_select(full, 0, self.row_shard_indices)

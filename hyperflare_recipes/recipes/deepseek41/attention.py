@@ -14,6 +14,7 @@ from b12x.attention import mla_compress
 from b12x.preparation import PreparedCall
 
 from hyperflare_recipes.components import sm103_projection
+from ignition.components.collectives import PreparedGatherShards
 from hyperflare_recipes.components.compressed_mla import PreparedCompressedCacheWriter, PreparedCompressedMLA
 from hyperflare_recipes.components.attention_output import PreparedGroupedOutputProjection
 from hyperflare_recipes.components.linear import QuantizedProjection, UnquantizedProjection
@@ -27,6 +28,7 @@ from hyperflare_recipes.components.projection_overlap import (
 from hyperflare_recipes.components.rms_norm import PreparedRMSNorm
 from ignition.components.state import gather_rows, gather_rows_three, save_hidden
 from hyperflare_recipes.components.window_indices import PreparedWindowIndices, WindowIndices
+from ignition.preparation.examples import declaration_tensor
 from ignition.preparation.persistent import persistent_copy
 from ignition.preparation.tensor_metadata import record_numeric_tensor
 from ignition.preparation.tuning import declare, register_finalizer
@@ -222,53 +224,76 @@ class AttentionScratch:
     normalized_keys: torch.Tensor
 
     @classmethod
-    def allocate(cls, tokens, world, device, *, candidate_tokens=None):
+    def allocate(cls, tokens, world, device, *, candidate_tokens=None, shard_rows=None, examples=None):
         candidate_tokens = tokens if candidate_tokens is None else candidate_tokens
         if type(candidate_tokens) is not int or not 0 < candidate_tokens <= tokens:
             raise ValueError("candidate row capacity must fit the attention token capacity")
-        def zeros(shape, dtype=torch.bfloat16):
+        def alloc(role, shape, dtype=torch.bfloat16):
+            if examples is not None:
+                return declaration_tensor(examples, role, shape, dtype, device)
             return torch.zeros(shape, dtype=dtype, device=device)
         first, last = TensorParallelShard(0, world).padded_partition(8)
-        heads = (last - first) * 8
-        return cls(zeros((tokens, 1792)),
-            zeros((tokens, 1280)), zeros((tokens, heads, 512)),
-            zeros((tokens, 512)), zeros((tokens, heads, 512)),
-            zeros((tokens, 5120)), zeros((tokens, 512), torch.int32).fill_(-1),
-            zeros((candidate_tokens, 16384), torch.int32).fill_(-1), zeros(candidate_tokens, torch.int32),
-            zeros((tokens, 32, 128)), zeros((tokens, 32)), zeros((tokens, 128)), zeros((tokens, 128)))
+        if shard_rows is not None:
+            rows, candidates, heads = shard_rows, min(candidate_tokens, shard_rows), 64
+        else:
+            rows, candidates, heads = tokens, candidate_tokens, (last - first) * 8
+        return cls(alloc("attn.projected", (rows, 1792)),
+            alloc("attn.query_low", (rows, 1280)), alloc("attn.query", (rows, heads, 512)),
+            alloc("attn.window_values", (rows, 512)), alloc("attn.attended", (rows, heads, 512)),
+            alloc("attn.output", (rows, 5120)),
+            alloc("attn.selected", (rows, 512), torch.int32).fill_(-1),
+            alloc("attn.candidates", (candidates, 16384), torch.int32).fill_(-1),
+            alloc("attn.candidate_counts", (candidates,), torch.int32),
+            alloc("attn.index_query", (rows, 32, 128)), alloc("attn.index_weights", (rows, 32)),
+            alloc("attn.index_keys", (tokens, 128)), alloc("attn.normalized_keys", (tokens, 128)))
 
 
 class PreparedCompressor:
-    def __init__(self, layer, weights, source, metadata, pool, slots, *, session, name, deferred=False):
+    def __init__(self, layer, weights, source, metadata, pool, slots, *, session, name, deferred=False,
+                 row_shard=False, runtime=None, coordinator=None):
         self.pool, self.layer = pool, layer
         self.weight = weights["norm"]
         self.deferred = deferred
         ratio = pool.config.text["compress_ratios"][layer]
         self.ratio = ratio
         tokens, rows = source.shape[0], metadata.starts.numel()
+        total = metadata.positions.numel() if row_shard else tokens
+        self.total = total
         device = source.device
+        dtype = torch.float32 if ratio == 2 else torch.bfloat16
         def zeros(shape, dtype):
             return torch.zeros(shape, device=device, dtype=dtype)
-        self.values = zeros((tokens, 512), torch.float32 if ratio == 2 else torch.bfloat16)
-        self.project_values = UnquantizedProjection(source, weights["values"], self.values,
+        self.values = zeros((total, 512), dtype)
+        self.local_values = zeros((tokens, 512), dtype) if row_shard else self.values
+        self.values_gather = (PreparedGatherShards(
+            self.local_values.view(torch.bfloat16), self.values.view(torch.bfloat16),
+            runtime=runtime, session=session, coordinator=coordinator, name=f"{name}.values_gather")
+            if row_shard else None)
+        self.project_values = UnquantizedProjection(source, weights["values"], self.local_values,
             session=session, name=f"{name}.values").functional(session=session)
-        self.output = zeros((tokens, 512), torch.bfloat16)
-        self.emitted = zeros(tokens, torch.bool)
-        self.slots = zeros(tokens, torch.int64).fill_(-1)
+        self.output = zeros((total, 512), torch.bfloat16)
+        self.emitted = zeros(total, torch.bool)
+        self.slots = zeros(total, torch.int64).fill_(-1)
         self.state_ids = persistent_copy(torch.arange(rows, dtype=torch.int64, device=device))
         record_numeric_tensor(self.state_ids)
         self.arguments = dict(values=self.values, weight=weights["norm"], query_start_loc=metadata.query_start_loc,
             positions=metadata.starts, state_ids=self.state_ids, destination_slots=slots,
             live_counts=metadata.live_counts, out=self.output, emitted=self.emitted, emitted_slots=self.slots)
+        self.gates_gather = None
         if ratio == 2:
             self.gates = zeros(self.values.shape, self.values.dtype)
-            self.project_gates = UnquantizedProjection(source, weights["gates"], self.gates,
+            self.local_gates = zeros(self.local_values.shape, dtype) if row_shard else self.gates
+            self.gates_gather = (PreparedGatherShards(
+                self.local_gates.view(torch.bfloat16), self.gates.view(torch.bfloat16),
+                runtime=runtime, session=session, coordinator=coordinator, name=f"{name}.gates_gather")
+                if row_shard else None)
+            self.project_gates = UnquantizedProjection(source, weights["gates"], self.local_gates,
                 session=session, name=f"{name}.gates").functional(session=session)
             self.pending = {key: zeros((rows, 512) if key != "pending_position" else (rows,),
                 torch.float32 if key != "pending_position" else torch.int64)
                 for key in ("pending_values", "pending_gates", "pending_position")}
             self.arguments.update(gates=self.gates, **self.pending)
-        self.plan = mla_compress.plan(mla_compress.Caps(device=device, max_tokens=tokens,
+        self.plan = mla_compress.plan(mla_compress.Caps(device=device, max_tokens=total,
             max_requests=rows, max_states=rows, ratio=ratio))
 
         declaration = self.arguments
@@ -276,9 +301,9 @@ class PreparedCompressor:
         def prepare(state):
             arguments = {key: value if key in ("weight", "state_ids") else torch.zeros_like(value)
                          for key, value in declaration.items()}
-            arguments["query_start_loc"].copy_(torch.arange(rows + 1, device=device) * tokens // rows)
-            arguments["live_counts"].copy_(torch.tensor([tokens, rows], dtype=torch.int32, device=device))
-            arguments["destination_slots"].copy_(torch.arange(tokens, device=device))
+            arguments["query_start_loc"].copy_(torch.arange(rows + 1, device=device) * total // rows)
+            arguments["live_counts"].copy_(torch.tensor([total, rows], dtype=torch.int32, device=device))
+            arguments["destination_slots"].copy_(torch.arange(total, device=device))
             if ratio == 2:
                 arguments["pending_position"].fill_(-1)
             binding = state.bind(**arguments)
@@ -287,20 +312,25 @@ class PreparedCompressor:
         declare(session, (self.plan.request(name=name, prepare_call=prepare),))
     def functional(self, *, session):
         register_finalizer(session, self.release_examples)
+        if self.values_gather is not None:
+            self.values_gather.functional(session=session)
+        if self.gates_gather is not None:
+            self.gates_gather.functional(session=session)
         return self
 
     def release_examples(self):
-        self.values = self.output = self.emitted = self.slots = self.arguments = None
+        self.values = self.local_values = self.output = self.emitted = self.slots = self.arguments = None
         if self.ratio == 2:
-            self.gates = self.pending = None
+            self.gates = self.local_gates = self.pending = None
 
     def __call__(self, source, metadata, slots):
         from b12x.attention.mla_compress._impl import _run_ratio1, _run_ratio2
 
         m = metadata
-        output = torch.empty((source.shape[0], 512), dtype=torch.bfloat16, device=source.device)
-        emitted = torch.empty(source.shape[0], dtype=torch.bool, device=source.device)
-        emitted_slots = torch.empty((source.shape[0],), dtype=torch.int64, device=source.device)
+        total = self.total
+        output = torch.empty((total, 512), dtype=torch.bfloat16, device=source.device)
+        emitted = torch.empty(total, dtype=torch.bool, device=source.device)
+        emitted_slots = torch.empty((total,), dtype=torch.int64, device=source.device)
         state_ids = self.state_ids
         gates = None
         if self.ratio == 2:
@@ -310,7 +340,11 @@ class PreparedCompressor:
             gather_rows_three(tuple(self.pool.region(f"layer{self.layer}.{key}") for key in pending),
                               m.state_rows, tuple(pending.values()))
             gates = self.project_gates(source)
+            if self.gates_gather is not None:
+                gates = self.gates_gather(gates.view(torch.bfloat16)).view(torch.float32)
             values = self.project_values(source)
+            if self.values_gather is not None:
+                values = self.values_gather(values.view(torch.bfloat16)).view(torch.float32)
             _run_ratio2(self.plan.handle, values, gates, self.weight, m.query_start_loc, m.starts,
                 state_ids, slots, m.live_counts, *pending.values(), output, emitted, emitted_slots)
             if not self.deferred:
@@ -319,6 +353,8 @@ class PreparedCompressor:
                                 m.state_rows, m.lengths > 0)
         else:
             values = self.project_values(source)
+            if self.values_gather is not None:
+                values = self.values_gather(values.view(torch.bfloat16))
             _run_ratio1(self.plan.handle, values, self.weight, m.query_start_loc, m.starts,
                        state_ids, slots, m.live_counts, output, emitted, emitted_slots)
         return output, emitted_slots, (values, gates)
@@ -328,7 +364,7 @@ class PreparedCompressor:
             return
         m = metadata
         values, gates = records
-        last = (m.query_start_loc[:-1] + counts - 1).long().clamp(0, values.shape[0] - 1)
+        last = (m.query_start_loc[:-1] + counts - 1).long().clamp(0, self.total - 1)
         position = m.starts + counts - 1
         pending = (counts > 0) & (position % 2 == 0)
         for key, source in (("pending_values", values), ("pending_gates", gates)):
@@ -341,15 +377,17 @@ class PreparedGlobalKV:
     """Project and store every source row before decoder queries are packed."""
 
     def __init__(self, layer, weights, source, scratch, metadata, pool, rotary, *,
-                 session, name, indices, deferred=False):
+                 session, name, indices, deferred=False, row_shard=False, runtime=None, coordinator=None):
         self.rotary = rotary
         self.ratio = pool.config.text["compress_ratios"][layer]
-        if indices.metadata is not metadata or indices.position.shape != (source.shape[0],):
+        total = metadata.positions.numel() if row_shard else source.shape[0]
+        if indices.metadata is not metadata or indices.position.shape != (total,):
             raise ValueError("global KV indices must describe every source row")
         slots = indices.compressed(self.ratio).slots
         self.angles = indices.rotary_angles(rotary, compressed=True, ratio=self.ratio)
         self.compressor = PreparedCompressor(layer, weights["compressor"], source, metadata,
-            pool, slots, session=session, name=f"{name}.compress", deferred=deferred)
+            pool, slots, session=session, name=f"{name}.compress", deferred=deferred,
+            row_shard=row_shard, runtime=runtime, coordinator=coordinator)
         self.index_key = UnquantizedProjection(self.compressor.output, weights["index_k"], scratch.index_keys,
             session=session, name=f"{name}.index_key").functional(session=session)
         self.eps = pool.config.text["rms_norm_eps"]
@@ -403,7 +441,7 @@ class PreparedAttention:
     def __init__(self, layer, weights, source, scratch, metadata, pool, rotary, *, mode,
                  world, session, name, workspace, replay_start=None, window_staging=None,
                  mla_compute_mode="auto", window_metadata=None, examples=None, pipelined_mode=None,
-                 qkv_encoded=None):
+                 qkv_encoded=None, shard_rows=None, window_target=None, runtime=None, coordinator=None):
         self.layer, self.weights, self.scratch, self.metadata = layer, weights, scratch, metadata
         self.pool, self.rotary, self.mode = pool, rotary, mode
         self.replay_start = replay_start
@@ -413,6 +451,8 @@ class PreparedAttention:
             raise ValueError("full pipelined attention requires a non-source, non-indexer layer")
         if qkv_encoded is not None and pipelined_mode != "full":
             raise ValueError("preencoded qkv_a requires full pipelined attention")
+        if shard_rows is not None and pipelined_mode is not None:
+            raise ValueError("row-sharded attention cannot be combined with half-chunk pipelined attention")
         self.pipelined_mode = pipelined_mode
         config = pool.config
         draft = mode == "draft"
@@ -420,6 +460,10 @@ class PreparedAttention:
         self.source = None if draft else config.source(layer)
         self.eps = config.text["rms_norm_eps"]
         tokens, device = source.shape[0], source.device
+        sharded = shard_rows is not None
+        total = metadata.positions.numel() if sharded else tokens
+        self.shard_rows = shard_rows
+        self.total = total
         if pipelined_mode is not None and (tokens < 2 or tokens % 2 != 0):
             raise ValueError("pipelined attention requires an even token capacity >= 2")
         self.half_tokens = tokens // 2
@@ -442,32 +486,38 @@ class PreparedAttention:
         window_width = self.window_page_size if draft else 128
         self.owns_window_metadata = window_metadata is None
         if window_metadata is None:
-            window_metadata = AttentionIndices(metadata, mode=mode, tokens=tokens,
+            window_metadata = AttentionIndices(metadata, mode=mode, tokens=total,
                 page_size=self.window_page_size, width=window_width, replay_start=replay_start,
                 ratios=(self.ratio,) if self.ratio else ())
         elif (window_metadata.metadata is not metadata or window_metadata.mode != mode
                 or window_metadata.window_page_size != self.window_page_size
-                or window_metadata.window_indices.shape != (tokens, window_width)
+                or window_metadata.window_indices.shape != (total, window_width)
                 or window_metadata.replay_start is not replay_start or window_metadata.visible is not None
                 or not isinstance(window_metadata, AttentionIndices)):
             raise ValueError("shared window indices must match the attention metadata and cache geometry")
         self.window_metadata = window_metadata
         self.window_slots = window_metadata.window_slots
-        self.window_indices = window_metadata.window_indices
-        self.window_lengths = window_metadata.window_lengths
-        self.token_offsets = window_metadata.token_offsets
+        self.window_indices = window_metadata.window_indices[:tokens] if sharded else window_metadata.window_indices
+        self.window_lengths = window_metadata.window_lengths[:tokens] if sharded else window_metadata.window_lengths
+        self.token_offsets = window_metadata.token_offsets[:tokens] if sharded else window_metadata.token_offsets
         self.angles = window_metadata.rotary_angles(rotary, compressed=bool(self.ratio), ratio=0)
         self.index_angles = (window_metadata.rotary_angles(rotary, compressed=True, ratio=0)
                              if "index_q" in weights else None)
         geometry = window_metadata.compressed(self.ratio) if self.ratio else None
-        self.lengths = zeros(tokens, torch.int32) if geometry is None else geometry.lengths
+        self.lengths = (zeros(tokens, torch.int32) if geometry is None
+                        else (geometry.lengths[:tokens] if sharded else geometry.lengths))
         self.active_width = zeros(1, torch.int32) if geometry is None else geometry.active_width
-        self.index_lengths = zeros(tokens, torch.int32) if geometry is None else geometry.index_lengths
-        self.page_table = metadata.token_page_table
+        self.index_lengths = (zeros(tokens, torch.int32) if geometry is None
+                              else (geometry.index_lengths[:tokens] if sharded else geometry.index_lengths))
+        self.page_table = metadata.token_page_table[:tokens] if sharded else metadata.token_page_table
         self.projections = {}
+        if sharded and not {"q_b_full", "output_full", "sink_full"} <= set(weights):
+            raise ValueError("row-sharded attention requires replicated attention weights")
+        q_b_key, output_key, sink_key = (("q_b_full", "output_full", "sink_full") if sharded
+                                         else ("q_b", "output", "sink"))
         use_b12x_mxfp8 = not sm103_projection.is_sm103(device)
         paired_mxfp8 = use_b12x_mxfp8 and all(isinstance(getattr(weights[key], "weight", None), mxfp8.MXFP8Rows)
-                           for key in ("qkv_a", "q_b"))
+                           for key in ("qkv_a", q_b_key))
         use_a16_qkv = (paired_mxfp8 and prefix_tokens <= 28
                        and not getattr(session, "native_dense_activations", False))
         self.norm_quant = (PreparedMLANormQuant(scratch.projected[:prefix_tokens],
@@ -476,17 +526,17 @@ class PreparedAttention:
             eps=self.eps, session=session, name=name + ".qkv_norm",
             release_dependents=prefix_tokens <= 8, examples=examples)
             if paired_mxfp8 and not use_a16_qkv and self.eps == 1e-20 and mla_norm_mxfp8.is_supported(device) else None)
-        for key, values, out in (
-            ("qkv_a", source[:prefix_tokens], scratch.projected[:prefix_tokens]),
-            ("q_b", scratch.query_low[:prefix_tokens], scratch.query[:prefix_tokens].view(prefix_tokens, -1)),
+        for key, weight_key, values, out in (
+            ("qkv_a", "qkv_a", source[:prefix_tokens], scratch.projected[:prefix_tokens]),
+            ("q_b", q_b_key, scratch.query_low[:prefix_tokens], scratch.query[:prefix_tokens].view(prefix_tokens, -1)),
         ):
             packed_mxfp8 = use_b12x_mxfp8 and isinstance(
-                getattr(weights[key], "weight", None), mxfp8.MXFP8Rows)
+                getattr(weights[weight_key], "weight", None), mxfp8.MXFP8Rows)
             use_quantized_seam = packed_mxfp8 and not use_a16_qkv
             qkv_preencoded = key == "qkv_a" and qkv_encoded is not None
             if qkv_preencoded and not use_quantized_seam:
                 raise ValueError("preencoded qkv_a requires an MXFP8 quantized attention seam")
-            self.projections[key] = QuantizedProjection(values, weights[key], out,
+            self.projections[key] = QuantizedProjection(values, weights[weight_key], out,
                 session=session, name=f"{name}.{key}", workspace=workspace, activation_mode="auto",
                 mxfp8_min_amax=(1e-4 if use_quantized_seam and not qkv_preencoded
                                 and (key != "q_b" or self.norm_quant is None) else None),
@@ -511,14 +561,26 @@ class PreparedAttention:
                 scratch.window_values[:prefix_tokens], eps=self.eps, session=session, name=name + ".kv_norm")
                 if self.norm_quant is None else None)
         self.output_projection = PreparedGroupedOutputProjection(
-            scratch.attended[:mla_tokens], weights["output"], scratch.output[:mla_tokens],
+            scratch.attended[:mla_tokens], weights[output_key], scratch.output[:mla_tokens],
             session=session, name=name + ".output", workspace=workspace,
             inv_rope=self.angles is not None,
-            heads_per_group=scratch.attended.shape[1] // getattr(weights["output"], "groups", 1),
+            heads_per_group=scratch.attended.shape[1] // getattr(weights[output_key], "groups", 1),
             nope_dim=448, rope_dim=64, positions=self.token_offsets[:mla_tokens],
             cos_sin_cache=None if self.angles is None else self.angles.values[:mla_tokens])
-        self.window_writer = PreparedCompressedCacheWriter(scratch.window_values[:prefix_tokens], self.window_cache,
-            self.window_slots[:prefix_tokens], page_size=self.window_page_size, kind="swa", session=session,
+        if sharded:
+            if window_target is None or window_target.shape != (total, 512):
+                raise ValueError("row-sharded attention gathers its KV latent into a full-row buffer")
+            self.window_gather = PreparedGatherShards(scratch.window_values[:prefix_tokens], window_target,
+                runtime=runtime, session=session, coordinator=coordinator, name=name + ".window_gather")
+            writer_values = window_target
+        else:
+            if window_target is not None:
+                raise ValueError("a full-row attention writes its own KV latent")
+            self.window_gather = None
+            writer_values = scratch.window_values[:prefix_tokens]
+        self.window_writer = PreparedCompressedCacheWriter(writer_values, self.window_cache,
+            self.window_slots if sharded else self.window_slots[:prefix_tokens],
+            page_size=self.window_page_size, kind="swa", session=session,
             name=f"{name}.window_write",
             history=self.window if mode in ("verify", "draft") else None,
             history_rows=metadata.state_rows if mode in ("verify", "draft") else None,
@@ -527,7 +589,8 @@ class PreparedAttention:
         self.selectors = []
         if "compressor" in weights:
             self.global_kv = PreparedGlobalKV(layer, weights, source, scratch, metadata, pool, rotary,
-                session=session, name=name, indices=window_metadata, deferred=mode == "verify")
+                session=session, name=name, indices=window_metadata, deferred=mode == "verify",
+                row_shard=sharded, runtime=runtime, coordinator=coordinator)
         if "index_q" in weights:
             self.index_query = QuantizedProjection(scratch.query_low, weights["index_q"],
                 scratch.index_query.view(tokens, -1), session=session, name=f"{name}.index_query",
@@ -557,7 +620,7 @@ class PreparedAttention:
             page_table=self.page_table[:mla_tokens],
             indexed_page_size=128 // self.ratio)
         self.attention = PreparedCompressedMLA(scratch.query[:mla_tokens], self.window_cache,
-            self.window_indices[:mla_tokens], self.window_lengths[:mla_tokens], weights["sink"],
+            self.window_indices[:mla_tokens], self.window_lengths[:mla_tokens], weights[sink_key],
             scratch.attended[:mla_tokens],
             window_page_size=self.window_page_size,
             # Speculative rows use explicit indices into staged caches. Their
@@ -615,6 +678,8 @@ class PreparedAttention:
             self.query_norm = self.query_norm.functional()
             self.window_norm = self.window_norm.functional()
         self.output_projection.functional(session=session)
+        if self.window_gather is not None:
+            self.window_gather.functional(session=session)
         self.window_writer.functional(session=session, cache=None)
         self.attention.functional(session=session, window=None)
         if self.selectors and not overlap_indexer:
@@ -793,7 +858,12 @@ class PreparedAttention:
         m = metadata
         indices = (self.window_metadata(m, replay_start=replay_start)
                    if self.owns_window_metadata else indices)
-        position = indices.position
+        rows_index = getattr(self, "shard_rows", None)
+        def rank_rows(full):
+            return full if rows_index is None else full.index_select(0, rows_index)
+        window_indices = rank_rows(indices.window_indices)
+        window_lengths = rank_rows(indices.window_lengths)
+        page_table = rank_rows(m.token_page_table)
         if window_cache is None:
             window_cache = self.window if self.mode == "decode" else torch.empty(
                 (m.starts.numel(), self.window_page_size * 528), dtype=torch.uint8, device=source.device)
@@ -804,7 +874,7 @@ class PreparedAttention:
             torch.empty(shape, dtype=dtype, device=source.device) for shape, dtype in qkv.encoded_layout))
         projected = qkv(source, encoded_bases=qkv_encoded_bases)
         encoded_bases = None
-        layer_angles = indices.angles[(bool(self.ratio), 0)]
+        layer_angles = rank_rows(indices.angles[(bool(self.ratio), 0)])
         if self.fused_qkv_norm_rope:
             query_low, window_values = _q_kv_norm_rope(
                 projected, self.q_norm_weight, self.kv_norm_weight, layer_angles, self.eps)
@@ -829,6 +899,8 @@ class PreparedAttention:
             else:
                 query = self.projections["q_b"](query_low, encoded_bases=encoded_bases).view(self.query_shape)
                 self.angles.apply(query, layer_angles)
+        if self.window_gather is not None:
+            window_values = self.window_gather(window_values)
         self.window_writer(window_values, indices.window_slots,
                            history_rows=m.state_rows if self.mode in ("verify", "draft") else None, cache=window_cache)
         dependency = window_cache
@@ -837,6 +909,8 @@ class PreparedAttention:
         joined_query = False
         if self.ratio:
             geometry = indices.compressed(self.ratio)
+            lengths = rank_rows(geometry.lengths)
+            index_lengths = rank_rows(geometry.index_lengths)
             global_dep = None
             if self.global_kv is not None:
                 records = self.global_kv(source, self.selectors[0], m, geometry,
@@ -851,13 +925,14 @@ class PreparedAttention:
                     index_query = iq_flat.view(source.shape[0], 32, 128)
                     joined_query = True
                 else:
+                    index_layer_angles = rank_rows(indices.angles[(True, 0)])
                     if self.index_query_fused_rope:
                         index_query = run_mxfp8_projection_rope(
-                            self.index_query, query_low, indices.angles[(True, 0)], head_dim=128
+                            self.index_query, query_low, index_layer_angles, head_dim=128
                         ).view(source.shape[0], 32, 128)
                     else:
                         index_query = self.index_query(query_low).view(source.shape[0], 32, 128)
-                        self.index_angles.apply(index_query, indices.angles[(True, 0)])
+                        self.index_angles.apply(index_query, index_layer_angles)
                     index_weights = self.index_weight(source)
                     index_weights.mul_(128 ** -.5 * 32 ** -.5)
                 outputs, candidate_outputs, count_outputs = [], [], []
@@ -865,7 +940,7 @@ class PreparedAttention:
                     first = ordinal * INDEXER_QUERY_ROWS
                     last = min(source.shape[0], first + INDEXER_QUERY_ROWS)
                     result = selector(index_query[first:last], index_weights[first:last],
-                        m.token_page_table[first:last], geometry.lengths[first:last], geometry.active_width,
+                        page_table[first:last], lengths[first:last], geometry.active_width,
                         candidates=None if self.layer <= self.candidate_source else candidates[first:last],
                         counts=None if self.layer <= self.candidate_source else candidate_counts[first:last],
                         quantized=None if quantized_list is None else quantized_list[ordinal])
@@ -881,10 +956,10 @@ class PreparedAttention:
                 dependency = selected
         if self.concurrent_query is not None and not joined_query:
             query = self.concurrent_query.finish(pending, dependency).view(self.query_shape)
-        attended = self.attention(query, indices.window_indices, indices.window_lengths,
+        attended = self.attention(query, window_indices, window_lengths,
             indexed_indices=selected if self.ratio else None,
-            indexed_lengths=geometry.index_lengths if self.ratio else None,
-            page_table=m.token_page_table if self.ratio else None, window=window_cache)
+            indexed_lengths=index_lengths if self.ratio else None,
+            page_table=page_table if self.ratio else None, window=window_cache)
         output = self.output_projection(attended, positions=self.token_offsets, cos_sin_cache=layer_angles)
         record = window_cache, records
         if self.mode == "prefill":

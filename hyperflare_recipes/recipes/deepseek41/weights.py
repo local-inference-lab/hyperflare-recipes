@@ -82,12 +82,13 @@ class ModelWeights:
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, dspark=False, confidence=False,
              expert_scale_compression=None, draft_head_quantization=None, markov_head_quantization=None,
-             vocabulary_parallel_sampling=False, engram_full_projection=None):
+             vocabulary_parallel_sampling=False, engram_full_projection=None, row_shard_attention=False):
         config = ModelConfig.load(manifest.metadata_path)
         before = allocated_tensor_bytes(device)
         with DeepSeekWeightLoader(manifest, device, shard=shard, progress=progress, dspark=dspark,
                                  expert_scale_compression=expert_scale_compression,
-                                 engram_full_projection=engram_full_projection) as loader:
+                                 engram_full_projection=engram_full_projection,
+                                 row_shard_attention=row_shard_attention) as loader:
             embedding, norm = loader.load_tensors(("embed.weight", "norm.weight"))
             head = loader.load_padded_tensor("head.weight", rows=shard.padded_partition(129280, alignment=64))
             layers = tuple(loader.load_layer(i) for i in range(config.layers))
@@ -112,7 +113,7 @@ class ModelWeights:
 
 class DeepSeekWeightLoader(BlockFP8WeightLoader):
     def __init__(self, manifest, device, *, shard, progress=None, prefixes=None, dspark=False,
-                 expert_scale_compression=None, engram_full_projection=None):
+                 expert_scale_compression=None, engram_full_projection=None, row_shard_attention=False):
         if expert_scale_compression not in (None, "csf"):
             raise ValueError("DeepSeek V4.1 expert scale compression must be None or 'csf'")
         self.dspark = dspark
@@ -121,6 +122,7 @@ class DeepSeekWeightLoader(BlockFP8WeightLoader):
             shard.world_size > 1 if engram_full_projection is None
             else bool(engram_full_projection) and shard.world_size > 1
         )
+        self.row_shard_attention = bool(row_shard_attention) and shard.world_size > 1
         super().__init__(manifest, device, progress=progress, prefixes=prefixes)
         self.config = ModelConfig.load(manifest.metadata_path)
         self.shard = shard
@@ -155,6 +157,14 @@ class DeepSeekWeightLoader(BlockFP8WeightLoader):
             "kv_norm": self.load_tensor(attn + ".kv_norm.weight"),
             "sink": self.load_padded_tensor(attn + ".attn_sink", rows=(first * 8, last * 8)),
         }
+        if (self.row_shard_attention and not draft
+                and self.config.decoder_start is not None and layer < self.config.decoder_start):
+            all_heads = (0, text["num_attention_heads"] * text["head_dim"])
+            all_groups = (0, text["o_groups"] * text["o_lora_rank"])
+            all_sink = (0, text["num_attention_heads"])
+            result["q_b_full"] = self.load_linear_group((attn + ".wq_b",), row_ranges=(all_heads,), pad=True)
+            result["output_full"] = self.load_attention_output(attn, all_groups, pad=True)
+            result["sink_full"] = self.load_padded_tensor(attn + ".attn_sink", rows=all_sink)
         if not draft and layer in text["kv_source_layer_ids"]:
             ratio = text["compress_ratios"][layer]
             result["compressor"] = {

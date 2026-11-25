@@ -957,3 +957,620 @@ def test_mxfp8_attn_shard_quantize_gather_matches_full_quantize_bit_exact_cuda()
     wrong_full = torch.cat([layer._prepare_attn_shard(full_x[r * st : (r + 1) * st]) for r in range(world)], dim=0)
     _, (_, wrong_srows, _) = layer._unpack_attn_gathered(wrong_full)
     assert not torch.equal(wrong_srows, ref_srows)
+
+
+class _FakeRoceRuntime:
+    def __init__(self, world_size: int = 4, *, pipe_bytes: int = 80 << 20, with_surfaces: bool = True):
+        self.world_size = world_size
+        self.pipe_bytes = pipe_bytes
+        self.max_size = 1 << 20
+        if with_surfaces:
+            self.should_reduce_scatter = lambda tensor: (
+                tensor.numel() * tensor.element_size() <= self.pipe_bytes and tensor.shape[0] % self.world_size == 0
+            )
+            self.should_gather_shards = lambda tensor: (
+                tensor.numel() * tensor.element_size() * self.world_size <= self.pipe_bytes
+            )
+
+    def should_allreduce(self, tensor):
+        return True
+
+
+def _build_roce_decoder_for_eligibility(
+    monkeypatch,
+    *,
+    tokens: int = 1024,
+    rank: int = 0,
+    world_size: int = 4,
+    mode: str = "prefill",
+    row_shard_prefill: bool = True,
+    overlap: bool = True,
+    scoring=None,
+    runtime="default",
+    encoder_only: bool = True,
+    with_replicated_attn: bool = True,
+    with_engram_full: bool = True,
+):
+    from ignition.components import collectives as ign_collectives
+
+    if runtime == "default":
+        runtime = _FakeRoceRuntime(world_size=world_size)
+
+    monkeypatch.setattr(ign_collectives, "_roce", lambda rt: isinstance(rt, _FakeRoceRuntime))
+    monkeypatch.setattr(
+        ign_collectives,
+        "row_shard_surfaces",
+        lambda rt: isinstance(rt, _FakeRoceRuntime)
+        and hasattr(rt, "should_reduce_scatter")
+        and hasattr(rt, "should_gather_shards"),
+    )
+    monkeypatch.setattr(decoder, "row_shard_surfaces", ign_collectives.row_shard_surfaces)
+
+    built_layers = []
+    built_boundaries = []
+    layer_inputs = []
+
+    class FakeTableRequests:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __call__(self, metadata):
+            return "history"
+
+        def commit(self, lengths, raw_history, metadata):
+            pass
+
+    class FakeEmbedding:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def functional(self, **kwargs):
+            return self
+
+        def __call__(self, *, token_ids, num_rows):
+            idx = torch.arange(token_ids.numel(), dtype=torch.float32)
+            out = torch.zeros((token_ids.numel(), 5120), dtype=torch.bfloat16)
+            out[:, 0] = (idx // 256).to(torch.bfloat16)
+            out[:, 1] = (idx % 256).to(torch.bfloat16)
+            return out
+
+    class FakeIndices:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def functional(self):
+            return self
+
+        def __call__(self, metadata, **kwargs):
+            return "indices"
+
+    class FakeLayer:
+        def __init__(self, index, *args, **kwargs):
+            self.index = index
+            self.has_image_mask = False
+            self.pipelined_ffn = kwargs["pipelined_ffn"]
+            self.row_shard_dma = kwargs["row_shard_dma"]
+            self.row_shard_roce = kwargs["row_shard_roce"]
+            self.row_shard_attn = kwargs["row_shard_attn"]
+            self.shard_rows = kwargs["shard_rows"]
+            self.boundary = kwargs["boundary"]
+            self.engram = None
+            self.attention = SimpleNamespace(selectors=[object()], plans=lambda: ())
+            self.post = None if kwargs["defer_post"] else object()
+            built_layers.append(self)
+
+        def __call__(self, incoming, pre_mix, metadata, indices, selection, **kwargs):
+            if self.index == 0:
+                layer_inputs.append((incoming, pre_mix, selection))
+            return incoming, pre_mix, f"rec{self.index}", selection
+
+    class FakeBoundary:
+        def __init__(self, index, layer, source, target, packing, pool, rotary, **kwargs):
+            self.index = index
+            self.packing = packing
+            self.row_shard_dma = kwargs.get("row_shard_dma", False)
+            self.row_shard_roce = kwargs.get("row_shard_roce", False)
+            built_boundaries.append(self)
+
+        def __call__(self, incoming, pre_mix, metadata, indices, indexer=None):
+            if self.packing is None:
+                return None, None, None
+            suffix = self.packing.begin(metadata)
+            zeros_4d = torch.zeros((128, 4, 5120), dtype=torch.bfloat16)
+            state = (
+                zeros_4d,
+                torch.zeros((128, 4), dtype=torch.float32),
+                torch.zeros((128, 4, 4), dtype=torch.float32),
+                torch.zeros((128, 5120), dtype=torch.bfloat16),
+            )
+            return suffix, state, torch.zeros((128, 4), dtype=torch.float32)
+
+    monkeypatch.setattr(decoder, "PreparedTableRequests", FakeTableRequests)
+    monkeypatch.setattr(decoder, "PreparedEmbedding", FakeEmbedding)
+    monkeypatch.setattr(decoder, "Rotary", lambda *args, **kwargs: None)
+    monkeypatch.setattr(decoder, "AttentionIndices", FakeIndices)
+    monkeypatch.setattr(decoder, "PreparedLayer", FakeLayer)
+    monkeypatch.setattr(decoder, "PreparedDecoderBoundary", FakeBoundary)
+    monkeypatch.setattr(decoder, "register_finalizer", lambda *args, **kwargs: None)
+    monkeypatch.setattr(decoder.PreparedDecoder, "_prepare_head", lambda *args, **kwargs: setattr(args[0], "head", lambda h, **kw: torch.zeros((1, 16))))
+
+    @dataclass(frozen=True)
+    class FakeLayerWeights:
+        engram: object
+        attention: dict
+
+    def make_attn(i):
+        d = {"compressor": object()} if i in (2, 8, 14, 20) else {}
+        if with_replicated_attn and i < 20:
+            d.update({"q_b_full": object(), "output_full": object(), "sink_full": object()})
+        return d
+
+    def make_engram(i):
+        if i not in (1, 14):
+            return None
+        return {"projection_full": object(), "projection": object()} if with_engram_full else {"projection": object()}
+
+    layers = tuple(FakeLayerWeights(engram=make_engram(i), attention=make_attn(i)) for i in range(40))
+    weights = SimpleNamespace(
+        config=SimpleNamespace(
+            decoder_start=20,
+            sources=(SimpleNamespace(layer=2), SimpleNamespace(layer=8), SimpleNamespace(layer=14), SimpleNamespace(layer=20)),
+            text={"compress_ratios": [0, 0, *([2] * 18), *([1] * 20)], "rms_norm_eps": 1e-6},
+            draft=SimpleNamespace(target_layers=(37, 38, 39)),
+        ),
+        draft=None,
+        layers=layers,
+        shard=TensorParallelShard(rank, world_size),
+        embedding=torch.zeros((16, 5120), dtype=torch.bfloat16),
+        norm=torch.ones(5120, dtype=torch.bfloat16),
+        head=torch.zeros((16, 5120), dtype=torch.bfloat16),
+    )
+    scratch = SimpleNamespace(
+        embedding=torch.zeros((tokens, 5120), dtype=torch.bfloat16),
+        residual=torch.zeros((tokens, 4, 5120), dtype=torch.bfloat16),
+        attention=SimpleNamespace(output=torch.zeros((tokens, 5120), dtype=torch.bfloat16)),
+        attention_output=torch.zeros((tokens, 5120), dtype=torch.bfloat16),
+        attention_hc=SimpleNamespace(normalized=torch.zeros((tokens, 5120), dtype=torch.bfloat16)),
+        hidden=torch.zeros((1, 5120), dtype=torch.bfloat16),
+        local_logits=torch.zeros((1, 16), dtype=torch.float32),
+        logits=torch.zeros((1, 16), dtype=torch.float32),
+    )
+    rows = 1 if mode == "prefill" else tokens
+    metadata = Metadata.allocate(tokens, rows, max(2, tokens // 128 + 2), "cpu")
+    metadata.lengths.fill_(tokens)
+    metadata.live_counts.copy_(torch.tensor([tokens, rows], dtype=torch.int32))
+    arena = ScratchArena("cpu", overlap=overlap)
+    scoring_obj = None if scoring is None else SimpleNamespace(prepare=lambda *a, **kw: (lambda x: None))
+
+    dec = decoder.PreparedDecoder(
+        weights,
+        None,
+        scratch,
+        metadata,
+        None,
+        mode=mode,
+        runtime=runtime,
+        vocabulary_runtime=None,
+        coordinator=None,
+        session=None,
+        name=f"test_roce_{tokens}",
+        workspace=arena,
+        scoring=scoring_obj,
+        encoder_only=encoder_only,
+        row_shard_prefill=row_shard_prefill,
+    )
+    return dec, metadata, built_layers, built_boundaries, layer_inputs
+
+
+@pytest.mark.parametrize("tokens", [512, 1024, 4096])
+def test_prepared_decoder_roce_row_shard_eligibility_and_embedding_partition(monkeypatch, tokens):
+    shard_tokens = tokens // 4
+    for rank in range(4):
+        dec, metadata, built_layers, built_boundaries, layer_inputs = _build_roce_decoder_for_eligibility(
+            monkeypatch, tokens=tokens, rank=rank, encoder_only=True, with_replicated_attn=True
+        )
+        assert dec.row_shard_dma is False
+        assert dec.row_shard_roce is True
+        assert dec.row_shard_roce_attn is True
+        assert dec.shard_tokens == shard_tokens
+        s0 = rank * shard_tokens
+        assert dec.shard_rows.tolist() == list(range(s0, s0 + shard_tokens))
+        assert dec.shard_offset.tolist() == [s0]
+        assert len(built_layers) == 20
+        assert all(layer.row_shard_roce and layer.row_shard_attn and not layer.row_shard_dma for layer in built_layers)
+        assert len(built_boundaries) == 1 and built_boundaries[0].row_shard_roce is True
+
+        dec(metadata)
+        (res_sh,), pre_mix_sh, selection = layer_inputs[0]
+        assert res_sh.shape == (shard_tokens, 4, 5120)
+        decoded = (res_sh[:, 0, 0].float() * 256.0 + res_sh[:, 0, 1].float()).to(torch.int64).tolist()
+        assert decoded == list(range(s0, s0 + shard_tokens))
+        assert torch.all(pre_mix_sh[:, 0] == 1.0) and torch.all(pre_mix_sh[:, 1:] == 0.0)
+        assert selection[0].shape == (shard_tokens, 512)
+
+    # Terminal prefill row-shards encoder layers 0..19 + boundary only, leaving decoder suffix 20..39 full-row.
+    term_dec, _, term_layers, term_boundaries, _ = _build_roce_decoder_for_eligibility(
+        monkeypatch, tokens=tokens, rank=2, encoder_only=False, with_replicated_attn=True
+    )
+    assert term_dec.row_shard_roce is True and term_dec.row_shard_roce_attn is True
+    assert all(layer.row_shard_roce and layer.row_shard_attn for layer in term_layers[:20])
+    assert all(not layer.row_shard_roce and not layer.row_shard_attn for layer in term_layers[20:])
+    assert len(term_boundaries) == 1 and term_boundaries[0].row_shard_roce is True
+
+    # Without replicated attention weights, row_shard_roce still activates with full-row attention fallback.
+    no_attn_dec, metadata, no_attn_layers, _, no_attn_inputs = _build_roce_decoder_for_eligibility(
+        monkeypatch, tokens=tokens, rank=1, encoder_only=True, with_replicated_attn=False
+    )
+    assert no_attn_dec.row_shard_roce is True and no_attn_dec.row_shard_roce_attn is False
+    assert all(layer.row_shard_roce and not layer.row_shard_attn for layer in no_attn_layers)
+    no_attn_dec(metadata)
+    assert no_attn_inputs[0][2][0].shape == (tokens, 512)
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"row_shard_prefill": False},
+        {"tokens": 256},
+        {"tokens": 768},  # 768 // 4 == 192, not 128-aligned
+        {"scoring": True},
+        {"mode": "decode", "tokens": 32, "encoder_only": False},
+        {"world_size": 1, "rank": 0},
+        {"runtime": None},
+        {"runtime": "no_surfaces"},
+        {"runtime": "tiny_pipe"},
+        {"with_engram_full": False},
+    ],
+)
+def test_prepared_decoder_roce_rejects_ineligible_configurations(monkeypatch, override):
+    kwargs = dict(tokens=1024, rank=0, world_size=4, mode="prefill", row_shard_prefill=True, overlap=True)
+    kwargs.update(override)
+    if kwargs.get("runtime") == "no_surfaces":
+        kwargs["runtime"] = _FakeRoceRuntime(world_size=4, with_surfaces=False)
+    elif kwargs.get("runtime") == "tiny_pipe":
+        kwargs["runtime"] = _FakeRoceRuntime(world_size=4, pipe_bytes=1024)
+    if kwargs.get("scoring"):
+        kwargs["encoder_only"] = False
+
+    dec, _, built_layers, built_boundaries, _ = _build_roce_decoder_for_eligibility(monkeypatch, **kwargs)
+    assert dec.row_shard_roce is False
+    assert dec.row_shard_roce_attn is False
+    assert dec.shard_tokens == 0
+    assert dec.shard_rows is None and dec.shard_offset is None
+    assert all(not layer.row_shard_roce for layer in built_layers)
+    assert all(not boundary.row_shard_roce for boundary in built_boundaries)
+
+
+@pytest.mark.parametrize("row_shard_attn", [True, False])
+def test_prepared_layer_roce_row_shard_serial_zero_dependencies_and_clamping(row_shard_attn):
+    tokens, world, hidden, top_k = 512, 4, 256, 6
+    shard_tokens = tokens // world
+
+    class StrictRoceCollective:
+        def __init__(self, fn):
+            self.fn = fn
+            self.calls = 0
+
+        def __call__(self, source, *, dependencies=()):
+            assert not dependencies, "RoCE collectives must never receive graph-ordering dependencies"
+            self.calls += 1
+            return self.fn(source)
+
+    router_calls = []
+
+    def make_rank_layer(rank: int):
+        layer = decoder.PreparedLayer.__new__(decoder.PreparedLayer)
+        s0 = rank * shard_tokens
+        layer.row_shard_dma = False
+        layer.row_shard_roce = True
+        layer.row_shard_attn = row_shard_attn
+        layer.shard_tokens = shard_tokens
+        layer.shard_rows = torch.arange(s0, s0 + shard_tokens, dtype=torch.int64)
+        layer.shard_offset = torch.tensor([s0], dtype=torch.int32)
+        layer.engram = None
+        layer.has_image_mask = True
+        layer.ffn_quantizer_plan = None
+        layer.ffn_local_shapes = None
+        layer.ffn_meta_scale_cols = 0
+
+        layer.attention_hc = lambda src, *, pre_mix, pre_out: (
+            src,
+            torch.zeros((shard_tokens, 4), dtype=torch.float32),
+            torch.zeros((shard_tokens, 4, 4), dtype=torch.float32),
+            src[:, 0, :],
+        )
+        if row_shard_attn:
+            layer.attn_gather = None
+            layer.attention_reduce = None
+            layer.attention = SimpleNamespace(
+                _run=lambda norm_sh, metadata, selection, **kw: (norm_sh, "rec", selection, {}),
+            )
+        else:
+            layer.attn_gather = StrictRoceCollective(lambda sh: sh.repeat(world, 1))
+            layer.attention_reduce = StrictRoceCollective(lambda full: full[s0 : s0 + shard_tokens].clone())
+            layer.attention = SimpleNamespace(
+                _run=lambda norm_full, metadata, selection, **kw: (norm_full, "rec", selection, {}),
+            )
+        layer.ffn_hc = lambda att, res, post, comb, *, pre_mix, pre_out: (res, post, comb, att)
+        layer.router_projection = lambda norm: torch.zeros((norm.shape[0], 384), dtype=torch.float32)
+
+        def fake_router(logits, *, image_mask=None, num_valid_tokens=None):
+            valid = int(num_valid_tokens.item())
+            router_calls.append((rank, valid, image_mask.clone()))
+            ids = torch.full((logits.shape[0], top_k), rank + 10, dtype=torch.int32)
+            weights = torch.full((logits.shape[0], top_k), 0.12345679 + rank * 0.01, dtype=torch.float32)
+            if valid < logits.shape[0]:
+                ids[valid:].fill_(-1)
+                weights[valid:].zero_()
+            return RouterScratch(torch.zeros_like(weights), ids, weights)
+
+        layer.router = fake_router
+        layer.ffn_vals_gather = StrictRoceCollective(lambda sh: sh.repeat(world, 1))
+        layer.ffn_meta_gather = StrictRoceCollective(lambda sh: sh.repeat(world, 1))
+        layer.experts = lambda vals, ids, weights, **kw: vals
+        layer.shared = lambda vals, **kw: vals
+        layer.mlp_reduce = StrictRoceCollective(lambda full: full[s0 : s0 + shard_tokens].clone())
+        layer.post = lambda mlp_sh, res, post, comb: res
+        return layer
+
+    metadata = Metadata.allocate(tokens, 1, 10, "cpu")
+    image_positions = {0, 127, 128, 255, 300, 511}
+    metadata.token_ids.copy_(
+        torch.tensor([130000 if idx in image_positions else (idx % 1000) for idx in range(tokens)], dtype=torch.int64)
+    )
+    rank_layers = [make_rank_layer(rank) for rank in range(world)]
+    for live in (0, 1, 127, 128, 129, 300, 511, 512):
+        metadata.live_counts[0] = live
+        metadata.lengths[0] = live
+        router_calls.clear()
+        for rank, layer in enumerate(rank_layers):
+            inc = torch.ones((shard_tokens, 4, hidden), dtype=torch.bfloat16)
+            pm = torch.zeros((shard_tokens, 4), dtype=torch.float32)
+            (out_sh,), _, _, _, obs = layer._run_row_shard_roce(
+                (inc,), pm, metadata, "indices", (torch.full((shard_tokens if row_shard_attn else tokens, 512), -1, dtype=torch.int32), None, None)
+            )
+            assert out_sh.shape == (shard_tokens, 4, hidden)
+            assert obs["router.ids"].shape == (tokens, top_k)
+
+        for rank in range(world):
+            call_rank, valid, mask = router_calls[rank]
+            expected_valid = max(0, min(shard_tokens, live - rank * shard_tokens))
+            assert call_rank == rank and valid == expected_valid
+            s0 = rank * shard_tokens
+            expected_mask = torch.tensor([idx in image_positions for idx in range(s0, s0 + shard_tokens)])
+            assert torch.equal(mask, expected_mask)
+
+
+@pytest.mark.parametrize("pipe_bytes", [80 << 20, 16 << 20])
+def test_prepared_engram_roce_row_shard_single_and_multi_chunk(monkeypatch, pipe_bytes):
+    from ignition.components import collectives as ign_collectives
+
+    monkeypatch.setattr(ign_collectives, "_roce", lambda rt: isinstance(rt, _FakeRoceRuntime))
+    monkeypatch.setattr(
+        ign_collectives,
+        "row_shard_surfaces",
+        lambda rt: isinstance(rt, _FakeRoceRuntime)
+        and hasattr(rt, "should_reduce_scatter")
+        and hasattr(rt, "should_gather_shards"),
+    )
+    monkeypatch.setattr(ds_engram, "row_shard_surfaces", ign_collectives.row_shard_surfaces)
+
+    class FakeLookup:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def functional(self, **kwargs):
+            return self
+
+        def __call__(self, source, count):
+            return torch.zeros((1024, 6144), dtype=torch.bfloat16)
+
+    gather_calls = []
+
+    class FakeGatherShards:
+        def __init__(self, source, output, **kwargs):
+            self.source_shape = tuple(source.shape)
+            self.output_shape = tuple(output.shape)
+            gather_calls.append((self.source_shape, self.output_shape))
+
+        def functional(self, **kwargs):
+            return self
+
+    class FakeChunkedAllReduce:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def functional(self, **kwargs):
+            return self
+
+    projection_shapes = []
+
+    class FakeQuantizedProjection:
+        def __init__(self, source, weight, output, **kwargs):
+            projection_shapes.append((kwargs["name"], tuple(source.shape), tuple(output.shape)))
+
+        def functional(self, **kwargs):
+            return self
+
+        def __call__(self, x):
+            row_tag = x[:, :1].float()
+            return row_tag.expand(x.shape[0], 25600).to(torch.bfloat16).contiguous()
+
+    mix_caps = []
+
+    def fake_mix_plan(caps, *, invocation):
+        mix_caps.append(caps.max_tokens)
+        return SimpleNamespace(request=lambda **kwargs: SimpleNamespace(**kwargs))
+
+    def fake_run_engram_mix(source_2d, projected, norm_weight, *, eps, plan, out, token_mask):
+        delta = torch.where(token_mask[:, None], projected[:, : source_2d.shape[1]], torch.zeros_like(source_2d))
+        out.copy_(source_2d + delta)
+
+    monkeypatch.setattr(ds_engram, "PreparedEngramLookup", FakeLookup)
+    monkeypatch.setattr(ds_engram, "PreparedGatherShards", FakeGatherShards)
+    monkeypatch.setattr(ds_engram, "PreparedChunkedAllReduce", FakeChunkedAllReduce)
+    monkeypatch.setattr(ds_engram, "QuantizedProjection", FakeQuantizedProjection)
+    monkeypatch.setattr(ds_engram.hyperconnection, "plan", fake_mix_plan)
+    monkeypatch.setattr(ds_engram.hyperconnection, "run_engram_mix", fake_run_engram_mix)
+    monkeypatch.setattr(ds_engram, "declare", lambda session, reqs: None)
+
+    tokens, world = 1024, 4
+    shard_rows = tokens // world
+    local_cols = 6144 // world
+    pool = SimpleNamespace(config=SimpleNamespace(text={"rms_norm_eps": 1e-6}))
+    weights_full = {
+        "projection_full": "proj_full_w",
+        "projection": "proj_sharded_w",
+        "weight": torch.ones(5120, dtype=torch.bfloat16),
+    }
+    roce_rt = _FakeRoceRuntime(world_size=world, pipe_bytes=pipe_bytes)
+
+    meta = Metadata.allocate(tokens, 1, 10, "cpu")
+    meta.positions.copy_(torch.tensor([idx if idx < 700 else -1 for idx in range(tokens)], dtype=torch.int64))
+    meta.token_ids.copy_(
+        torch.tensor([130000 if idx in (5, 140, 520, 680) else (idx % 1000) for idx in range(tokens)], dtype=torch.int64)
+    )
+    full_source = (
+        (torch.arange(tokens, dtype=torch.float32)[:, None, None] * 2.0)
+        .expand(tokens, 4, 5120)
+        .to(torch.bfloat16)
+        .contiguous()
+    )
+    # Reference full-row mix: row_tag = row index, masked by (positions >= 0) & (token_ids < 129280).
+    mask = (meta.positions >= 0) & (meta.token_ids < 129280)
+    expected_delta = torch.arange(tokens, dtype=torch.float32)[:, None, None].expand(tokens, 4, 5120).to(torch.bfloat16)
+    expected_mixed = full_source + torch.where(mask[:, None, None], expected_delta, torch.zeros_like(expected_delta))
+
+    reassembled = []
+    for rank in range(world):
+        gather_calls.clear()
+        projection_shapes.clear()
+        mix_caps.clear()
+        tables = SimpleNamespace(
+            columns=torch.arange(0, local_cols, dtype=torch.int64),
+            shard=TensorParallelShard(rank, world),
+            inputs={1: object()},
+            token_map=(0, 1),
+            geometry=object(),
+            readiness_runtime=None,
+        )
+        scratch = ds_engram.EngramScratch.allocate(tokens, "cpu", world=world)
+        src = torch.zeros((tokens, 4, 5120), dtype=torch.bfloat16)
+        out = torch.zeros((tokens, 4, 5120), dtype=torch.bfloat16)
+        sharded_engram = ds_engram.PreparedEngram(
+            1, weights_full, tables, src, out, meta, pool,
+            scratch=scratch, session=None, name=f"roce_l1_r{rank}", workspace=None,
+            runtime=roce_rt, row_shard=(rank, shard_rows),
+        )
+        assert sharded_engram.use_all_gather is True
+        assert sharded_engram.row_shard is True
+        expected_chunks = 1 if pipe_bytes >= tokens * world * local_cols * 2 else 2
+        assert len(sharded_engram.gather_parts) == expected_chunks
+        assert len(gather_calls) == expected_chunks
+        assert projection_shapes[-1][1] == (shard_rows, 6144)
+        assert mix_caps[-1] == shard_rows
+        s0 = rank * shard_rows
+        assert sharded_engram.row_shard_indices.tolist() == list(range(s0, s0 + shard_rows))
+
+        # Construct 2D gathered chunks [world * step, local_cols] matching PreparedGatherShards output.
+        chunks = []
+        for begin, end in sharded_engram.gather_bounds:
+            row_vals = (
+                torch.arange(begin, end, dtype=torch.float32)[None, :, None]
+                .expand(world, end - begin, local_cols)
+                .to(torch.bfloat16)
+                .contiguous()
+                .view(world * (end - begin), local_cols)
+            )
+            chunks.append(row_vals)
+        local_proj = sharded_engram.project_gathered(chunks)
+        assert local_proj.shape == (shard_rows, 25600)
+        local_mixed = sharded_engram.mix(full_source[s0 : s0 + shard_rows], local_proj, meta)
+        reassembled.append(local_mixed)
+
+    assert torch.equal(torch.cat(reassembled, dim=0), expected_mixed)
+
+
+def test_prepared_decoder_boundary_roce_encoder_only_and_terminal():
+    tokens, world = 512, 4
+    s = tokens // world
+
+    class StrictRoceGather:
+        def __init__(self, fn):
+            self.fn = fn
+            self.calls = 0
+
+        def __call__(self, source, *, dependencies=()):
+            assert not dependencies, "RoCE boundary gathers must not pass dependencies"
+            self.calls += 1
+            return self.fn(source)
+
+    # 1. Encoder-only boundary: calls global_kv directly on s rows with zero norm_gather.
+    enc_boundary = decoder.PreparedDecoderBoundary.__new__(decoder.PreparedDecoderBoundary)
+    enc_boundary.packing = None
+    enc_boundary.row_shard_dma = False
+    enc_boundary.row_shard_roce = True
+    enc_boundary.shard_tokens = s
+    enc_boundary.indexer = "idx0"
+    seen_kv = []
+    enc_boundary.mhc = lambda src, *, pre_mix, pre_out: (
+        src,
+        torch.ones((s, 4), dtype=torch.float32),
+        torch.ones((s, 4, 4), dtype=torch.float32),
+        src[:, 0, :],
+    )
+    enc_boundary.global_kv = SimpleNamespace(
+        ratio=1,
+        __call__=lambda norm, idx, md, geom, angles=None: seen_kv.append((tuple(norm.shape), idx)),
+    )
+    # Use a callable object for global_kv
+    class FakeGlobalKV:
+        ratio = 1
+
+        def __call__(self, norm, idx, md, geom, angles=None):
+            seen_kv.append((tuple(norm.shape), idx))
+
+    enc_boundary.global_kv = FakeGlobalKV()
+    indices = SimpleNamespace(compressed=lambda r: "geom", angles={(True, 1): "ang"})
+    md = Metadata.allocate(tokens, 1, 8, "cpu")
+    md.lengths.fill_(tokens)
+    md.positions.copy_(torch.arange(tokens, dtype=torch.int64))
+    res_in = torch.ones((s, 4, 5120), dtype=torch.bfloat16)
+    pm_in = torch.ones((s, 4), dtype=torch.float32)
+    assert enc_boundary((res_in,), pm_in, md, indices) == (None, None, None)
+    assert seen_kv == [((s, 5120), "idx0")]
+
+    # 2. Terminal prefill boundary: gathers norm, residual, state with zero dependencies and packs suffix.
+    term_boundary = decoder.PreparedDecoderBoundary.__new__(decoder.PreparedDecoderBoundary)
+    term_boundary.packing = decoder.PreparedDecoderSuffix(md)
+    term_boundary.row_shard_dma = False
+    term_boundary.row_shard_roce = True
+    term_boundary.shard_tokens = s
+    term_boundary.indexer = "idx0"
+    def fake_term_mhc(src, *, pre_mix, pre_out):
+        pre_out.fill_(0.5)
+        return (
+            src,
+            torch.full((s, 4), 1.5, dtype=torch.float32),
+            torch.full((s, 4, 4), 2.5, dtype=torch.float32),
+            src[:, 0, :],
+        )
+
+    term_boundary.mhc = fake_term_mhc
+    term_boundary.norm_gather = StrictRoceGather(lambda sh: sh.repeat(world, 1))
+    term_boundary.res_gather = StrictRoceGather(lambda sh: sh.repeat(world, 1, 1))
+    term_boundary.state_gather = StrictRoceGather(lambda sh: sh.repeat(world, 1))
+    seen_kv.clear()
+    term_boundary.global_kv = FakeGlobalKV()
+    suffix, state, attn_mix = term_boundary((res_in,), pm_in, md, indices)
+    assert suffix is not None
+    assert seen_kv == [((tokens, 5120), "idx0")]
+    assert term_boundary.norm_gather.calls == 1
+    assert term_boundary.res_gather.calls == 1
+    assert term_boundary.state_gather.calls == 1
+    r_out, p_out, c_out, n_out = state
+    assert r_out.shape == (128, 4, 5120)
+    assert p_out.shape == (128, 4) and torch.all(p_out == 1.5)
+    assert c_out.shape == (128, 4, 4) and torch.all(c_out == 2.5)
+    assert n_out.shape == (128, 5120)
+    assert attn_mix.shape == (128, 4) and torch.all(attn_mix == 0.5)
