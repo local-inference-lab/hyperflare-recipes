@@ -31,7 +31,7 @@ def expert_format(precision, layer):
     return formats[0]
 
 
-@weight_container(("w13", "s13", "g13", "w2", "s2", "g2"))
+@weight_container(("w13", "s13", "g13", "w2", "s2", "g2", "s13_exc", "s13_slab_offsets", "s2_exc", "s2_slab_offsets"))
 @dataclass(frozen=True)
 class MiniExperts:
     w13: torch.Tensor
@@ -41,29 +41,47 @@ class MiniExperts:
     s2: torch.Tensor
     g2: torch.Tensor
     nvfp4: bool
+    s13_exc: torch.Tensor | None = None
+    s13_slab_offsets: torch.Tensor | None = None
+    s2_exc: torch.Tensor | None = None
+    s2_slab_offsets: torch.Tensor | None = None
 
 
-def load_experts(loader, layer, *, shard):
+def load_experts(loader, layer, *, shard, expert_scale_compression=None):
     from ignition.preparation.persistent import persistent_copy
 
     # Per-token maxima cover the complete intermediate vector. Partitioning
     # intermediate channels would change the quantizer without a global maximum.
     if shard.world_size != 1:
         raise ValueError("Mini expert loading requires one rank to preserve per-token activation scales")
+    if expert_scale_compression not in (None, "csf"):
+        raise ValueError(f"unsupported Inkling-2-Mini expert scale compression: {expert_scale_compression!r}")
     fmt = expert_format(loader.config.quantization, layer)
     c = loader.config.text
     prefix = f"model.llm.layers.{layer}.mlp.experts."
     pack, block = (2, 16) if fmt == "nvfp4" else (1, 32)
+    use_csf = fmt == "nvfp4" and expert_scale_compression == "csf"
     values = []
+    csf_extras = []
     for projection, n, k in (("w13", 2 * c.intermediate, c.hidden), ("w2", c.hidden, c.intermediate)):
         weight = loader.load_tensor(prefix + projection + "_weight")
-        scale = loader.load_tensor(prefix + projection + "_weight_scale")
+        scale = loader.load_tensor(prefix + projection + "_weight_scale", temporary=use_csf)
         if weight.shape != (c.experts, n, k // pack) or scale.shape != (c.experts, n, k // block):
             raise ValueError(f"{prefix}{projection} has invalid expert storage geometry")
         if weight.dtype != (torch.uint8 if fmt == "nvfp4" else torch.float8_e4m3fn):
             raise ValueError(f"{prefix}{projection} has invalid weight storage dtype")
         if scale.dtype != (torch.float8_e4m3fn if fmt == "nvfp4" else torch.uint8):
             raise ValueError(f"{prefix}{projection} has invalid scale storage dtype")
+        if use_csf:
+            from b12x._lib.quant.csf_encode import encode_csf_source
+            from b12x.moe import situ_moe
+
+            csf = encode_csf_source(scale.view(torch.uint8), quantization="nvfp4")
+            exc, slab_offsets = situ_moe.partition_csf_slab_offsets(
+                csf.components[1], csf.starts, c.experts, n, k // block
+            )
+            scale = persistent_copy(csf.components[0])
+            csf_extras.extend((persistent_copy(exc), persistent_copy(slab_offsets)))
         if fmt == "nvfp4":
             amax = loader.load_tensor(prefix + projection + "_weight_amax", temporary=True)
             denominator = loader.load_tensor(prefix + projection + "_weight_outer_scale_denominator", temporary=True)
@@ -78,4 +96,8 @@ def load_experts(loader, layer, *, shard):
         else:
             gain = persistent_copy(torch.ones(c.experts, device=loader.device, dtype=torch.float32))
         values.extend((weight, scale, gain))
+    if use_csf:
+        return MiniExperts(*values, nvfp4=True,
+                           s13_exc=csf_extras[0], s13_slab_offsets=csf_extras[1],
+                           s2_exc=csf_extras[2], s2_slab_offsets=csf_extras[3])
     return MiniExperts(*values, nvfp4=fmt == "nvfp4")

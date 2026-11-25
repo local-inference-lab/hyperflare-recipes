@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import torch
 
-from hyperflare_recipes.components.collectives import PreparedAllGather, PreparedChunkedAllReduce
+from ignition.components.collectives import PreparedAllGather, PreparedChunkedAllReduce
 from hyperflare_recipes.components.rms_norm import PreparedTorchRMSNorm
 from hyperflare_recipes.components.situ_experts import PreparedSiTUExperts
 from ignition.preparation.examples import declaration_tensor
@@ -41,8 +41,9 @@ class PreparedLoopLayer(PreparedLayer):
                     hidden=text.hidden, eps=text.eps, device=weights.router.device, examples=examples)
 
     def _build_experts(self, source, weights, routes, *, tokens, mode, session, workspace, name, example):
-        del source, routes, mode, session, workspace, name, example
-        return PreparedSiTUExperts(weights.experts, tokens=tokens, top_k=self.text.experts_per_token)
+        del source, routes, mode, example
+        return PreparedSiTUExperts(weights.experts, tokens=tokens, top_k=self.text.experts_per_token,
+                                   session=session, workspace=workspace, name=f"{name}.experts")
 
     def forward(self, state, metadata, cross_pass=None):
         t, m = self.text, metadata

@@ -70,13 +70,14 @@ class ModelWeights:
 
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, drafting=True, vision=True, layers=None,
-             draft_head_quantization=None, markov_head_quantization=None):
+             draft_head_quantization=None, markov_head_quantization=None, expert_scale_compression=None):
         before = torch.cuda.memory_allocated(device)
         loader_type = InklingWeightLoader
         if "model.llm.embed.weight" in manifest.tensors:
             from .mini_weights import MiniWeightLoader
             loader_type = MiniWeightLoader
-        with loader_type(manifest, device, shard=shard, progress=progress, vision=vision) as loader:
+        with loader_type(manifest, device, shard=shard, progress=progress, vision=vision,
+                         expert_scale_compression=expert_scale_compression) as loader:
             c = loader.config
             count = c.text.layers if layers is None else layers
             if type(count) is not int or not 1 <= count <= c.text.layers:
@@ -122,11 +123,12 @@ class ModelWeights:
 
 
 class InklingWeightLoader(DirectWeightLoader):
-    def __init__(self, manifest, device, *, shard, progress=None, vision=True):
+    def __init__(self, manifest, device, *, shard, progress=None, vision=True, expert_scale_compression=None):
         super().__init__(manifest, device, progress=progress)
         self.config = ModelConfig.load(manifest.snapshot)
         self.config.validate_shard(shard)
         self.shard, self.vision = shard, vision
+        self.expert_scale_compression = expert_scale_compression
 
     @cached_property
     def quantization(self):
@@ -179,7 +181,8 @@ class InklingWeightLoader(DirectWeightLoader):
                                       separate_inputs=c.loop is not None and c.loop.core_start <= index < c.loop.core_end)
         attention_query = None if index == 0 else scaled_query(
             self.load_tensor(prefix + ".attention_input.query"), c.hidden)
-        return LayerWeights(attention, load_experts(self, index, shard=s),
+        return LayerWeights(attention, load_experts(self, index, shard=s,
+                                                    expert_scale_compression=self.expert_scale_compression),
             self.load_tensor(prefix + ".mlp.gate.weight"),
             self.load_tensor(prefix + ".mlp.gate.e_score_correction_bias"),
             self.load_tensor(prefix + ".post_attention_convolution.conv1d.weight"),

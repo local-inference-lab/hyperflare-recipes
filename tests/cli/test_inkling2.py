@@ -155,3 +155,30 @@ def test_mini_rejects_undeclared_proposal_head_quantization():
                 ),
             ),
         )
+
+
+def test_mini_expert_scale_compression_csf_plans_and_prepares(monkeypatch, tmp_path):
+    from hyperflare_recipes.recipes.inkling2 import bootstrap
+
+    model = ResolvedModel(MINI_RECIPE, MINI_RECIPE.checkpoints[0])
+    native_args = parse_args(["export", model.checkpoint.alias, "--no-mtp"], recipes=recipes())
+    csf_args = parse_args(["export", model.checkpoint.alias, "--no-mtp", "--expert-scale-compression", "csf"], recipes=recipes())
+    native_plan = derive(model=MINI_RECIPE, gpus=(gpu(0, 31),), selected=(0,),
+                         parameters=preparation.resolve_parameters(model, native_args))
+    csf_plan = derive(model=MINI_RECIPE, gpus=(gpu(0, 31),), selected=(0,),
+                      parameters=preparation.resolve_parameters(model, csf_args))
+    assert csf_plan.weights_bytes < native_plan.weights_bytes
+    assert native_plan.weights_bytes - csf_plan.weights_bytes == 20_263_810_112 - 19_654_436_240
+    assert csf_plan.pages > native_plan.pages
+
+    captured = []
+    configuration = bootstrap.PreparationConfig
+    class ConfigurationCaptured(Exception):
+        pass
+    def capture_config(**kwargs):
+        captured.append(configuration(**kwargs))
+        raise ConfigurationCaptured
+    monkeypatch.setattr(bootstrap, "PreparationConfig", capture_config)
+    with pytest.raises(ConfigurationCaptured):
+        MINI_RECIPE.prepare(tmp_path, csf_plan, compile_forwards=False, kernel_cache=None, progress=None)
+    assert captured.pop().expert_scale_compression == "csf"

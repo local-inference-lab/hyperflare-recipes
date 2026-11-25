@@ -22,10 +22,36 @@ import triton
 import triton.language as tl
 from triton.language.extra.cuda import libdevice
 from triton.runtime.jit import MockTensor
+from b12x.moe import situ_moe
 from b12x.moe.fused_moe._token_outer import _clear, _pack, _tasks
+from b12x.preparation import PreparationSession, PreparedCall, plan_from_handle
 
+from ignition.preparation.scratch import planned_scratch, prime_owners
 from ignition.preparation.triton import prepare_triton, launch_triton
+from ignition.preparation.tuning import declare, register_finalizer
 from hyperflare_recipes.components.four_six_quantization import _quantize_block
+
+
+@torch.library.custom_op("flare::situ_moe", mutates_args=("output", "scratch"))
+def _situ_moe_op(x: torch.Tensor, ids: torch.Tensor, weights: torch.Tensor,
+                 w13: torch.Tensor, s13: torch.Tensor, w2: torch.Tensor, s2: torch.Tensor,
+                 g13: torch.Tensor | None, g2: torch.Tensor | None,
+                 s13_exc: torch.Tensor | None, s13_slab_offsets: torch.Tensor | None,
+                 s2_exc: torch.Tensor | None, s2_slab_offsets: torch.Tensor | None,
+                 output: torch.Tensor, scratch: list[torch.Tensor], handle: int) -> None:
+    plan = plan_from_handle(handle)
+    situ_moe.run(situ_moe.bind(
+        plan, scratch=scratch, x=x, ids=ids, weights=weights,
+        w13=w13, s13=s13, w2=w2, s2=s2, output=output,
+        g13=g13, g2=g2, s13_exc=s13_exc, s13_slab_offsets=s13_slab_offsets,
+        s2_exc=s2_exc, s2_slab_offsets=s2_slab_offsets))
+
+
+@_situ_moe_op.register_fake
+def _fake_situ_moe_op(x, ids, weights, w13, s13, w2, s2, g13, g2,
+                      s13_exc, s13_slab_offsets, s2_exc, s2_slab_offsets,
+                      output, scratch, handle):
+    pass
 
 
 @triton.jit
@@ -140,14 +166,83 @@ def _gemm_tile(tokens, nvfp4):
 
 
 class PreparedSiTUExperts:
-    def __init__(self, weights, *, tokens, top_k):
+    def __init__(self, weights, *, tokens, top_k, session=None, workspace=None, name=None):
         self.weights, self.tokens, self.top_k = weights, tokens, top_k
         self.hidden, self.intermediate = weights.w2.shape[1], weights.w13.shape[1] // 2
         self.experts, self.rows = weights.w2.shape[0], tokens * top_k
+        self.has_csf = getattr(weights, "s13_exc", None) is not None
+        self.plan = None
+        self._scratch_layout = None
+        fmt = "nvfp4" if weights.nvfp4 else "mxfp8"
+        device = weights.w13.device
+        can_b12x = (
+            situ_moe.is_supported(device)
+            and situ_moe.supports(
+                weight_format=fmt,
+                hidden=self.hidden,
+                intermediate=self.intermediate,
+                num_experts=self.experts,
+                top_k=top_k,
+                max_tokens=tokens,
+                has_csf=self.has_csf,
+            )
+        )
+        if can_b12x and (session is not None and workspace is not None or self.has_csf):
+            caps = situ_moe.Caps(
+                device=device,
+                weight_format=fmt,
+                hidden=self.hidden,
+                intermediate=self.intermediate,
+                num_experts=self.experts,
+                top_k=top_k,
+                max_tokens=tokens,
+                has_csf=self.has_csf,
+            )
+            self.plan = situ_moe.plan(caps)
+            if session is not None and workspace is not None:
+                w = self.weights
+
+                def prepare_call(state):
+                    specs = state.scratch_specs()
+                    scratch = planned_scratch(specs, workspace)
+                    scratch = list(scratch) if isinstance(scratch, tuple) else [scratch]
+                    x_ex = torch.zeros((tokens, self.hidden), dtype=torch.bfloat16, device=device)
+                    ids_ex = torch.full((tokens, top_k), -1, dtype=torch.int32, device=device)
+                    rw_ex = torch.zeros((tokens, top_k), dtype=torch.float32, device=device)
+                    out_ex = torch.empty_like(x_ex)
+                    binding = state.bind(
+                        plan=self.plan, scratch=scratch, x=x_ex, ids=ids_ex, weights=rw_ex,
+                        w13=w.w13, s13=w.s13, w2=w.w2, s2=w.s2, output=out_ex,
+                        g13=w.g13 if w.nvfp4 else None, g2=w.g2 if w.nvfp4 else None,
+                        s13_exc=w.s13_exc, s13_slab_offsets=w.s13_slab_offsets,
+                        s2_exc=w.s2_exc, s2_slab_offsets=w.s2_slab_offsets,
+                    )
+                    return PreparedCall(
+                        run=lambda: state.run(binding),
+                        owners=prime_owners(workspace, scratch, binding, x_ex, ids_ex, rw_ex, out_ex),
+                    )
+
+                declare(session, (self.plan.request(name=name or "situ_moe", prepare_call=prepare_call),))
+                register_finalizer(session, self._bind_scratch, workspace=workspace)
+            else:
+                with PreparationSession(device=device) as local_session:
+                    local_session.prepare((
+                        self.plan.request(
+                            name=name or "situ_moe",
+                            prepare_call=lambda state: PreparedCall(run=lambda: None),
+                        ),
+                    ))
+                self._bind_scratch()
+            return
+        if self.has_csf:
+            raise RuntimeError("CSF expert scale compression requires SM120/SM121 b12x.moe.situ_moe support")
         self.bm, self.bn, self.bk, self.num_warps = _gemm_tile(tokens, weights.nvfp4)
         self.tasks = triton.cdiv(self.rows, self.bm) + self.experts
         self.programs = {}
         self._declare()
+
+    def _bind_scratch(self):
+        self._scratch_layout = tuple((tuple(spec.shape), spec.dtype) for spec in self.plan.scratch_specs())
 
     def _call(self, name, kernel, args, grid, **options):
         grid = (*grid, *((1,) * (3 - len(grid))))
@@ -205,4 +300,18 @@ class PreparedSiTUExperts:
         return torch.where((ids >= 0)[:, :, None], output, 0).sum(1).to(torch.bfloat16)
 
     def __call__(self, source, ids, weights):
+        if self.plan is not None:
+            if self._scratch_layout is None:
+                raise RuntimeError("prepared b12x situ_moe requires finalized preparation")
+            w = self.weights
+            output = torch.empty_like(source)
+            scratch = [torch.empty(shape, dtype=dtype, device=source.device) for shape, dtype in self._scratch_layout]
+            _situ_moe_op(
+                source, ids, weights,
+                w.w13, w.s13, w.w2, w.s2,
+                w.g13 if w.nvfp4 else None, w.g2 if w.nvfp4 else None,
+                w.s13_exc, w.s13_slab_offsets, w.s2_exc, w.s2_slab_offsets,
+                output, scratch, self.plan.handle,
+            )
+            return output
         return self._execute(source, ids, weights)
