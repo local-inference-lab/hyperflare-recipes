@@ -57,6 +57,14 @@ def test_mini_visits_and_cache_storage(mini_config_dir):
     assert cache.global_layers == (5, 11, 17, 23, 29, 35, 41, 47)
     assert sum(s[0] for _, s in page_specs(cache, geometry)) == 2097152
     assert config.draft.taps == (5, 23, 41, 48)
+    draft_layout = continuation_layout(cache, geometry, config.draft)
+    assert draft_layout.row_bytes == 102_891_520
+    assert sum(s[0] for _, s in page_specs(cache, geometry, config.draft)) == 2_359_296
+    for layer in sorted(config.draft.local_layers):
+        for kind in ("key", "value"):
+            region = draft_layout.region(f"draft{layer}.{kind}")
+            assert region.shape == (config.draft.window, geometry.kv_heads, geometry.head_dim)
+            assert region.dtype == torch.float8_e4m3fn
 
 
 def test_public_release_configuration(mini_config_dir):

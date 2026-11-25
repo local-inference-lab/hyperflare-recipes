@@ -21,6 +21,14 @@ def rotary(values, positions, inverse):
     return torch.cat((left * cosine - right * sine, right * cosine + left * sine), -1).to(values.dtype)
 
 
+def _cast_kv(values, dtype):
+    if values.dtype == dtype:
+        return values
+    if dtype == torch.float8_e4m3fn:
+        return values.clamp(-448.0, 448.0).to(dtype)
+    return values.to(dtype)
+
+
 def stage_window(history, values, metadata, pages):
     """Stage the same committed suffix before every query in a noncausal block."""
     m = metadata
@@ -31,10 +39,11 @@ def stage_window(history, values, metadata, pages):
     positions = m.starts[:, None] - prefix + offsets
     previous = history[m.state_rows[:, None], positions.remainder(window)]
     indices = (m.query_start_loc[:-1, None] + offsets - prefix).clamp(0, values.shape[0] - 1)
-    current = values[indices]
+    current = _cast_kv(values, history.dtype)[indices]
     valid = (m.lengths[:, None] > 0) & (offsets < prefix + m.lengths[:, None])
+    zero = torch.zeros((), dtype=history.dtype, device=values.device)
     return torch.where(valid[:, :, None, None],
-        torch.where((offsets < prefix)[:, :, None, None], previous, current), 0).view(
+        torch.where((offsets < prefix)[:, :, None, None], previous, current), zero).view(
             rows * pages, 128, *values.shape[1:])
 
 
@@ -49,10 +58,11 @@ def stage_paged_tail(history, values, metadata, pages):
     source_pages = m.page_table[requests, columns].long().clamp_min(0)
     previous = history[source_pages[:, None], offsets.remainder(page_tokens)]
     indices = (m.query_start_loc[:-1, None] + offsets - prefix).clamp(0, values.shape[0] - 1)
-    current = values[indices]
+    current = _cast_kv(values, history.dtype)[indices]
     valid = (m.lengths[:, None] > 0) & (offsets < prefix + m.lengths[:, None])
+    zero = torch.zeros((), dtype=history.dtype, device=values.device)
     return torch.where(valid[:, :, None, None],
-        torch.where((offsets < prefix)[:, :, None, None], previous, current), 0).view(
+        torch.where((offsets < prefix)[:, :, None, None], previous, current), zero).view(
             rows * pages, page_tokens, *values.shape[1:])
 
 

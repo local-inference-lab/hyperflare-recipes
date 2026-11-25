@@ -132,7 +132,7 @@ class DraftAttention:
             self.pages = persistent_copy(torch.arange(rows * self.pages_per_row, device=scratch.hidden.device,
                 dtype=torch.int32).view(rows, self.pages_per_row))
             shape = (rows * self.pages_per_row, 128, *self.key_shape[1:])
-            key, value = (torch.empty(shape, dtype=torch.bfloat16, device=scratch.hidden.device) for _ in range(2))
+            key, value = (torch.empty(shape, dtype=self.key_cache.dtype, device=scratch.hidden.device) for _ in range(2))
             tail = {}
         else:
             self.key_cache, self.value_cache = pool.key(index, draft=True), pool.value(index, draft=True)
