@@ -113,6 +113,74 @@ def test_packed_causal_convolution_replay_preserves_raw_history(channels, heads,
         assert torch.equal(backing[:, 3 * channels:], padding)
 
 
+@pytest.mark.parametrize("channels,heads,requests,weight_dtype", [
+    (2304, 0, 1, torch.float32), (2304, 0, 4, torch.float32), (2304, 0, 16, torch.bfloat16),
+    (1024, 8, 1, torch.bfloat16), (1024, 8, 8, torch.float32), (257, 0, 7, torch.bfloat16),
+    (258, 2, 7, torch.float32),
+])
+@torch.no_grad()
+def test_fused_decode_causal_convolution_bit_exact_and_single_graph_node(channels, heads, requests, weight_dtype):
+    from ignition import runtime_patches
+    from hyperflare_recipes.components.causal_convolution import PreparedCausalConvolution
+
+    runtime_patches.apply()
+    device = torch.device("cuda:0")
+    torch.manual_seed(913)
+    # Mix active/inactive rows and starts 0, 1, 2, >=3 to exercise every history boundary.
+    lengths = torch.tensor([1 if i % 3 != 1 else 0 for i in range(requests)], dtype=torch.int32, device=device)
+    if requests == 1:
+        lengths[0] = 1
+    begins = torch.cat((torch.zeros(1, dtype=torch.int32, device=device), lengths.cumsum(0).int()))
+    starts = torch.tensor([i % 5 for i in range(requests)], dtype=torch.int32, device=device)
+    rows = torch.arange(requests, device=device)
+    req_ids = (rows[:, None] >= begins[1:]).sum(-1).clamp_max(requests - 1)
+    live = rows < begins[-1]
+    positions = torch.where(live, starts[req_ids], -1)
+    req_ids = torch.where(live, req_ids, -1)
+    state_rows = torch.arange(requests, 0, -1, dtype=torch.int64, device=device)
+    metadata = SimpleNamespace(lengths=lengths, starts=starts, query_start_loc=begins,
+        state_rows=state_rows, requests=req_ids, positions=positions)
+
+    source = torch.randn(requests, channels + 11, dtype=torch.bfloat16, device=device)[:, :channels]
+    backing_ref = torch.randn(requests + 2, 3 * channels + 32, dtype=torch.bfloat16, device=device)
+    backing_fused = backing_ref.clone()
+    hist_ref = backing_ref[:, :3 * channels].view(requests + 2, 3, channels)
+    hist_fused = backing_fused[:, :3 * channels].view(requests + 2, 3, channels)
+    original = hist_ref.clone()
+    padding = backing_ref[:, 3 * channels:].clone()
+    weight = torch.randn((4, channels) if heads else (channels, 1, 4), dtype=weight_dtype, device=device)
+    dynamic = (torch.randn(requests, heads * 4 + 3, dtype=torch.bfloat16, device=device)[:, :heads * 4]
+               .view(requests, heads, 4)) if heads else None
+
+    op_ref = PreparedCausalConvolution(weight, hist_ref, dynamic_heads=heads)
+    op_fused = PreparedCausalConvolution(weight, hist_fused, dynamic_heads=heads)
+    # Warmup
+    op_fused.forward_and_commit(source, metadata, dynamic=dynamic)
+    hist_fused.copy_(original)
+
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    with torch.cuda.graph(graph):
+        out_fused = op_fused.forward_and_commit(source, metadata, dynamic=dynamic)
+    graph.instantiate()
+    assert _nodes(graph) == 1
+
+    for step in range(4):
+        hist_ref.copy_(original)
+        hist_fused.copy_(original)
+        starts.copy_(torch.tensor([(i + step) % 6 for i in range(requests)], dtype=torch.int32, device=device))
+        positions.copy_(torch.where(live, starts[req_ids], -1))
+        out_ref, prev = op_ref(source, metadata, dynamic=dynamic)
+        op_ref.commit(prev, source, metadata)
+        out_fused.fill_(float("nan"))
+        allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+        assert torch.equal(out_fused, out_ref)
+        assert torch.equal(hist_fused, hist_ref)
+        assert torch.equal(backing_fused[:, 3 * channels:], padding)
+
+
 @pytest.mark.parametrize("heads", [0, 2])
 @torch.no_grad()
 def test_verification_history_snapshot_survives_until_separate_commit(heads):
