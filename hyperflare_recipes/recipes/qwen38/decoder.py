@@ -70,12 +70,18 @@ class ModelWeights:
     vision: VisionWeights
     allocated_bytes: int
     shard: TensorParallelShard = TensorParallelShard(0, 1)
+    target_head: object | None = None
+
+    @property
+    def lm_head_weight(self):
+        return self.tree.lm_head.weight if self.target_head is None else self.target_head
 
     @classmethod
     def load(cls, manifest: CheckpointManifest, device: torch.device,
              *, progress: Callable[[str], None] | None = None,
              shard: TensorParallelShard = TensorParallelShard(0, 1),
-             shard_hyperconnections: bool = False, force_moe_decode_a16: bool = False) -> ModelWeights:
+             shard_hyperconnections: bool = False, force_moe_decode_a16: bool = False,
+             target_head_quantization: str | None = None) -> ModelWeights:
         device = torch.device(device)
         if device.type != "cuda":
             raise ValueError("model weights require a CUDA device")
@@ -114,8 +120,12 @@ class ModelWeights:
                                    tuple(extents.get(f"{name}.weight") for name in selected), temporary=temporary)
                 packed_down_projection(tree.get_submodule(prefix))
 
-            parameters((f"{TEXT_PREFIX}.embed_tokens.weight", "lm_head.weight"),
-                       (None, slice(*shard.partition(248320))))
+            if target_head_quantization is None:
+                parameters((f"{TEXT_PREFIX}.embed_tokens.weight", "lm_head.weight"),
+                           (None, slice(*shard.partition(248320))))
+            else:
+                parameters((f"{TEXT_PREFIX}.embed_tokens.weight",))
+                parameters(("lm_head.weight",), (slice(*shard.partition(248320)),), temporary=True)
             hyperconnection(f"{TEXT_PREFIX}.hyper_connection_mixer")
             for layer in range(48):
                 prefix = f"{TEXT_PREFIX}.layers.{layer}"
@@ -519,18 +529,27 @@ class PreparedDecoder:
         else:
             state.prepare_rope_delta()
         state.prepare_residual(scratch.residual)
+        lm_head_weight = getattr(weights, "lm_head_weight", weights.tree.lm_head.weight)
         if not self.sample:
             self.lm_head = None
         elif vocabulary_runtime is None:
-            self.lm_head = UnquantizedProjection(scratch.sample_hidden, weights.tree.lm_head.weight,
-                scratch.logits, session=session, name=f"{name}.lm_head")
+            if lm_head_weight is None or isinstance(lm_head_weight, torch.Tensor):
+                self.lm_head = UnquantizedProjection(scratch.sample_hidden, lm_head_weight,
+                    scratch.logits, session=session, name=f"{name}.lm_head")
+            else:
+                from hyperflare_recipes.components.linear import QuantizedProjection
+
+                self.lm_head = QuantizedProjection(scratch.sample_hidden, lm_head_weight,
+                    scratch.logits, session=session, name=f"{name}.lm_head",
+                    activation_mode="auto", workspace=workspaces)
         else:
             from hyperflare_recipes.components.vocabulary import PreparedVocabularyProjection
 
-            self.lm_head = PreparedVocabularyProjection(scratch.sample_hidden, weights.tree.lm_head.weight,
+            self.lm_head = PreparedVocabularyProjection(scratch.sample_hidden, lm_head_weight,
                 scratch.local_logits, scratch.logits, runtime=vocabulary_runtime, session=session,
-                coordinator=coordinator, name=f"{name}.lm_head")
-        self.scoring = None if scoring is None else scoring.prepare(scratch.hidden, weights.tree.lm_head.weight,
+                coordinator=coordinator, name=f"{name}.lm_head",
+                activation_mode="auto", workspace=workspaces)
+        self.scoring = None if scoring is None else scoring.prepare(scratch.hidden, lm_head_weight,
             vocabulary=248320, session=session, coordinator=coordinator, name=name + ".prompt")
         self.sampler = None
         self.completion_recorder = None

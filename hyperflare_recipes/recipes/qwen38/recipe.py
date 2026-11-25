@@ -56,6 +56,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         online_mxfp8=plan.online_mxfp8,
         force_moe_decode_a16=plan.force_moe_decode_a16,
         shard_hyperconnections=plan.shard_hyperconnections,
+        target_head_quantization=getattr(plan, "target_head_quantization", None),
         lock_gpu_clocks=plan.lock_gpu_clocks and plan.autotune_effort != "off",
         devices=tuple(range(plan.world_size)) if ranks is None else (0,) * plan.world_size,
         hosts=None if ranks is None else ranks.hosts, compile_decoder=compile_forwards, retain_graphs=retain_graphs,
@@ -121,6 +122,7 @@ RECIPE = Recipe(
         }), draft_bytes=WEIGHT_BYTES),
     }),
     online_mxfp8=True, draft_head_quantizations=("mxfp8", "nvfp4"),
+    target_head_quantizations=("mxfp8",),
     moe_decode_a16_intermediate_width=640, shard_hyperconnections=True,
     max_images=4, image_bytes=32 << 20, mixed_prefill=True,
 )
