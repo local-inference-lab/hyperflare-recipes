@@ -144,10 +144,17 @@ class PreparedDecoderBoundary:
 
     def __init__(self, index, weights, source, target, packing, pool, rotary, *, carry,
                  session, name, workspace, window_metadata, source_indices,
-                 row_shard_dma=False, shard=None, runtime=None, coordinator=None, examples=None):
+                 row_shard_dma=False, row_shard_roce=False, shard=None, runtime=None,
+                 coordinator=None, examples=None):
         self.packing = packing
         self.row_shard_dma = bool(row_shard_dma)
+        self.row_shard_roce = bool(row_shard_roce)
+        if self.row_shard_dma and self.row_shard_roce:
+            raise ValueError("decoder boundary cannot combine DMA and RoCE row-sharding")
         text = pool.config.text
+        global_kv_source = source.attention_hc.normalized
+        global_kv_row_shard = False
+        self.norm_gather = self.res_gather = self.state_gather = None
         if self.row_shard_dma:
             tokens = source.attention.output.shape[0]
             h = tokens // 2
@@ -187,6 +194,37 @@ class PreparedDecoderBoundary:
                     name=name + ".boundary_state_gather.1").functional(session=session)
             else:
                 self.res_gather_0 = self.res_gather_1 = self.state_gather_0 = self.state_gather_1 = None
+        elif self.row_shard_roce:
+            tokens = source.attention.output.shape[0]
+            s = tokens // shard.world_size
+            self.shard_tokens = s
+            incoming = ((source.mlp_output[:s], source.ffn_hc.residual[:s], source.ffn_hc.post[:s], source.ffn_hc.comb[:s])
+                        if carry else (source.residual[:s],))
+            self.mhc = PreparedMHC(incoming, _mhc_weights(weights, "attn", "attn_norm"), source.attention_hc.rows(s),
+                session=session, name=name + ".attn_hc", workspace=workspace,
+                pre_mix=source.pre_mix[:s], pre_out=source.attn_mix[:s], rms_eps=text["rms_norm_eps"],
+                norm_eps=text["rms_norm_eps"], hc_eps=text["hc_eps"], sinkhorn_iters=text["hc_sinkhorn_iters"]).functional()
+            self.norm_gather_0 = self.norm_gather_1 = None
+            self.res_gather_0 = self.res_gather_1 = self.state_gather_0 = self.state_gather_1 = None
+            if packing is None:
+                # Encoder-only boundary only needs the compact compressed KV projection.
+                global_kv_source = source.attention_hc.normalized[:s]
+                global_kv_row_shard = True
+            else:
+                self.norm_gather = PreparedGatherShards(
+                    source.attention_hc.normalized[:s], source.attention_hc.normalized,
+                    runtime=runtime, session=session, coordinator=coordinator,
+                    name=name + ".boundary_norm_gather").functional(session=session)
+                self.res_gather = PreparedChunkedGatherShards(
+                    source.attention_hc.residual[:s], source.attention_hc.residual,
+                    runtime=runtime, session=session, coordinator=coordinator,
+                    name=name + ".boundary_res_gather", examples=examples).functional(session=session)
+                dev = source.residual.device
+                state_in = declaration_tensor(examples, "row_shard_roce.boundary_state_in", (s, 48), torch.bfloat16, dev)
+                state_out = declaration_tensor(examples, "row_shard_roce.boundary_state_out", (tokens, 48), torch.bfloat16, dev)
+                self.state_gather = PreparedGatherShards(
+                    state_in, state_out, runtime=runtime, session=session, coordinator=coordinator,
+                    name=name + ".boundary_state_gather").functional(session=session)
         else:
             incoming = ((source.mlp_output, source.ffn_hc.residual, source.ffn_hc.post, source.ffn_hc.comb)
                         if carry else (source.residual,))
@@ -196,9 +234,9 @@ class PreparedDecoderBoundary:
                 norm_eps=text["rms_norm_eps"], hc_eps=text["hc_eps"], sinkhorn_iters=text["hc_sinkhorn_iters"]).functional()
             self.norm_gather_0 = self.norm_gather_1 = None
             self.res_gather_0 = self.res_gather_1 = self.state_gather_0 = self.state_gather_1 = None
-        self.global_kv = PreparedGlobalKV(index, weights.attention, source.attention_hc.normalized, source.attention,
+        self.global_kv = PreparedGlobalKV(index, weights.attention, global_kv_source, source.attention,
             source_indices.metadata, pool, rotary, session=session, name=name + ".global_kv",
-            indices=source_indices)
+            indices=source_indices, row_shard=global_kv_row_shard, runtime=runtime, coordinator=coordinator)
         self.indexer = None
         if packing is None:
             from hyperflare_recipes.components.mxfp4_indexer import PreparedMXFP4Indexer
@@ -263,6 +301,26 @@ class PreparedDecoderBoundary:
             comb = g[:, 4:20].contiguous().view(g.shape[0], 4, 4)
             attn_mix = g[:, 20:24].contiguous()
             return suffix, tuple(suffix.gather(value) for value in (residual, post, comb, normalized)), suffix.gather(attn_mix)
+        if self.row_shard_roce:
+            attn_mix_sh = torch.empty_like(pre_mix)
+            r_sh, p_sh, c_sh, norm_sh = self.mhc(*incoming, pre_mix=pre_mix, pre_out=attn_mix_sh)
+            if suffix is None:
+                self.global_kv(norm_sh, self.indexer if indexer is None else indexer, metadata,
+                    indices.compressed(self.global_kv.ratio),
+                    angles=indices.angles[(True, self.global_kv.ratio)])
+                return None, None, None
+            normalized = self.norm_gather(norm_sh)
+            self.global_kv(normalized, self.indexer if indexer is None else indexer, metadata,
+                indices.compressed(self.global_kv.ratio),
+                angles=indices.angles[(True, self.global_kv.ratio)])
+            residual = self.res_gather(r_sh)
+            s = self.shard_tokens
+            st_sh = torch.cat((p_sh, c_sh.view(s, 16), attn_mix_sh), dim=1).view(torch.bfloat16)
+            g = self.state_gather(st_sh).view(torch.float32)
+            post = g[:, :4].contiguous()
+            comb = g[:, 4:20].contiguous().view(g.shape[0], 4, 4)
+            attn_mix = g[:, 20:24].contiguous()
+            return suffix, tuple(suffix.gather(value) for value in (residual, post, comb, normalized)), suffix.gather(attn_mix)
         attn_mix = torch.empty_like(pre_mix)
         residual, post, comb, normalized = self.mhc(*incoming, pre_mix=pre_mix, pre_out=attn_mix)
         self.global_kv(normalized, self.indexer if indexer is None else indexer, metadata,
@@ -279,7 +337,8 @@ class PreparedLayer:
                  boundary=None, replay_start=None, window_staging=None, mla_compute_mode="auto",
                  window_metadata=None, examples=None, pipelined_ffn=False, pipelined_attn_hc=False,
                  defer_mlp_b=False, defer_engram_reduce=False, pipelined_attn=None,
-                 row_shard_dma=False, shard_rows=None):
+                 row_shard_dma=False, row_shard_roce=False, row_shard_attn=False,
+                 shard_rows=None, shard_attention_scratch=None, window_target=None):
         s, text = scratch, pool.config.text
         self.scratch, self.carry = s, carry
         self.metadata = metadata
@@ -291,10 +350,20 @@ class PreparedLayer:
         self.pipelined_attn = pipelined_attn
         self.defer_mlp_b = bool(defer_mlp_b)
         self.row_shard_dma = bool(row_shard_dma)
+        self.row_shard_roce = bool(row_shard_roce)
+        self.row_shard_attn = bool(row_shard_attn) and self.row_shard_roce
+        if self.row_shard_dma and self.row_shard_roce:
+            raise ValueError("a layer cannot combine DMA and RoCE row-sharded prefill")
         tokens = s.attention.output.shape[0]
         h = tokens // 2
         self.half_tokens = h
-        self.shard_tokens = h // shard.world_size if self.row_shard_dma else 0
+        if self.row_shard_dma:
+            self.shard_tokens = h // shard.world_size
+        elif self.row_shard_roce:
+            self.shard_tokens = tokens // shard.world_size
+        else:
+            self.shard_tokens = 0
+        self.shard_rows = self.shard_offset = None
         if self.row_shard_dma:
             if shard_rows is None:
                 dev = s.residual.device
@@ -305,6 +374,15 @@ class PreparedLayer:
                 self.shard_offset_b = persistent_copy(torch.tensor([h + s0], dtype=torch.int32, device=dev))
             else:
                 self.shard_rows_a, self.shard_rows_b, self.shard_offset_a, self.shard_offset_b = shard_rows
+        elif self.row_shard_roce:
+            self.shard_rows_a = self.shard_rows_b = self.shard_offset_a = self.shard_offset_b = None
+            if shard_rows is None:
+                dev = s.residual.device
+                s0 = shard.rank * self.shard_tokens
+                self.shard_rows = persistent_copy(torch.arange(s0, s0 + self.shard_tokens, dtype=torch.int64, device=dev))
+                self.shard_offset = persistent_copy(torch.tensor([s0], dtype=torch.int32, device=dev))
+            else:
+                self.shard_rows, self.shard_offset = shard_rows
         else:
             self.shard_rows_a = self.shard_rows_b = self.shard_offset_a = self.shard_offset_b = None
         self.attn_quantizer_plan = None
@@ -313,8 +391,10 @@ class PreparedLayer:
         self.ffn_quantizer_plan = None
         self.ffn_local_shapes = None
         self.ffn_meta_scale_cols = 0
+        self.attn_gather = None
         self.attn_gather_0 = self.attn_gather_1 = None
         self.cr_attn_gather_0 = self.cr_attn_gather_1 = None
+        self.ffn_vals_gather = self.ffn_meta_gather = None
         self.ffn_vals_0 = self.ffn_vals_1 = self.ffn_meta_0 = self.ffn_meta_1 = None
         self.cr_ffn_vals_0 = self.cr_ffn_vals_1 = self.cr_ffn_meta_0 = self.cr_ffn_meta_1 = None
         if self.pipelined_attn_hc and (not self.pipelined_ffn or not carry or boundary is not None):
@@ -326,16 +406,24 @@ class PreparedLayer:
         if self.row_shard_dma and (not self.pipelined_ffn or boundary is not None
                 or self.pipelined_attn not in ("full", "mla_wo") or h % shard.world_size != 0):
             raise ValueError("DMA row-sharded prefill requires pipelined attention/FFN with divisible half-chunks")
+        if self.row_shard_roce and (self.pipelined_ffn or boundary is not None
+                or tokens % shard.world_size != 0):
+            raise ValueError("RoCE row-sharded prefill requires serial execution without a boundary and divisible chunks")
         self.engram = None
         if weights.engram is not None:
-            engram_row_shard = (shard.rank, h, self.shard_tokens) if self.row_shard_dma else None
+            if self.row_shard_dma:
+                engram_row_shard = (shard.rank, h, self.shard_tokens)
+            elif self.row_shard_roce:
+                engram_row_shard = (shard.rank, self.shard_tokens)
+            else:
+                engram_row_shard = None
             self.engram = PreparedEngram(index, weights.engram, tables, s.residual, s.engram_residual,
                 metadata, pool,
                 scratch=s.engram, session=session, name=name + ".engram", workspace=workspace,
                 runtime=runtime, coordinator=coordinator, examples=examples,
                 defer_reduce_functional=defer_engram_reduce, row_shard=engram_row_shard)
-            if self.row_shard_dma and self.engram.row_shard is None:
-                raise ValueError("DMA row-sharded prefill requires full-projection Engram all-gather")
+            if (self.row_shard_dma or self.row_shard_roce) and self.engram.row_shard is None:
+                raise ValueError("row-sharded prefill requires full-projection Engram gather")
         source = s.engram_residual if self.engram is not None else s.residual
         options = dict(rms_eps=text["rms_norm_eps"], norm_eps=text["rms_norm_eps"], hc_eps=text["hc_eps"],
                        sinkhorn_iters=text["hc_sinkhorn_iters"])
@@ -346,6 +434,7 @@ class PreparedLayer:
             and not self.pipelined_ffn
             and not self.pipelined_attn_hc
             and self.pipelined_attn is None
+            and not self.row_shard_roce
             and boundary is None
             and runtime is not None
             and shard.world_size > 1
@@ -356,7 +445,7 @@ class PreparedLayer:
             and supports_split_lagged(
                 source.device, tokens, source.shape[-1], weights.residual["ffn_norm.weight"].dtype)
         )
-        if self.row_shard_dma:
+        if self.row_shard_dma or self.row_shard_roce:
             st = self.shard_tokens
             attn_incoming = ((s.mlp_output[:st], s.ffn_hc.residual[:st], s.ffn_hc.post[:st], s.ffn_hc.comb[:st])
                              if carry else (source[:st],))
@@ -429,12 +518,29 @@ class PreparedLayer:
                         attn_qkv_encoded = full_encoded
                         attn_gather_in = local_packed
                         attn_gather_out = full_packed
-        self.attention = PreparedAttention(index, weights.attention, s.attention_hc.normalized, s.attention,
-            metadata, pool, rotary, mode=mode, world=shard.world_size,
-            session=session, name=name + ".attention", workspace=workspace, replay_start=replay_start,
-            window_staging=window_staging, mla_compute_mode=mla_compute_mode,
-            window_metadata=window_metadata, examples=examples, pipelined_mode=self.pipelined_attn,
-            qkv_encoded=attn_qkv_encoded)
+        if self.row_shard_attn:
+            st = self.shard_tokens
+            attn_source = s.attention_hc.normalized[:st]
+            attn_scratch = (shard_attention_scratch if shard_attention_scratch is not None
+                            else AttentionScratch.allocate(tokens, shard.world_size, s.residual.device,
+                                                           shard_rows=st, examples=examples))
+            attn_window_target = (window_target if window_target is not None
+                                  else declaration_tensor(examples, "row_shard_roce.window_full",
+                                                          (tokens, 512), torch.bfloat16, s.residual.device))
+            self.attention = PreparedAttention(index, weights.attention, attn_source, attn_scratch,
+                metadata, pool, rotary, mode=mode, world=shard.world_size,
+                session=session, name=name + ".attention", workspace=workspace, replay_start=replay_start,
+                window_staging=window_staging, mla_compute_mode=mla_compute_mode,
+                window_metadata=window_metadata, examples=examples,
+                shard_rows=self.shard_rows, window_target=attn_window_target,
+                runtime=runtime, coordinator=coordinator)
+        else:
+            self.attention = PreparedAttention(index, weights.attention, s.attention_hc.normalized, s.attention,
+                metadata, pool, rotary, mode=mode, world=shard.world_size,
+                session=session, name=name + ".attention", workspace=workspace, replay_start=replay_start,
+                window_staging=window_staging, mla_compute_mode=mla_compute_mode,
+                window_metadata=window_metadata, examples=examples, pipelined_mode=self.pipelined_attn,
+                qkv_encoded=attn_qkv_encoded)
         if self.row_shard_dma:
             st = self.shard_tokens
             self.attention_reduce = None
@@ -604,6 +710,115 @@ class PreparedLayer:
                 parallel_plans=ffn_compute_plans)
             self.cr_mlp_1 = ConcurrentReduceScatter(self.mlp_reduce_1, workspace=workspace, session=session,
                 parallel_plans=(self.post.plan,) if self.post is not None else ffn_compute_plans)
+        elif self.row_shard_roce:
+            st = self.shard_tokens
+            self.att_reduce_0 = self.att_reduce_1 = self.mlp_reduce_0 = self.mlp_reduce_1 = None
+            self.cr_att_0 = self.cr_att_1 = self.cr_mlp_0 = self.cr_mlp_1 = None
+            if self.row_shard_attn:
+                self.attn_gather = None
+                self.attention_reduce = None
+            else:
+                self.attn_gather = PreparedGatherShards(
+                    s.attention_hc.normalized[:st], s.attention_hc.normalized,
+                    runtime=runtime, coordinator=coordinator, session=session, name=name + ".attn_gather")
+                self.attention_reduce = PreparedReduceScatter(
+                    s.attention.output, s.attention_output[:st],
+                    runtime=runtime, coordinator=coordinator, session=session, name=name + ".attention_rs")
+            ffn_hc_scratch = s.ffn_hc.rows(st)
+            self.ffn_hc = PreparedMHC((s.attention_output[:st], s.attention_hc.residual[:st],
+                s.attention_hc.post[:st], s.attention_hc.comb[:st]),
+                _mhc_weights(weights, "ffn", "ffn_norm"), ffn_hc_scratch, session=session,
+                name=name + ".ffn_hc", workspace=workspace,
+                pre_mix=s.attn_mix[:st], pre_out=s.pre_mix[:st], **options)
+            self.router_projection = UnquantizedProjection(ffn_hc_scratch.normalized, weights.experts.router,
+                s.router_logits[:st], session=session, name=name + ".router")
+            router_scratch = s.router.rows(st)
+            self.router = PreparedRouter(s.router_logits[:st], router_scratch, session=session, name=name + ".topk",
+                score_func=text["scoring_func"], renormalize=text["norm_topk_prob"],
+                routed_scaling_factor=text["routed_scaling_factor"], correction_bias=weights.experts.correction,
+                image_correction_bias=weights.experts.vision_correction if self.image_mask is not None else None,
+                image_mask=None if self.image_mask is None else self.image_mask[:st],
+                num_valid_tokens=metadata.live_counts[:1])
+            dev = ffn_hc_scratch.normalized.device
+            top_k = router_scratch.ids.shape[1]
+            route_bf16_cols = 4 * top_k
+            use_mxfp8_gather = False
+            ffn_experts_source = s.ffn_hc.normalized
+            ffn_experts_scales = None
+            ffn_shared_encoded = None
+            if (dev.type == "cuda" and st % 128 == 0 and tokens % 128 == 0
+                    and ffn_hc_scratch.normalized.shape[1] % 128 == 0):
+                from b12x.gemm.blockscaled._linear import MXFP8LinearWeight
+                from hyperflare_recipes.components import sm103_projection
+
+                experts_plan = getattr(weights.experts.experts, "plan", None)
+                quant_modes = getattr(getattr(experts_plan, "_impl", None), "quant_modes", ())
+                if (not sm103_projection.is_sm103(dev)
+                        and isinstance(weights.experts.shared.gate_up, MXFP8LinearWeight)
+                        and "w4a8_mx" in quant_modes):
+                    from b12x.quantization import mxfp8
+
+                    local_shapes = mxfp8.dense_rows_storage_shapes(st, ffn_hc_scratch.normalized.shape[1])
+                    full_shapes = mxfp8.dense_rows_storage_shapes(tokens, s.ffn_hc.normalized.shape[1])
+                    local_vals = declaration_tensor(examples, "row_shard_roce.ffn_local_vals", local_shapes[0], torch.float8_e4m3fn, dev)
+                    local_srows = declaration_tensor(examples, "row_shard_roce.ffn_local_srows", local_shapes[1], torch.uint8, dev)
+                    local_smma = declaration_tensor(examples, "row_shard_roce.ffn_local_smma", local_shapes[2], torch.uint8, dev)
+                    full_vals = declaration_tensor(examples, "row_shard_roce.ffn_full_vals", full_shapes[0], torch.float8_e4m3fn, dev)
+                    full_srows = declaration_tensor(examples, "row_shard_roce.ffn_full_srows", full_shapes[1], torch.uint8, dev)
+                    full_smma = declaration_tensor(examples, "row_shard_roce.ffn_full_smma", full_shapes[2], torch.uint8, dev)
+                    scale_bf16_cols = local_srows.view(st, -1).view(torch.bfloat16).shape[1]
+                    local_meta = declaration_tensor(examples, "row_shard_roce.ffn_local_meta",
+                                                    (st, scale_bf16_cols + route_bf16_cols), torch.bfloat16, dev)
+                    full_meta = declaration_tensor(examples, "row_shard_roce.ffn_full_meta",
+                                                   (tokens, scale_bf16_cols + route_bf16_cols), torch.bfloat16, dev)
+                    if (PreparedGatherShards.fits(runtime, local_vals.view(torch.bfloat16), full_vals.view(torch.bfloat16))
+                            and PreparedGatherShards.fits(runtime, local_meta, full_meta)):
+                        use_mxfp8_gather = True
+                        local_encoded = mxfp8.dense_rows_from_bases(local_vals, local_srows, local_smma)
+                        full_encoded = mxfp8.dense_rows_from_bases(full_vals, full_srows, full_smma)
+                        self.ffn_local_shapes = local_shapes
+                        self.ffn_meta_scale_cols = scale_bf16_cols
+                        self.ffn_quantizer_plan = mxfp8.plan(mxfp8.query_from_call(
+                            ffn_hc_scratch.normalized, local_encoded.values, local_encoded.scale_rows,
+                            local_encoded.scale_mma, min_amax=0.0))
+                        src_norm = ffn_hc_scratch.normalized
+                        declare(session, (self.ffn_quantizer_plan.request(
+                            name=name + ".ffn_quant",
+                            prepare_call=lambda state, src=src_norm, enc=local_encoded: PreparedCall(
+                                run=lambda: state.run(src, enc.values, enc.scale_rows, enc.scale_mma),
+                                owners=(src, enc))),))
+                        self.ffn_vals_gather = PreparedGatherShards(
+                            local_vals.view(torch.bfloat16), full_vals.view(torch.bfloat16),
+                            runtime=runtime, coordinator=coordinator, session=session, name=name + ".ffn_vals")
+                        self.ffn_meta_gather = PreparedGatherShards(
+                            local_meta, full_meta,
+                            runtime=runtime, coordinator=coordinator, session=session, name=name + ".ffn_meta")
+                        ffn_experts_source = full_vals
+                        ffn_experts_scales = full_srows
+                        ffn_shared_encoded = full_encoded
+            if not use_mxfp8_gather:
+                local_meta = declaration_tensor(examples, "row_shard_roce.ffn_route_local_meta",
+                                                (st, route_bf16_cols), torch.bfloat16, dev)
+                full_meta = declaration_tensor(examples, "row_shard_roce.ffn_route_full_meta",
+                                               (tokens, route_bf16_cols), torch.bfloat16, dev)
+                self.ffn_vals_gather = PreparedGatherShards(
+                    ffn_hc_scratch.normalized, s.ffn_hc.normalized,
+                    runtime=runtime, coordinator=coordinator, session=session, name=name + ".ffn_vals")
+                self.ffn_meta_gather = PreparedGatherShards(
+                    local_meta, full_meta,
+                    runtime=runtime, coordinator=coordinator, session=session, name=name + ".ffn_meta")
+            self.experts = PreparedRoutedExperts(ffn_experts_source, weights.experts.experts,
+                s.router.ids, s.router.weights, s.routed, session=session, name=name + ".experts",
+                workspace=workspace, router_plan=self.router.plan, a_scales=ffn_experts_scales)
+            self.shared = PreparedMLP(s.ffn_hc.normalized, weights.experts.shared, s.shared.gate_up,
+                s.shared.intermediate, s.shared.output, session=session, name=name + ".shared",
+                workspace=workspace, swiglu_limit=text["swiglu_limit"], round_silu=False, activation_mode="auto",
+                encoded=ffn_shared_encoded)
+            self.concurrent_shared = None
+            self.mlp_reduce = PreparedReduceScatter(s.mlp_partial, s.mlp_output[:st], runtime=runtime,
+                coordinator=coordinator, session=session, name=name + ".mlp_rs")
+            self.post = None if defer_post else PreparedMHCPost(s.mlp_output[:st], ffn_hc_scratch.residual,
+                ffn_hc_scratch.post, ffn_hc_scratch.comb, s.residual[:st], session=session, name=name + ".post")
         elif self.pipelined_ffn:
             self.attention_reduce = None
             self.att_reduce_0 = PreparedAllReduce(s.attention.output[:h], s.attention_output[:h], runtime=runtime,
@@ -719,6 +934,14 @@ class PreparedLayer:
             self.cr_ffn_meta_1.functional(session=session)
             self.cr_mlp_0.functional(session=session)
             self.cr_mlp_1.functional(session=session)
+        elif self.row_shard_roce:
+            if self.attn_gather is not None:
+                self.attn_gather.functional(session=session)
+            if self.attention_reduce is not None:
+                self.attention_reduce.functional(session=session)
+            self.ffn_vals_gather.functional(session=session)
+            self.ffn_meta_gather.functional(session=session)
+            self.mlp_reduce.functional(session=session)
         elif self.pipelined_ffn:
             if self.cr_att_0 is not None:
                 self.cr_att_0.functional(session=session)
@@ -978,6 +1201,48 @@ class PreparedLayer:
         }
         return incoming, next_mix, records, selection, observations
 
+    def _run_row_shard_roce(self, incoming, pre_mix, metadata, indices, selection, *,
+                            window_cache=None, image_mask=None):
+        s_tok = self.shard_tokens
+        if self.engram is not None:
+            incoming = (self.engram(incoming[0], metadata),)
+        attn_mix = torch.empty_like(pre_mix)
+        residual, post, comb, norm_sh = self.attention_hc(*incoming, pre_mix=pre_mix, pre_out=attn_mix)
+        if self.row_shard_attn:
+            attention_normalized = norm_sh
+            attention_output, records, selection, attn_obs = self.attention._run(
+                norm_sh, metadata, selection, indices=indices, window_cache=window_cache)
+        else:
+            norm_full = self.attn_gather(norm_sh)
+            attention_normalized = norm_full
+            attended, records, selection, attn_obs = self.attention._run(
+                norm_full, metadata, selection, indices=indices, window_cache=window_cache)
+            attention_output = self.attention_reduce(attended)
+        next_mix = torch.empty_like(attn_mix)
+        residual, post, comb, ffn_norm_sh = self.ffn_hc(
+            attention_output, residual, post, comb, pre_mix=attn_mix, pre_out=next_mix)
+        if self.has_image_mask:
+            if image_mask is None:
+                image_mask = metadata.token_ids >= 129280
+            mask_sh = torch.index_select(image_mask, 0, self.shard_rows)
+        else:
+            mask_sh = None
+        valid_sh = (metadata.live_counts[:1] - self.shard_offset).clamp(0, s_tok).to(torch.int32)
+        vals_sh, meta_sh = self._prepare_ffn_shard(ffn_norm_sh, mask_sh, valid_sh)
+        vals_full = self.ffn_vals_gather(vals_sh)
+        meta_full = self.ffn_meta_gather(meta_sh)
+        partial, route_ids = self._run_ffn_gathered(vals_full, meta_full)
+        mlp_sh = self.mlp_reduce(partial)
+        incoming = ((self.post(mlp_sh, residual, post, comb),) if self.post is not None
+                    else (mlp_sh, residual, post, comb))
+        observations = {"attention." + key: value for key, value in attn_obs.items()}
+        observations.update({
+            "attention_hc.normalized": attention_normalized,
+            "router.ids": route_ids,
+            "output": incoming[0],
+        })
+        return incoming, next_mix, records, selection, observations
+
     def _run(self, incoming, pre_mix, metadata, indices, selection, *, boundary=None, window_cache=None,
              image_mask=None, engram_projected=None, engram_gathered=None, engram_overlap=None,
              engram_project=None):
@@ -985,6 +1250,9 @@ class PreparedLayer:
             return self._run_row_shard_dma(incoming, pre_mix, metadata, indices, selection,
                 window_cache=window_cache, image_mask=image_mask, engram_projected=engram_projected,
                 engram_gathered=engram_gathered, engram_overlap=engram_overlap, engram_project=engram_project)
+        if getattr(self, "row_shard_roce", False):
+            return self._run_row_shard_roce(incoming, pre_mix, metadata, indices, selection,
+                window_cache=window_cache, image_mask=image_mask)
         if self.engram is not None:
             if engram_gathered is not None:
                 incoming = (self.engram.mix(incoming[0], self.engram.project_gathered(engram_gathered), metadata),)
@@ -1331,8 +1599,57 @@ class PreparedDecoder:
                 runtime, scratch.attention_hc.normalized[:encoder_tokens // (2 * world)],
                 scratch.attention_hc.normalized[:encoder_tokens // 2])
         )
+        roce_shard_tokens = encoder_tokens // world if world > 1 else 0
+        self.row_shard_roce = (
+            bool(row_shard_prefill)
+            and mode == "prefill"
+            and scoring is None
+            and not self.row_shard_dma
+            and runtime is not None
+            and not _is_dma_runtime(runtime)
+            and row_shard_surfaces(runtime)
+            and world > 1
+            and decoder_start is not None
+            and encoder_tokens >= 512
+            and encoder_tokens % world == 0
+            and roce_shard_tokens % 128 == 0
+            and all(
+                layer.engram is None or "projection_full" in layer.engram
+                for layer in weights.layers[:decoder_start]
+            )
+            and PreparedReduceScatter.fits(
+                runtime, scratch.attention.output,
+                scratch.attention_output[:roce_shard_tokens])
+            and PreparedGatherShards.fits(
+                runtime, scratch.attention_hc.normalized[:roce_shard_tokens],
+                scratch.attention_hc.normalized)
+            and PreparedChunkedGatherShards.fits(
+                runtime, scratch.residual[:roce_shard_tokens],
+                scratch.residual)
+        )
+        self.row_shard_roce_attn = False
+        roce_attn_scratch = None
+        roce_window_target = None
+        if self.row_shard_roce:
+            dev = scratch.residual.device
+            roce_window_local = declaration_tensor(
+                examples, "row_shard_roce.window_local", (roce_shard_tokens, 512), torch.bfloat16, dev)
+            roce_window_target = declaration_tensor(
+                examples, "row_shard_roce.window_full", (encoder_tokens, 512), torch.bfloat16, dev)
+            if (all({"q_b_full", "output_full", "sink_full"} <= set(layer.attention)
+                    for layer in weights.layers[:decoder_start])
+                    and PreparedGatherShards.fits(runtime, roce_window_local, roce_window_target)):
+                self.row_shard_roce_attn = True
+                roce_attn_scratch = AttentionScratch.allocate(
+                    encoder_tokens, world, dev, shard_rows=roce_shard_tokens, examples=examples)
         self.half_tokens = encoder_tokens // 2
-        self.shard_tokens = self.half_tokens // world if self.row_shard_dma else 0
+        if self.row_shard_dma:
+            self.shard_tokens = self.half_tokens // world
+        elif self.row_shard_roce:
+            self.shard_tokens = roce_shard_tokens
+        else:
+            self.shard_tokens = 0
+        self.shard_rows = self.shard_offset = None
         if self.row_shard_dma:
             r = getattr(weights.shard, "rank", 0)
             dev = scratch.residual.device
@@ -1342,6 +1659,14 @@ class PreparedDecoder:
             self.shard_offset_a = persistent_copy(torch.tensor([s0], dtype=torch.int32, device=dev))
             self.shard_offset_b = persistent_copy(torch.tensor([self.half_tokens + s0], dtype=torch.int32, device=dev))
             shared_shard_rows = (self.shard_rows_a, self.shard_rows_b, self.shard_offset_a, self.shard_offset_b)
+        elif self.row_shard_roce:
+            r = getattr(weights.shard, "rank", 0)
+            dev = scratch.residual.device
+            s0 = r * self.shard_tokens
+            self.shard_rows_a = self.shard_rows_b = self.shard_offset_a = self.shard_offset_b = None
+            self.shard_rows = persistent_copy(torch.arange(s0, s0 + self.shard_tokens, dtype=torch.int64, device=dev))
+            self.shard_offset = persistent_copy(torch.tensor([s0], dtype=torch.int32, device=dev))
+            shared_shard_rows = (self.shard_rows, self.shard_offset)
         else:
             self.shard_rows_a = self.shard_rows_b = self.shard_offset_a = self.shard_offset_b = None
             shared_shard_rows = None
@@ -1362,14 +1687,15 @@ class PreparedDecoder:
                         pool, self.rotary, carry=carry, session=session, name=f"{name}.layer{index}", workspace=workspace,
                         window_metadata=self.suffix_window_metadata,
                         source_indices=self.window_metadata,
-                        row_shard_dma=self.row_shard_dma, shard=weights.shard,
-                        runtime=runtime, coordinator=coordinator, examples=examples)
+                        row_shard_dma=self.row_shard_dma, row_shard_roce=self.row_shard_roce,
+                        shard=weights.shard, runtime=runtime, coordinator=coordinator, examples=examples)
                     layer = replace(layer, attention={key: value for key, value in layer.attention.items()
                                                       if key not in ("compressor", "index_k", "index_norm")})
             defer = (index + 1 < len(weights.layers) and weights.layers[index + 1].engram is None
                      and index + 1 not in self.aux_layers)
             pipelined_ffn = layer_pipelined[index]
             layer_row_shard_dma = self.row_shard_dma and index < decoder_start and pipelined_ffn
+            layer_row_shard_roce = self.row_shard_roce and index < decoder_start
             pipelined_attn = None
             if pipelined_ffn and boundary is None:
                 if "compressor" not in layer.attention and "index_q" not in layer.attention:
@@ -1392,7 +1718,11 @@ class PreparedDecoder:
                 window_metadata=(self.window_metadata if layer_metadata is metadata else self.suffix_window_metadata),
                 examples=examples, pipelined_ffn=pipelined_ffn, pipelined_attn_hc=pipelined_attn_hc,
                 defer_mlp_b=defer_mlp_b, defer_engram_reduce=overlap_engram, pipelined_attn=pipelined_attn,
-                row_shard_dma=layer_row_shard_dma, shard_rows=shared_shard_rows)
+                row_shard_dma=layer_row_shard_dma, row_shard_roce=layer_row_shard_roce,
+                row_shard_attn=layer_row_shard_roce and self.row_shard_roce_attn,
+                shard_rows=shared_shard_rows if (layer_row_shard_dma or layer_row_shard_roce) else None,
+                shard_attention_scratch=roce_attn_scratch if (layer_row_shard_roce and self.row_shard_roce_attn) else None,
+                window_target=roce_window_target if (layer_row_shard_roce and self.row_shard_roce_attn) else None)
             if pipelined_attn_hc:
                 prev_plan = self.layers[index - 1].cr_mlp_1.reduce.plan
                 if getattr(prepared_layer.attention_hc, "plan", None) is not None:
@@ -1455,8 +1785,8 @@ class PreparedDecoder:
                 pool, self.rotary, carry=carry, session=session,
                 name=f"{name}.layer{decoder_start}", workspace=workspace,
                 window_metadata=None, source_indices=self.window_metadata,
-                row_shard_dma=self.row_shard_dma, shard=weights.shard,
-                runtime=runtime, coordinator=coordinator, examples=examples,
+                row_shard_dma=self.row_shard_dma, row_shard_roce=self.row_shard_roce,
+                shard=weights.shard, runtime=runtime, coordinator=coordinator, examples=examples,
             )
             self.scoring = self.head = self.head_hidden = self.local_logits = None
             self.compact_head = False
@@ -1514,13 +1844,20 @@ class PreparedDecoder:
             pre_mix_b = torch.zeros((s_tok, 4), dtype=torch.float32, device=embedding.device)
             pre_mix_b[:, 0].fill_(1)
             pre_mix = (pre_mix_a, pre_mix_b)
+        elif getattr(self, "row_shard_roce", False):
+            s_tok = self.shard_tokens
+            res_sh = torch.index_select(embedding, 0, self.shard_rows)[:, None, :].expand(-1, 4, -1).contiguous()
+            incoming = (res_sh,)
+            pre_mix = torch.zeros((s_tok, 4), dtype=torch.float32, device=embedding.device)
+            pre_mix[:, 0].fill_(1)
         else:
             residual = embedding[:, None, :].expand(-1, 4, -1).contiguous()
             pre_mix = torch.zeros((embedding.shape[0], 4), dtype=torch.float32, device=embedding.device)
             pre_mix[:, 0].fill_(1)
             incoming = (residual,)
         indices = self.window_metadata(metadata)
-        selection = (torch.full((embedding.shape[0], 512), -1, dtype=torch.int32, device=embedding.device), None, None)
+        selection_rows = self.shard_tokens if getattr(self, "row_shard_roce_attn", False) else embedding.shape[0]
+        selection = (torch.full((selection_rows, 512), -1, dtype=torch.int32, device=embedding.device), None, None)
         staging = (None if self.staging_shape is None else torch.empty(
             self.staging_shape, dtype=torch.uint8, device=embedding.device))
         auxiliary = None if self.encoder_only else torch.empty(self.auxiliary_shape, dtype=torch.bfloat16, device=embedding.device)

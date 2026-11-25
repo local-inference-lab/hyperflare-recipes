@@ -334,8 +334,13 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
     coordinator = CollectivePreparation(group)
     load_engram_full = (
         shard.world_size > 1
-        and not coordinator.spans_hosts
         and max(config.prefill_capacities, default=0) >= 512
+        and (not coordinator.spans_hosts or config.row_shard_prefill)
+    )
+    load_row_shard_attention = (
+        config.row_shard_prefill
+        and coordinator.spans_hosts
+        and shard.world_size > 1
     )
     with core_storage.transient():
         weights = ModelWeights.load(manifest, device, shard=shard, progress=progress, dspark=config.dspark,
@@ -344,7 +349,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                                     draft_head_quantization=config.draft_head_quantization,
                                     markov_head_quantization=config.markov_head_quantization,
                                     vocabulary_parallel_sampling=config.vocabulary_parallel_sampling,
-                                    engram_full_projection=load_engram_full)
+                                    engram_full_projection=load_engram_full,
+                                    row_shard_attention=load_row_shard_attention)
         release_unused()
     if progress is not None:
         progress("Target head: BF16 checkpoint weights with FP32 accumulation and logits")
