@@ -26,7 +26,7 @@ def test_mini_directory_resolves_loop_architecture(tmp_path):
     assert model.recipe.speculation.draft_tokens == 7
     assert model.recipe.max_images == 4
     assert (model.recipe.max_concurrency, model.recipe.prefill_chunk,
-            model.recipe.speculation.token_capacity) == (8, 8192, 64)
+            model.recipe.speculation.token_capacity) == (16, 8192, 64)
 
 
 def test_small_directory_retains_its_recipe(tmp_path):
@@ -155,3 +155,12 @@ def test_mini_rejects_undeclared_proposal_head_quantization():
                 ),
             ),
         )
+
+
+def test_mini_plans_c16_on_32gb_gpu():
+    model = ResolvedModel(MINI_RECIPE, MINI_RECIPE.checkpoints[0])
+    args = parse_args(["export", model.checkpoint.alias, "--no-mtp", "--max-concurrency", "16"], recipes=recipes())
+    params = preparation.resolve_parameters(model, args)
+    plan = derive(model=MINI_RECIPE, gpus=(gpu(0, 31),), selected=(0,), parameters=params)
+    assert plan.concurrency == 16
+    assert plan.fits

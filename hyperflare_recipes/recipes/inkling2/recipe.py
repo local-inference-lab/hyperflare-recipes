@@ -74,7 +74,7 @@ MINI_SAMPLING_DEFAULTS = SamplingDefaults(temperature=1., top_p=1., top_k=-1)
 
 MINI_RECIPE = replace(RECIPE, name="inkling2_mini", served_model_name="inkling-2-mini",
     sampling_defaults=MINI_SAMPLING_DEFAULTS,
-    parameters=replace(RECIPE.parameters, max_concurrency_limit=8, prefill_chunk=8192,
+    parameters=replace(RECIPE.parameters, max_concurrency_limit=16, prefill_chunk=8192,
         speculation=SpeculationParameters(draft_tokens=7, max_draft_tokens=7, token_capacity=64,
                                           packed_verification=True, graph_budget=64),
         draft_quantization=DraftQuantizationParameters(
