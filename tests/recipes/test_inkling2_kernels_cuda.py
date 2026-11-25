@@ -276,3 +276,33 @@ def test_cross_pass_router_and_fused_message_gates_match_reference(tokens):
         rel_l2 = (outs[idx].float() - ref.float()).norm() / ref.float().norm()
         assert cos.item() >= 0.9999, f"shared tokens={tokens} stream={idx} cos={cos.item()}"
         assert rel_l2.item() <= 1.5e-2, f"shared tokens={tokens} stream={idx} rel_l2={rel_l2.item()}"
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("tokens", [512, 2048])
+def test_prefill_message_gate_is_bit_deterministic(tokens):
+    """Tiled prefill message gate must be bit-for-bit identical across repeated launches."""
+    device = torch.device("cuda:0")
+    torch.manual_seed(71)
+    hidden, rank, eps = 2304, 64, 1e-6
+    s0 = torch.randn(tokens, hidden, device=device, dtype=torch.bfloat16)
+    s1 = torch.randn(tokens, hidden, device=device, dtype=torch.bfloat16)
+    queries = torch.randn(4, hidden, device=device, dtype=torch.float32) * (hidden ** -0.5)
+    dest = torch.randn(tokens, hidden, device=device, dtype=torch.float32)
+    norm = torch.randn(hidden, device=device, dtype=torch.bfloat16)
+    down = (torch.randn(rank, 2 * hidden, device=device) * 0.02).to(torch.bfloat16)
+    gain = (torch.randn(hidden, rank, device=device) * 0.02).to(torch.bfloat16)
+    forget = (torch.randn(hidden, rank, device=device) * 0.02).to(torch.bfloat16)
+    gw = GateWeights(
+        down=down,
+        forget_gain=torch.cat((forget, gain), dim=0).contiguous(),
+        forget_t=forget.t().contiguous(),
+        gain_t=gain.t().contiguous(),
+    )
+    gate = PreparedMessageGate(gw, norm, stream_idx=0, num_streams=4, tokens=tokens, hidden=hidden, eps=eps)
+    router = PreparedCrossPassRouter(queries, tokens=tokens, hidden=hidden, eps=eps)
+    n0, n1, probs = router(s0, s1)
+    first = gate(dest, n0, n1, probs)
+    for _ in range(5):
+        again = gate(dest, n0, n1, probs)
+        assert torch.equal(first, again)

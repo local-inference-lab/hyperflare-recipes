@@ -190,12 +190,12 @@ def _gate_mix_rms_norm_qkv_shared(
 
 @triton.jit
 def _fused_fg_mix_to_buf(
-    Hidden, N0, N1, Probs, Z, ForgetT, GainT, MixedOut, RowSumSq,
+    Hidden, N0, N1, Probs, Z, ForgetT, GainT, MixedOut,
     STREAM_IDX: tl.constexpr, NUM_STREAMS: tl.constexpr,
     T: tl.constexpr, HIDDEN: tl.constexpr, RANK: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
-    """2D Tensor-Core tiled fusion of `Z @ [ForgetT, GainT]`, tanh gating, cross-pass mix, and sum-of-squares."""
+    """2D Tensor-Core tiled fusion of `Z @ [ForgetT, GainT]`, tanh gating, and cross-pass mix."""
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
     rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -217,21 +217,19 @@ def _fused_fg_mix_to_buf(
     s1 = tl.load(N1 + rows[:, None] * HIDDEN + cols[None, :], mask=mask, other=0.0).to(tl.float32)
     m = (1.0 - p1) * s0 + p1 * s1
     mixed = (1.0 - f) * h + g * m
-    tl.store(MixedOut + rows[:, None] * HIDDEN + cols[None, :], mixed.to(tl.bfloat16), mask=mask)
-    tl.atomic_add(RowSumSq + rows, tl.sum(mixed * mixed, axis=1), mask=rmask)
+    tl.store(MixedOut + rows[:, None] * HIDDEN + cols[None, :], mixed, mask=mask)
 
 
 @triton.jit
 def _scale_rmsnorm(
-    Mixed, RowSumSq, NormW, Out,
+    Mixed, NormW, Out,
     HIDDEN: tl.constexpr, EPS: tl.constexpr, BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, BLOCK)
     valid = cols < HIDDEN
     x = tl.load(Mixed + row * HIDDEN + cols, valid, other=0.0).to(tl.float32)
-    ss = tl.load(RowSumSq + row).to(tl.float32)
-    inv = tl.rsqrt(ss / HIDDEN + EPS)
+    inv = tl.rsqrt(tl.sum(x * x, 0) / HIDDEN + EPS)
     gamma = tl.load(NormW + cols, valid, other=0.0).to(tl.float32)
     tl.store(Out + row * HIDDEN + cols, (x * inv * gamma).to(tl.bfloat16), valid)
 
@@ -348,8 +346,7 @@ class PreparedMessageGate:
         ).compiled
 
         if self.use_tiled_fg:
-            mixed_bf16 = example("mixed_bf16", (tokens, hidden), torch.bfloat16)
-            row_ss = example("row_ss", (tokens,), torch.float32)
+            mixed_fp32 = example("mixed_fp32", (tokens, hidden), torch.float32)
             bm, bn = 64, 128
             self._tiled_grid = (triton.cdiv(tokens, bm), triton.cdiv(hidden, bn), 1)
             self._tiled_opts = dict(
@@ -359,12 +356,12 @@ class PreparedMessageGate:
             )
             self._tiled_compiled = prepare_triton(
                 _fused_fg_mix_to_buf,
-                (fp32_h, bf16_n0, bf16_n1, probs, z_bf16, self.forget_t, self.gain_t, mixed_bf16, row_ss),
+                (fp32_h, bf16_n0, bf16_n1, probs, z_bf16, self.forget_t, self.gain_t, mixed_fp32),
                 self._tiled_grid, **self._tiled_opts,
             ).compiled
             self._scale_opts = dict(HIDDEN=hidden, EPS=eps, BLOCK=block, num_warps=8, enable_fp_fusion=False)
             self._scale_compiled = prepare_triton(
-                _scale_rmsnorm, (mixed_bf16, row_ss, norm_weight, out_bf16),
+                _scale_rmsnorm, (mixed_fp32, norm_weight, out_bf16),
                 (tokens, 1, 1), **self._scale_opts,
             ).compiled
             self._mix_norm_compiled = None
@@ -391,16 +388,15 @@ class PreparedMessageGate:
         z = F.linear(cat_bf16, self.down_w)
         out = torch.empty((self.tokens, self.hidden), dtype=torch.bfloat16, device=device)
         if self.use_tiled_fg:
-            mixed = torch.empty((self.tokens, self.hidden), dtype=torch.bfloat16, device=device)
-            row_ss = torch.zeros((self.tokens,), dtype=torch.float32, device=device)
+            mixed = torch.empty((self.tokens, self.hidden), dtype=torch.float32, device=device)
             launch_triton(
                 _fused_fg_mix_to_buf, self._tiled_compiled,
-                (hidden, n0, n1, probs, z, self.forget_t, self.gain_t, mixed, row_ss),
+                (hidden, n0, n1, probs, z, self.forget_t, self.gain_t, mixed),
                 self._tiled_grid, **self._tiled_opts,
             )
             launch_triton(
                 _scale_rmsnorm, self._scale_compiled,
-                (mixed, row_ss, self.norm_weight, out),
+                (mixed, self.norm_weight, out),
                 (self.tokens, 1, 1), **self._scale_opts,
             )
             return out
