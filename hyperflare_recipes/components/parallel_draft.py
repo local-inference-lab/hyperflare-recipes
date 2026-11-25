@@ -590,10 +590,12 @@ class PreparedParallelDraftRound:
             target_scratch = {name: torch.empty(shape, dtype=dtype, device=logits.device)
                               for name, (shape, dtype) in target.layout.items()}
             verify_scratch = {name: torch.empty(shape, dtype=dtype, device=logits.device)
-                              for name, (shape, dtype) in verify.layout.items()}
+                              for name, (shape, dtype) in PreparedStochasticVerification.scratch_layout(
+                                  b, w, o.requests.vocab_size, consume_inputs=True).items()}
             target.run(target_scratch, logits.view(b, w, -1), candidates=proposal.drafts)
             acceptance = verify.run(verify_scratch, probabilities, target_scratch["probabilities"],
-                target_scratch["valid"], disjoint=True, drafts=proposal.drafts, draft_valid=proposal.valid)
+                target_scratch["valid"], disjoint=True, consume_inputs=True,
+                drafts=proposal.drafts, draft_valid=proposal.valid)
         if proposal_valid is not None:
             acceptance.valid.logical_and_(proposal_valid)
         committed = commit(logits.view(b, w, -1), acceptance=acceptance, inputs=proposal.candidates)
