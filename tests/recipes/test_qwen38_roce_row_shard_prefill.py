@@ -162,10 +162,13 @@ class _FakeDmaRuntime:
     (4, 16, 4096),   # TP4 4K chunk
 ])
 def test_roce_sharded_qsa_bootstrap_gather_bytes_and_wiring(monkeypatch, world_size, max_active, prefill_chunk):
-    """RoCE bootstrap sizes gather_bytes to cover QSA decode+prefill gathers and wires both collectives."""
+    """RoCE bootstrap sizes gather_bytes and wires QSA gather runtime/mode and row_shard_prefill into decoders."""
     import ignition.components.collectives as collectives_mod
+    import ignition.components.readiness as readiness_mod
+    import hyperflare_recipes.recipes.qwen38.vision_state as vision_state_mod
+    import transformers.models.qwen4_exp.modeling_qwen4_exp as qwen4_mod
 
-    recorded = {"roce_kwargs": None, "decoder_calls": [], "spec_kwargs": None}
+    recorded = {"roce_kwargs": None, "decoder_calls": [], "namespace": None}
     fake_roce = _FakeRoceRuntime(world_size=world_size)
 
     def fake_create_roce_runtime(group, device, **kwargs):
@@ -176,8 +179,55 @@ def test_roce_sharded_qsa_bootstrap_gather_bytes_and_wiring(monkeypatch, world_s
         def __init__(self, group):
             self.spans_hosts = True
 
-    class StopAfterCollectives(Exception):
+    class StopAfterDecoders(Exception):
         pass
+
+    class FakeSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def close(self):
+            pass
+
+    class FakeScratch:
+        sample_hidden = torch.zeros((max_active, 2560), dtype=torch.bfloat16)
+        logits = torch.zeros((max_active, 32), dtype=torch.bfloat16)
+        local_logits = None
+
+        def rows(self, capacity, rows):
+            return SimpleNamespace(embedding=torch.zeros((capacity, 2560), dtype=torch.bfloat16))
+
+    class FakeInputs:
+        vision_token_indices = torch.zeros(prefill_chunk, dtype=torch.int64)
+        vision_feature_slot = torch.zeros(1, dtype=torch.int64)
+        row_slot_ids = torch.zeros(1, dtype=torch.int64)
+        row_generations = torch.zeros(1, dtype=torch.int64)
+        query_lengths = torch.zeros(1, dtype=torch.int64)
+        live_rows = torch.zeros(1, dtype=torch.int32)
+
+        def buffers(self):
+            return {"input_ids": torch.zeros(1, dtype=torch.int64)}
+
+    class FakeDecoder:
+        def __init__(self, *args, **kwargs):
+            state_meta = args[2]
+            recorded["decoder_calls"].append({
+                "name": kwargs["name"],
+                "mode": state_meta.mode,
+                "capacity": state_meta.tokens,
+                "qsa_gather_runtime": kwargs.get("qsa_gather_runtime"),
+                "qsa_shard_mode": kwargs.get("qsa_shard_mode"),
+                "row_shard_prefill": kwargs.get("row_shard_prefill"),
+            })
+
+        def functional(self, *, session):
+            return self
+
+        def release_outputs(self):
+            pass
 
     monkeypatch.setattr(qwen_bootstrap, "CollectivePreparation", FakeCoordinator)
     monkeypatch.setattr(qwen_bootstrap, "create_roce_runtime", fake_create_roce_runtime)
@@ -190,23 +240,86 @@ def test_roce_sharded_qsa_bootstrap_gather_bytes_and_wiring(monkeypatch, world_s
     monkeypatch.setattr(qwen_bootstrap, "ModelWeights", SimpleNamespace(
         load=lambda *a, **kw: SimpleNamespace(
             shard=TensorParallelShard(0, world_size),
-            tree=SimpleNamespace(config=SimpleNamespace(text_config=SimpleNamespace())),
+            tree=SimpleNamespace(
+                config=SimpleNamespace(text_config=SimpleNamespace(), vision_config=SimpleNamespace()),
+                lm_head=SimpleNamespace(weight=None),
+            ),
+            vision=SimpleNamespace(),
             allocated_bytes=0,
         )
     ))
     monkeypatch.setattr(qwen_bootstrap, "PLETable", SimpleNamespace(
-        load=lambda *a, **kw: SimpleNamespace(close=lambda: None)
+        load=lambda *a, **kw: SimpleNamespace(close=lambda: None, buffers=lambda: {})
     ))
     monkeypatch.setattr(torch.cuda, "set_device", lambda dev: None)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda dev: None)
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda dev: SimpleNamespace(is_integrated=False))
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda dev: (64 << 30, 128 << 30))
     monkeypatch.setattr(collectives_mod, "packed_broadcast_layout", lambda vals: ((), 64))
-
-    def fake_prep_session(**kwargs):
-        recorded["namespace"] = kwargs["namespace"]
-        raise StopAfterCollectives()
-
-    monkeypatch.setattr(qwen_bootstrap, "preparation_session", fake_prep_session)
+    monkeypatch.setattr(qwen_bootstrap, "preparation_session", lambda **kw: (
+        recorded.__setitem__("namespace", kw["namespace"]) or FakeSession()
+    ))
+    monkeypatch.setattr(qwen_bootstrap, "HybridStateLayout", SimpleNamespace(
+        build=lambda **kw: SimpleNamespace(snapshot_capacity=lambda budget: 4, row_bytes=1024)
+    ))
+    monkeypatch.setattr(qwen_bootstrap, "HybridStatePool", SimpleNamespace(
+        allocate=lambda *a, **kw: SimpleNamespace(
+            gdn={0: SimpleNamespace(recurrent=torch.zeros(1))},
+            backing=torch.zeros(1),
+            reset_for_preparation=lambda: None,
+            memory_capacity=torch.zeros(2, dtype=torch.int64),
+        )
+    ))
+    monkeypatch.setattr(qwen_bootstrap, "register_benchmark_state", lambda *a, **kw: None)
+    monkeypatch.setattr(qwen_bootstrap, "DeviceRequestState", SimpleNamespace(
+        allocate=lambda *a, **kw: SimpleNamespace(grammar_mask=torch.zeros(1, dtype=torch.uint8))
+    ))
+    monkeypatch.setattr(qwen_bootstrap, "DecoderInputs", SimpleNamespace(allocate=lambda *a, **kw: FakeInputs()))
+    monkeypatch.setattr(qwen_bootstrap, "DecoderScratch", SimpleNamespace(allocate=lambda *a, **kw: FakeScratch()))
+    monkeypatch.setattr(qwen_bootstrap, "ScratchArena", lambda *a, **kw: SimpleNamespace(overlap=True))
+    monkeypatch.setattr(qwen_bootstrap, "RotaryTables", SimpleNamespace(allocate=lambda *a, **kw: SimpleNamespace()))
+    monkeypatch.setattr(qwen_bootstrap, "QSAState", SimpleNamespace(
+        allocate=lambda *a, **kw: SimpleNamespace(
+            main_k_cache=torch.zeros(16, dtype=torch.uint8),
+            main_v_cache=torch.zeros(16, dtype=torch.uint8),
+            compressed_k_cache=torch.zeros(16, dtype=torch.uint8),
+        )
+    ))
+    monkeypatch.setattr(qwen_bootstrap, "minimum_across_ranks", lambda val, group: val)
+    monkeypatch.setattr(qwen_bootstrap, "AdmissionBuffers", SimpleNamespace(
+        allocate=lambda *a, **kw: SimpleNamespace(__dataclass_fields__={})
+    ))
+    monkeypatch.setattr(qwen_bootstrap, "StateTransferMetadata", SimpleNamespace(
+        allocate=lambda *a, **kw: SimpleNamespace(__dataclass_fields__={})
+    ))
+    monkeypatch.setattr(readiness_mod, "ReadinessTimings", SimpleNamespace(allocate=lambda *a, **kw: SimpleNamespace()))
+    monkeypatch.setattr(qwen_bootstrap, "CompletionOutputs", SimpleNamespace(
+        allocate=lambda *a, **kw: SimpleNamespace(buffers=lambda: {})
+    ))
+    monkeypatch.setattr(vision_state_mod, "VisionFeatureState", SimpleNamespace(allocate=lambda *a, **kw: SimpleNamespace()))
+    monkeypatch.setattr(vision_state_mod, "VisionInputs", SimpleNamespace(
+        allocate=lambda *a, **kw: SimpleNamespace(__dataclass_fields__={})
+    ))
+    monkeypatch.setattr(vision_state_mod, "PreparedVisionHandoff", lambda *a, **kw: SimpleNamespace(
+        metadata=SimpleNamespace(), prepare=lambda: None, functional=lambda: None
+    ))
+    monkeypatch.setattr(vision_state_mod, "PreparedVisionGeneration", lambda *a, **kw: SimpleNamespace())
+    monkeypatch.setattr(vision_state_mod, "PreparedEmbeddingInjection", lambda *a, **kw: SimpleNamespace(prepare=lambda: None))
+    monkeypatch.setattr(qwen_bootstrap, "VisionScratch", SimpleNamespace(
+        allocate=lambda *a, **kw: SimpleNamespace(output=None, patches=None)
+    ))
+    monkeypatch.setattr(qwen4_mod, "Qwen4ExpVisionModel", lambda cfg: SimpleNamespace(
+        eval=lambda: SimpleNamespace(requires_grad_=lambda flag: None)
+    ))
+    monkeypatch.setattr(qwen_bootstrap, "PreparedVision", lambda *a, **kw: SimpleNamespace(functional=lambda **fkw: None))
+    monkeypatch.setattr(qwen_bootstrap, "PromptScoring", SimpleNamespace(allocate=lambda *a, **kw: None))
+    monkeypatch.setattr(qwen_bootstrap, "PreparedDecoderState", lambda *a, **kw: SimpleNamespace(
+        tokens=kw["tokens"], rows=kw["rows"], mode=kw["mode"]
+    ))
+    monkeypatch.setattr(qwen_bootstrap, "PreparedDecoder", FakeDecoder)
+    monkeypatch.setattr(qwen_bootstrap, "PreparedResume", lambda *a, **kw: (_ for _ in ()).throw(StopAfterDecoders()))
+    orig_zeros = torch.zeros
+    monkeypatch.setattr(torch, "zeros", lambda *a, **kw: orig_zeros(*a, **{**kw, "device": "cpu"}))
 
     cfg = PreparationConfig(
         devices=(0,) * world_size,
@@ -215,7 +328,7 @@ def test_roce_sharded_qsa_bootstrap_gather_bytes_and_wiring(monkeypatch, world_s
         prefill_chunk_size=prefill_chunk,
         row_shard_prefill=True,
     )
-    with pytest.raises(StopAfterCollectives):
+    with pytest.raises(StopAfterDecoders):
         qwen_bootstrap.prepare_model(
             snapshot=SimpleNamespace(), config=cfg, rank=0, group=object()
         )
@@ -229,6 +342,27 @@ def test_roce_sharded_qsa_bootstrap_gather_bytes_and_wiring(monkeypatch, world_s
         # At small concurrency, QSA prefill gather (8 MiB TP2 / 4 MiB TP4) exceeds vocab gather!
         assert recorded["roce_kwargs"]["gather_bytes"] == expected_qsa_prefill
     assert recorded["namespace"]["row_shard_prefill"] is True
+
+    calls = recorded["decoder_calls"]
+    assert calls, "bootstrap must reach PreparedDecoder construction"
+    eligible_prefill = [c for c in calls if c["mode"] == "prefill" and c["capacity"] >= 512 and c["capacity"] % (32 * world_size) == 0]
+    ineligible_prefill = [c for c in calls if c["mode"] == "prefill" and (c["capacity"] < 512 or c["capacity"] % (32 * world_size) != 0)]
+    eligible_decode = [c for c in calls if c["mode"] == "decode" and c["capacity"] <= 128]
+    assert eligible_prefill, "expected at least one eligible prefill bucket (>=512 aligned)"
+    assert ineligible_prefill, "expected at least one ineligible prefill bucket (<512)"
+    assert eligible_decode, "expected at least one eligible decode bucket (<=128)"
+    for call in eligible_prefill:
+        assert call["qsa_gather_runtime"] is fake_roce
+        assert call["qsa_shard_mode"] == "row"
+        assert call["row_shard_prefill"] is True
+    for call in ineligible_prefill:
+        assert call["qsa_gather_runtime"] is None
+        assert call["qsa_shard_mode"] is None
+        assert call["row_shard_prefill"] is True
+    for call in eligible_decode:
+        assert call["qsa_gather_runtime"] is fake_roce
+        assert call["qsa_shard_mode"] == "group"
+        assert call["row_shard_prefill"] is False
 
 
 def test_prepared_sharded_qsa_disables_overlap_on_roce_preserves_pcie(monkeypatch):
@@ -651,10 +785,17 @@ def test_qwen38_decoder_roce_row_shard_enabled_shapes_and_collectives(
     assert set(dec.context_gathers) == {5, 15, 25, 35, 45}
     assert len(rec["gather_shards"]) == 47 * 2 + int(sample) + 5
 
-    # Functional conversion succeeds and refuses late capture_context.
+    # Functional conversion succeeds and refuses late capture_context without mutating decoder state.
     dec.functional(session=None)
+    orig_layers = dec.context_layers
+    orig_capture = dec.context_capture
+    orig_aux = dec.auxiliary
+    late_draft_cfg = SimpleNamespace(target_layers=(1, 2), attention=SimpleNamespace(window=128))
     with pytest.raises(RuntimeError, match="capture_context must precede functional conversion"):
-        dec.capture_context(meta, draft_cfg, compact_prefill=True)
+        dec.capture_context(meta, late_draft_cfg, compact_prefill=False)
+    assert dec.context_layers == orig_layers
+    assert dec.context_capture is orig_capture
+    assert dec.auxiliary is orig_aux
 
 
 def test_qwen38_decoder_roce_row_shard_eligibility_rejections(monkeypatch):
@@ -758,9 +899,9 @@ class _SimulatedRoceFabric:
             raise AssertionError(f"RoCE {kind} must never pass graph-ordering dependencies, got {dependencies}")
         self.calls[rank].append((kind, tuple(tensor.shape), dependencies))
         self.slots[rank] = tensor.detach().clone()
-        self.barrier.wait()
+        self.barrier.wait(timeout=30)
         gathered = [self.slots[r].clone() for r in range(self.world_size)]
-        self.barrier.wait()
+        self.barrier.wait(timeout=30)
         return gathered
 
     def all_reduce(self, rank: int, tensor: torch.Tensor, *, dependencies=()):
@@ -1003,21 +1144,25 @@ def test_roce_row_shard_multi_rank_end_to_end_parity_and_zero_dependencies(
     # Run all `world_size` RoCE row-sharded ranks concurrently over the simulated fabric.
     fabric = _SimulatedRoceFabric(world_size)
     results: list[tuple | None] = [None] * world_size
-    errors: list[BaseException] = []
+    errors: list[tuple[int, BaseException]] = []
+    errors_lock = threading.Lock()
 
     def worker(r: int):
         try:
             dec = build_decoder(rank=r, fabric=fabric)
             results[r] = dec(runtime)
         except BaseException as exc:  # noqa: BLE001
-            errors.append(exc)
+            with errors_lock:
+                errors.append((r, exc))
+            fabric.barrier.abort()
 
     threads = [threading.Thread(target=worker, args=(r,)) for r in range(world_size)]
     for t in threads:
         t.start()
     for t in threads:
-        t.join(timeout=15)
-        assert not t.is_alive()
+        t.join(timeout=30)
+    alive = [i for i, t in enumerate(threads) if t.is_alive()]
+    assert not alive, f"worker threads hung: {alive}; errors={errors}"
     assert not errors, errors
 
     # Verify numerical parity across EVERY rank AND strict collective call counts / zero dependencies!
@@ -1160,4 +1305,118 @@ def test_qwen38_decoder_roce_mxfp8_attn_gather_init_and_fallback(monkeypatch):
     bf16 = [g for g in attn_gathers if g[1] == (256, 2560) and g[2] == (512, 2560)]
     assert len(packed) == 46
     assert len(bf16) == 1 and bf16[0][0] == "prefill512.layer2.attn_gather"
+
+
+def test_qwen38_decoder_default_path_does_not_import_row_shard_collectives(monkeypatch):
+    """Default PreparedDecoder construction (row_shard_prefill=False) works when row-shard symbols are absent."""
+    import ignition.components.collectives as collectives_mod
+
+    weights, scratch, state, qsa_states, rec = _build_roce_decoder_env(monkeypatch, tokens=512, world_size=2)
+    for attr in (
+        "PreparedChunkedGatherShards",
+        "PreparedGatherShards",
+        "PreparedReduceScatter",
+        "row_shard_surfaces",
+    ):
+        monkeypatch.delattr(collectives_mod, attr, raising=False)
+
+    dec = qwen_decoder.PreparedDecoder(
+        weights, scratch, state, qsa_states, None, None, None,
+        None, None, None, session=None, name="prefill512_default",
+        runtime=_FakeRoceRuntime(2), row_shard_prefill=False,
+    )
+    assert dec.row_shard_roce is False
+    assert len(rec["all_reduce"]) == 96
+    assert not rec["reduce_scatter"]
+    assert not rec["gather_shards"]
+
+
+def test_prepared_attention_rejects_preencoded_input_with_overlapping_group_sharded_qsa(monkeypatch):
+    """PreparedAttention rejects input_encoded at construction when PCIe group-mode QSA would overlap streams."""
+    from b12x.gemm.blockscaled._linear import MXFP8LinearWeight
+    from b12x.quantization import mxfp8
+    import ignition.components.collectives as collectives_mod
+    from ignition.preparation.scratch import ScratchArena
+
+    pcie_rt = SimpleNamespace(world_size=2)
+    monkeypatch.setattr(collectives_mod, "_roce", lambda rt: False)
+    monkeypatch.setattr(qwen_attention.sm103, "is_sm103", lambda dev: False)
+    monkeypatch.setattr(qwen_attention.qsa, "Caps", lambda **kw: SimpleNamespace(**kw))
+
+    projection_calls = []
+
+    def fail_if_called(*args, **kwargs):
+        projection_calls.append((args, kwargs))
+        raise AssertionError("projection must not be constructed when overlap + input_encoded is rejected")
+
+    monkeypatch.setattr(qwen_attention, "QuantizedProjection", fail_if_called)
+    monkeypatch.setattr(qwen_attention, "UnquantizedProjection", fail_if_called)
+
+    class FakeArena(ScratchArena):
+        def __init__(self):
+            self.overlap = True
+
+    class FakeMXFP8Rows:
+        pass
+
+    monkeypatch.setattr(mxfp8, "MXFP8Rows", FakeMXFP8Rows)
+
+    mxfp8_w = MXFP8LinearWeight(weight=None, in_features=2560, padded_in_features=2560, out_features=640)
+    module = SimpleNamespace(
+        q_norm=torch.nn.RMSNorm(256, eps=1e-6),
+        k_norm=torch.nn.RMSNorm(256, eps=1e-6),
+        config=SimpleNamespace(rms_norm_eps=1e-6),
+        indexer=SimpleNamespace(
+            q_layernorm=SimpleNamespace(weight=torch.ones(128)),
+            k_layernorm=SimpleNamespace(weight=torch.ones(128)),
+        ),
+    )
+    source = torch.zeros((8, 2560), dtype=torch.bfloat16)
+    scratch = SimpleNamespace(
+        query=torch.zeros((8, 12, 256), dtype=torch.bfloat16),
+        key=torch.zeros((8, 1, 256), dtype=torch.bfloat16),
+        output=torch.zeros((8, 2560), dtype=torch.bfloat16),
+        projected_qkv=torch.zeros((8, 6656), dtype=torch.bfloat16),
+        projected_index=torch.zeros((8, 640), dtype=torch.bfloat16),
+        projected_v=torch.zeros((8, 256), dtype=torch.bfloat16),
+        gated=torch.zeros((8, 3072), dtype=torch.bfloat16),
+        attended=torch.zeros((8, 12, 256), dtype=torch.bfloat16),
+        selected_positions=torch.full((8, 2051), -1, dtype=torch.int32),
+    )
+    state = SimpleNamespace(
+        main_k_cache=torch.zeros((2, 64, 1, 256), dtype=torch.float8_e4m3fn),
+        main_v_cache=torch.zeros((2, 64, 1, 256), dtype=torch.float8_e4m3fn),
+        compressed_k_cache=torch.zeros((2, 16, 128), dtype=torch.bfloat16),
+        raw_k_ring=torch.zeros((2, 8, 128), dtype=torch.bfloat16),
+        raw_logical_positions=torch.full((2, 8), -1, dtype=torch.int64),
+        raw_rope_positions=torch.full((2, 8, 3), -1, dtype=torch.int64),
+        raw_interval_start_positions=torch.full((2,), -1, dtype=torch.int64),
+    )
+    metadata = SimpleNamespace(
+        main_block_table=torch.full((1, 4), -1, dtype=torch.int32),
+        compressed_block_table=torch.full((1, 4), -1, dtype=torch.int32),
+        raw_state_slot_ids=torch.full((1,), -1, dtype=torch.int64),
+        request_ids=torch.full((8,), -1, dtype=torch.int64),
+        query_positions=torch.full((8,), -1, dtype=torch.int64),
+        rope_positions=torch.full((8, 3), -1, dtype=torch.int64),
+        sequence_lengths=torch.zeros((1,), dtype=torch.int32),
+        query_start_loc=torch.zeros((2,), dtype=torch.int32),
+        num_accepted_tokens=torch.zeros((1,), dtype=torch.int32),
+        is_prefilling=torch.zeros((1,), dtype=torch.bool),
+        slot_mapping=torch.full((8,), -1, dtype=torch.int64),
+    )
+    rotary = SimpleNamespace(cos=torch.ones((256, 32)), sin=torch.zeros((256, 32)))
+    weights = {"qkv_proj": mxfp8_w, "indexer.index_qk_proj": mxfp8_w, "o_proj": mxfp8_w}
+
+    with pytest.raises(ValueError, match="preencoded QSA inputs require serial non-overlapping projections"):
+        qwen_attention.PreparedAttention(
+            module, weights, source, scratch, state, metadata, rotary,
+            session=None, name="qsa_overlap_reject",
+            workspace=FakeArena(), projection_workspace=FakeArena(),
+            shard=TensorParallelShard(0, 2),
+            qsa_gather_runtime=pcie_rt, qsa_shard_mode="group",
+            input_encoded=FakeMXFP8Rows(),
+        )
+    assert projection_calls == []
+
 

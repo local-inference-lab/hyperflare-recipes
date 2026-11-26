@@ -280,7 +280,12 @@ class PreparedAttention:
         if input_encoded is not None:
             from b12x.gemm.blockscaled._linear import MXFP8LinearWeight
             from b12x.quantization import mxfp8
+            from ignition.components.collectives import _roce
 
+            if (use_sharded and qsa_shard_mode == "group"
+                    and isinstance(workspace, ScratchArena) and workspace.overlap
+                    and not (qsa_gather_runtime is not None and _roce(qsa_gather_runtime))):
+                raise ValueError("preencoded QSA inputs require serial non-overlapping projections")
             if (sm103.is_sm103(source.device) or not isinstance(input_encoded, mxfp8.MXFP8Rows)
                     or any(not isinstance(weights[k], MXFP8LinearWeight)
                            or weights[k].padded_in_features != source.shape[1]

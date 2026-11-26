@@ -419,42 +419,43 @@ class PreparedDecoder:
             and runtime.should_allreduce(scratch.hidden[:half])
         )
         self.half_tokens = half if self.pipelined_prefill else 0
-        from ignition.components.collectives import (
-            PreparedChunkedGatherShards,
-            PreparedGatherShards,
-            PreparedReduceScatter,
-            row_shard_surfaces,
-        )
-
         world = 1 if shard is None else shard.world_size
         shard_tokens = state.tokens // world if world > 1 and state.tokens % world == 0 else 0
         need_full_residual = bool(getattr(state, "maintain_draft_state", False)) or residual_output is not None
-        self.row_shard_roce = (
-            bool(row_shard_prefill)
-            and state.mode == "prefill"
-            and state.rows == 1
-            and scoring is None
-            and not verification
-            and not self.pipelined_prefill
-            and not sharded_hc
-            and layer_outputs is None
-            and gdn_records is None
-            and getattr(state, "gdn_partitions", None) is None
-            and getattr(state, "ple_partitions", None) is None
-            and runtime is not None
-            and not _is_dma_runtime(runtime)
-            and row_shard_surfaces(runtime)
-            and world > 1
-            and state.tokens >= 512
-            and state.tokens % world == 0
-            and shard_tokens % 128 == 0
-            and PreparedReduceScatter.fits(runtime, scratch.hidden, scratch.hidden[:shard_tokens])
-            and PreparedGatherShards.fits(runtime, scratch.hidden[:shard_tokens], scratch.hidden)
-            and (
-                not need_full_residual
-                or PreparedChunkedGatherShards.fits(runtime, scratch.residual[:shard_tokens], scratch.residual)
+        self.row_shard_roce = False
+        if row_shard_prefill:
+            from ignition.components.collectives import (
+                PreparedChunkedGatherShards,
+                PreparedGatherShards,
+                PreparedReduceScatter,
+                row_shard_surfaces,
             )
-        )
+
+            self.row_shard_roce = (
+                state.mode == "prefill"
+                and state.rows == 1
+                and scoring is None
+                and not verification
+                and not self.pipelined_prefill
+                and not sharded_hc
+                and layer_outputs is None
+                and gdn_records is None
+                and getattr(state, "gdn_partitions", None) is None
+                and getattr(state, "ple_partitions", None) is None
+                and runtime is not None
+                and not _is_dma_runtime(runtime)
+                and row_shard_surfaces(runtime)
+                and world > 1
+                and state.tokens >= 512
+                and state.tokens % world == 0
+                and shard_tokens % 128 == 0
+                and PreparedReduceScatter.fits(runtime, scratch.hidden, scratch.hidden[:shard_tokens])
+                and PreparedGatherShards.fits(runtime, scratch.hidden[:shard_tokens], scratch.hidden)
+                and (
+                    not need_full_residual
+                    or PreparedChunkedGatherShards.fits(runtime, scratch.residual[:shard_tokens], scratch.residual)
+                )
+            )
         self.need_full_residual = need_full_residual
         self.shard_tokens = shard_tokens if self.row_shard_roce else 0
         if self.row_shard_roce:
@@ -765,6 +766,8 @@ class PreparedDecoder:
                 self.completion_recorder.prepare()
 
     def capture_context(self, metadata, draft_config, *, compact_prefill=False):
+        if getattr(self, "row_shard_roce", False) and getattr(self, "_functional_requested", False):
+            raise RuntimeError("capture_context must precede functional conversion for row-sharded RoCE decoders")
         from hyperflare_recipes.components.dflash2 import PreparedContextCapture
 
         self.context_layers = draft_config.target_layers
@@ -774,8 +777,6 @@ class PreparedDecoder:
         self.auxiliary = torch.empty(self.context_capture.shape, dtype=torch.bfloat16,
                                      device=self.context_capture.device)
         if getattr(self, "row_shard_roce", False):
-            if getattr(self, "_functional_requested", False):
-                raise RuntimeError("capture_context must precede functional conversion for row-sharded RoCE decoders")
             from ignition.components.collectives import PreparedGatherShards
 
             runtime, coordinator, session, name, hidden_sh, hidden_full = self._row_shard_context_args
