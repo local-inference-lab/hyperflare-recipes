@@ -237,7 +237,7 @@ class SpeculativePreparation(DFlash2Preparation):
 
         super().__init__(facade, pool, requests, inputs, scratch, decoder=decoder,
             embedding=draft_embedding,
-            head=weights.tree.lm_head.weight if draft_head is None else draft_head,
+            head=weights.lm_head_weight if draft_head is None else draft_head,
             page_tokens=64, completion=completion, frame=frame, sequence=sequence,
             session=session, workspace=workspaces, verification_width=verification_width,
             runtime=runtime, vocabulary_runtime=vocabulary_runtime, coordinator=coordinator,

@@ -9,7 +9,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import torch
@@ -89,6 +89,7 @@ class PreparationConfig(BasePreparationConfig):
     force_moe_decode_a16: bool = False
     online_mxfp8: bool = False
     draft_head_quantization: str | None = None
+    target_head_quantization: str | None = None
     device: int = 0
     devices: tuple[int, ...] | None = None
     # Each rank's host when ranks run on separate hosts; devices are then host-local ordinals.
@@ -113,6 +114,8 @@ class PreparationConfig(BasePreparationConfig):
 
         if self.draft_head_quantization not in (None, "nvfp4", "mxfp8"):
             raise ValueError("draft head quantization must be nvfp4 or mxfp8")
+        if self.target_head_quantization not in (None, "mxfp8"):
+            raise ValueError("target head quantization must be mxfp8")
         if (self.online_mxfp8 or self.draft_head_quantization is not None) and (
                 not self.mtp or self.speculative_method != "dflash2"):
             raise ValueError("Flash Next online MXFP8 and draft head conversion require DFlash2")
@@ -238,7 +241,9 @@ def _identity(manifest, world_size=1, *, config=None, draft_config=None):
     if config is not None:
         value["arithmetic"] = dict(native_dense_activations=config.native_dense_activations,
             force_moe_decode_a16=config.force_moe_decode_a16,
-            shard_hyperconnections=config.shard_hyperconnections)
+            shard_hyperconnections=config.shard_hyperconnections,
+            **({} if config.target_head_quantization is None else {
+                "target_head_quantization": config.target_head_quantization}))
         value["draft"] = None
         if config.mtp:
             value["draft"] = dict(method=config.speculative_method,
@@ -306,7 +311,8 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
         transient.enter_context(core_storage.transient())
     weights = ModelWeights.load(manifest, device, progress=progress, shard=shard,
         shard_hyperconnections=config.shard_hyperconnections,
-        force_moe_decode_a16=config.force_moe_decode_a16)
+        force_moe_decode_a16=config.force_moe_decode_a16,
+        target_head_quantization=config.target_head_quantization)
     if torch.cuda.get_device_properties(device).is_integrated:
         from ignition.preparation.host_memory import release_page_cache
 
@@ -340,6 +346,19 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                 raise ValueError("draft head conversion requires BF16 checkpoint vocabulary weights")
             converters = {"mxfp8": mxfp8_draft_head, "nvfp4": nvfp4_draft_head}
             draft_head = converters[config.draft_head_quantization](head)
+    if config.target_head_quantization is not None:
+        from hyperflare_recipes.components.vocabulary import mxfp8_draft_head
+
+        head = weights.tree.lm_head.weight
+        if head.dtype != torch.bfloat16:
+            raise ValueError("target head conversion requires BF16 checkpoint vocabulary weights")
+        target_head = (draft_head if config.draft_head_quantization == "mxfp8" and draft_head is not None
+                       else mxfp8_draft_head(head))
+        weights.tree.lm_head.weight = torch.nn.Parameter(torch.empty_like(head, device="meta"), requires_grad=False)
+        del head
+        weights = replace(weights, target_head=target_head)
+        if mtp_weights is not None:
+            mtp_weights = replace(mtp_weights, lm_head=target_head)
     host_storage = {} if core_storage is None else {"host_allocator": core_storage.host_allocate}
     table = PLETable.load(manifest, device, tokens=config.token_capacity, progress=progress, **host_storage)
     sample_rows = max(batch * width for batch, width in config.speculative_shapes) if config.mtp else config.request_capacity
@@ -421,7 +440,9 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                    "shard_hyperconnections": config.shard_hyperconnections,
                    "force_moe_decode_a16": config.force_moe_decode_a16,
                    "speculative_method": config.speculative_method,
-                   "online_mxfp8": config.online_mxfp8, "draft_head_quantization": config.draft_head_quantization},
+                   "online_mxfp8": config.online_mxfp8, "draft_head_quantization": config.draft_head_quantization,
+                   **({} if config.target_head_quantization is None else {
+                       "target_head_quantization": config.target_head_quantization})},
         headroom_bytes=config.headroom_bytes, benchmark_storage=core_storage)
     session.__enter__()
     graphs = {}
@@ -642,11 +663,11 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                 for capacity in reversed(config.batch_capacities):
                     name = f"resume{capacity}" + suffix
                     resume = PreparedResume(inputs, requests, state, scratch.sample_hidden[:capacity],
-                        scratch.logits[:capacity], weights.tree.lm_head.weight, completion, frame, sequence,
+                        scratch.logits[:capacity], weights.lm_head_weight, completion, frame, sequence,
                         session=session, name=name, vocabulary_runtime=vocabulary_collective,
                         result_runtime=result_collective,
                         local_logits=None if scratch.local_logits is None else scratch.local_logits[:capacity],
-                        coordinator=coordinator, sampling_workspace=sampling_workspace)
+                        coordinator=coordinator, sampling_workspace=sampling_workspace, workspace=workspaces)
                     resume.functional(session=session)
                     forward = speculation.resume(resume) if enabled else resume
                     add(name, forward, "resume", capacity, 1, forward_fields, enabled=enabled)
@@ -787,6 +808,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
         'tree.model.language_model.embed_tokens': 'embedding',
         'tree.model.language_model.hyper_connection_mixer': 'hyper-connection',
         'tree.lm_head': 'head',
+        'target_head': 'head',
         'vision': 'vision',
         'mtp': 'mtp',
         'draft': 'draft',
