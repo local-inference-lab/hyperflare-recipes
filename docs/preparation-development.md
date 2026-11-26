@@ -8,6 +8,22 @@ For running preparation, use [model preparation and serving](model-preparation.m
 Recipe and execution-component changes also require
 [model development](model-development.md).
 
+## Recipe parameters and preparation manifests
+
+Recipes declare their preparation options, defaults, validation rules, planning
+adjustments, and manifest serialization on a frozen `RecipeParameters` instance
+(`ignition.parameters`) attached to `Recipe.parameters`. Reusable recipe-domain
+parameter groups live in
+[hyperflare_recipes/parameters.py](../hyperflare_recipes/parameters.py), while
+universal core options and Helios `GraphOperation` ABI opt-ins
+(`SpeculationParameters`, `VisionParameters`, `PromptLogprobsParameters`,
+`MixedPrefillParameters`) live in core `ignition.parameters`. `PreparationConfig`
+classes inherit from `BasePreparationConfig` (`ignition.preparation.bootstrap`)
+and embed `plan.parameters` directly via `common_preparation_kwargs`.
+`PreparationManifest` (`parameters` and `reproduction_args`) is serialized
+exclusively from the resolved `RecipeParameters` object and checkpoint
+provenance, emitting only keys declared by the selected recipe.
+
 ## Operator declaration, tuning, and binding
 
 - Use b12x's autotuning and warmup facilities during preparation. Do not pin

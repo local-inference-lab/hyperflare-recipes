@@ -9,7 +9,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
@@ -19,6 +19,11 @@ from hyperflare_recipes.components.prompt_logprobs import (
     PreparedScoredPrefill, PromptScoring, prefill_graph_count, prefill_modes,
 )
 
+from ignition.parameters import (
+    MixedPrefillParameters,
+    PromptLogprobsParameters,
+    VisionParameters,
+)
 from ignition.preparation.tuning_replicas import TuningReplica
 from ignition.preparation.tuning import with_autotune_effort
 
@@ -54,7 +59,7 @@ from .checkpoint_schema import (
 from ignition.preparation.scratch import ScratchArena
 from ignition.progress import phase
 
-from .recipe import RECIPE
+from .recipe import Qwen38Parameters, RECIPE
 from .attention import QSAState, RotaryTables
 from .decoder import DecoderScratch, ModelWeights, PreparedDecoder
 from .decoder_state import DecoderInputs, PreparedDecoderState, PreparedResume
@@ -75,6 +80,18 @@ from ignition.preparation.bootstrap import BasePreparationConfig
 _DMA_PREFILL_TOKENS = 1024
 
 
+def _default_parameters() -> Qwen38Parameters:
+    return Qwen38Parameters(
+        max_concurrency=4,
+        max_concurrency_limit=64,
+        prefill_chunk=4096,
+        speculation=None,
+        vision=VisionParameters(),
+        prompt_logprobs=PromptLogprobsParameters(),
+        mixed_prefill=MixedPrefillParameters(),
+    )
+
+
 def _terminal_prefill_capacities(prefill_capacities: tuple[int, ...], *, has_terminal_op: bool) -> tuple[int, ...]:
     """Select chunk capacities that split into non-terminal prefill and terminal_prefill graphs."""
     if not has_terminal_op or not prefill_capacities or prefill_capacities[-1] < 512:
@@ -84,33 +101,54 @@ def _terminal_prefill_capacities(prefill_capacities: tuple[int, ...], *, has_ter
 
 @dataclass(frozen=True)
 class PreparationConfig(BasePreparationConfig):
-    prompt_logprobs: bool = False
-    image_concurrency: int | None = None
-    force_moe_decode_a16: bool = False
-    online_mxfp8: bool = False
-    draft_head_quantization: str | None = None
+    parameters: Qwen38Parameters = field(default_factory=_default_parameters)
     device: int = 0
     devices: tuple[int, ...] | None = None
     # Each rank's host when ranks run on separate hosts; devices are then host-local ordinals.
     hosts: tuple[str, ...] | None = None
-    roce_ring: bool = False
-    roce_chain: bool = False
-    mixed_prefill: bool = False
     pages: int | None = None
-    mtp: bool = False
-    speculative_method: str = "mtp"
     draft_snapshot: Path | None = None
-    # Run shared experts, small-batch attention projections and selection, and GDN input projections
-    # on an auxiliary stream; without overlap every branch runs serially on the main stream.
-    stream_overlap: bool = True
-    shard_hyperconnections: bool = False
+
+    @property
+    def native_dense_activations(self) -> bool:
+        return self.parameters.native_dense_activations.enabled
+
+    @property
+    def force_moe_decode_a16(self) -> bool:
+        return self.parameters.force_moe_decode_a16
+
+    @property
+    def online_mxfp8(self) -> bool:
+        return self.parameters.online_mxfp8.enabled
+
+    @property
+    def draft_head_quantization(self) -> str | None:
+        return self.parameters.draft_quantization.draft_head_quantization
+
+    @property
+    def stream_overlap(self) -> bool:
+        return self.parameters.stream_overlap.enabled
+
+    @property
+    def shard_hyperconnections(self) -> bool:
+        return self.parameters.shard_hyperconnections
+
+    @property
+    def mtp(self) -> bool:
+        return self.parameters.speculation is not None
+
+    @property
+    def speculative_method(self) -> str:
+        if self.parameters.speculation is None or self.parameters.speculation.method is None:
+            return "mtp"
+        return self.parameters.speculation.method
 
     def __post_init__(self):
+        if not isinstance(self.parameters, Qwen38Parameters):
+            raise TypeError("Qwen3.8 PreparationConfig requires Qwen38Parameters")
         if self.mtp_only and (not self.mtp
                 or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
             raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
-        from ignition.components.capacity import image_capacity
-
         if self.draft_head_quantization not in (None, "nvfp4", "mxfp8"):
             raise ValueError("draft head quantization must be nvfp4 or mxfp8")
         if (self.online_mxfp8 or self.draft_head_quantization is not None) and (
@@ -124,7 +162,6 @@ class PreparationConfig(BasePreparationConfig):
             if self.mixed_prefill:
                 raise ValueError("DFlash2 requires separate prefill and verification graphs")
 
-        object.__setattr__(self, "image_concurrency", image_capacity(self.max_active, self.image_concurrency))
         from ignition.planning import host_shape_error
 
         error = host_shape_error(self.roce_ring, self.roce_chain, None if self.hosts is None else len(self.hosts))
@@ -155,8 +192,8 @@ class PreparationConfig(BasePreparationConfig):
             raise ValueError("prefill chunk size must be 64-aligned in [64,context]")
         if self.pages is not None and (type(self.pages) is not int or self.pages <= 0):
             raise ValueError("explicit page capacity must be a positive integer")
-        if type(self.mtp) is not bool or type(self.stream_overlap) is not bool:
-            raise TypeError("MTP and stream overlap switches must be booleans")
+        if type(self.stream_overlap) is not bool:
+            raise TypeError("stream_overlap must be a boolean")
         if type(self.mixed_prefill) is not bool:
             raise TypeError("mixed_prefill must be a boolean")
         world_size = 1 if self.devices is None else len(self.devices)

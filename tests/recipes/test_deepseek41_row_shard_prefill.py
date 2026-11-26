@@ -32,36 +32,37 @@ def _sm120_gpus(count: int, capability: tuple[int, int] = (12, 0)) -> tuple[Gpu,
 
 
 def _make_plan(*, gpus: tuple[Gpu, ...], row_shard_prefill: bool) -> Plan:
+    from dataclasses import replace
+
     return Plan(
         recipe=ds_recipe.RECIPE,
         checkpoint=ds_recipe.RECIPE.checkpoints[0],
         gpus=gpus,
-        concurrency=32,
-        prefill_chunk=4096,
-        speculation=ds_recipe.RECIPE.speculation,
+        parameters=replace(ds_recipe.RECIPE.parameters, row_shard_prefill=row_shard_prefill),
         cache_target=8192,
         cache_states=256,
         pages=1024,
-        reserve_bytes=0,
         weights_bytes=1,
         graph_bytes=1,
-        image_concurrency=4,
-        row_shard_prefill=row_shard_prefill,
     )
 
 
 def test_recipe_and_plan_gate_row_shard_prefill_to_tp4(monkeypatch):
-    assert ds_recipe.RECIPE.row_shard_prefill_world_sizes == (4,)
+    from dataclasses import replace
+
+    assert ds_recipe.RECIPE.parameters.row_shard_prefill_world_sizes == (4,)
 
     default_cfg = PreparationConfig()
     assert default_cfg.row_shard_prefill is False
-    assert PreparationConfig(row_shard_prefill=True).row_shard_prefill is True
+    assert PreparationConfig(
+        parameters=replace(ds_recipe.RECIPE.parameters, row_shard_prefill=True),
+    ).row_shard_prefill is True
     for invalid in (1, 0, "true", None):
         with pytest.raises(TypeError, match="row_shard_prefill must be a boolean"):
-            PreparationConfig(row_shard_prefill=invalid)
+            replace(ds_recipe.RECIPE.parameters, row_shard_prefill=invalid)
 
     valid_plan = _make_plan(gpus=_sm120_gpus(4), row_shard_prefill=True)
-    assert valid_plan.row_shard_prefill is True
+    assert valid_plan.parameters.row_shard_prefill is True
 
     captured = {}
 

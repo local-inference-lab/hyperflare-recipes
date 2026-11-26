@@ -365,9 +365,8 @@ publishes image features into the shared `VisionState` feature arena through
 `PreparedFeaturePublication`. Prefill replaces the embeddings at image-token
 positions (token 248056) with the published rows. Each feature slot holds
 16,384 BF16 vectors of width 5,120 (167,772,160 bytes, or 160 MiB).
-`--image-concurrency` defaults to the smaller of four and `--max-concurrency`,
-and can also be set via `image_concurrency` in `[defaults]` or
-`[models."qwen3.8-27b"]`. Fixed persistent vision storage declares
+`--image-concurrency` defaults to the smaller of four and `--max-concurrency`
+and is configured on the command line. Fixed persistent vision storage declares
 1,023,172,092 bytes (the 921,460,192-byte BF16 vision tower plus 101,711,900
 bytes of float32 patch upload and handoff metadata), and each feature slot adds
 167,772,160 bytes (1,694,260,732 bytes declared for four slots). Vision scratch
@@ -539,10 +538,9 @@ verification use A16 at every row count; separate prefill graphs use calibrated
 A4 from the checkpoint activation scales. The option requires SM120/121 and
 rank-local intermediate width divisible by 64 (TP1/2); mixed prefill is rejected
 because its prompt and decode rows share one expert call. Shared experts and MTP
-retain their declared precision. `[preparation] force_moe_decode_a16 = true`
-sets the default, and `--no-force-moe-decode-a16` overrides it. Preparation records
-the resolved option in the plan and rebuild metadata; compatible weight reuse
-requires the packed layouts and activation scales prepared for that option.
+retain their declared precision. Preparation records the resolved option in the
+plan and `PreparationManifest`; compatible weight reuse requires the packed
+layouts and activation scales prepared for that option.
 
 `ignition export qwen3.8-flash --gpus 0,1 --shard-hyperconnections` partitions
 the 320-wide hyperconnection bottleneck across ranks, including target and MTP
@@ -555,11 +553,9 @@ Replicated execution is the default: the compute savings must outweigh the extra
 10,240-element reduction per mixer and token. Changing the option requires a
 fresh export; `--reuse-weights` requires matching prepared weight layouts.
 
-Vision recipes accept `--image-concurrency N`, independently of
-`--max-concurrency`. It defaults to `min(4, max_concurrency)` and can also be set
-as `image_concurrency` in `[defaults]` or a model's configuration section.
-Explicit flags override configuration. Text-only recipes ignore the configured
-image default and reject an explicit image-concurrency flag.
+Vision recipes accept `--image-concurrency N` on the command line, independently
+of `--max-concurrency`, defaulting to `min(4, max_concurrency)`. Text-only
+recipes do not accept `--image-concurrency`.
 Helios reserves a feature slot when a request needs vision computation. Requests
 whose image spans are already covered by a reused prefix checkpoint need no
 feature slot. Requests needing a slot queue when those slots are occupied;

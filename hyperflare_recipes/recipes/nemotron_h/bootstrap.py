@@ -5,7 +5,7 @@
 """Prepare Nemotron-H graphs with explicit Mamba continuations and FP8 KV pages."""
 
 import contextlib
-from dataclasses import dataclass, fields as dataclass_fields, replace
+from dataclasses import dataclass, field, fields as dataclass_fields, replace
 from functools import partial
 import hashlib
 import json
@@ -61,28 +61,35 @@ from .pool import ContinuationPool, continuation_layout, page_bytes
 from .weights import ModelWeights
 from .vision import PATCH_CAPACITIES, FEATURES, HIDDEN, VisionInputs, VisionScratch, PreparedVision
 from .vision_state import PreparedVisionGeneration
+from .recipe import NemotronHParameters, RECIPE
 from ignition.components.vision_state import PrefillVisionInputs, VisionState
 from ignition.preparation.bootstrap import BasePreparationConfig
 
 _DMA_PREFILL_TOKENS = 1024
 
 
+def _default_parameters() -> NemotronHParameters:
+    return RECIPE.parameters
+
+
 @dataclass(frozen=True)
 class PreparationConfig(BasePreparationConfig):
-    prompt_logprobs: bool = False
-    image_concurrency: int | None = None
+    parameters: NemotronHParameters = field(default_factory=_default_parameters)
     device: int = 0
     devices: tuple[int, ...] | None = None
     # Each rank's host when ranks run on separate hosts; devices are then host-local ordinals.
     hosts: tuple[str, ...] | None = None
-    roce_ring: bool = False
-    roce_chain: bool = False
-    stream_overlap: bool = True
     hub_cache: Path | None = None
     draft_checkpoint: Path | None = None
-    speculative_widths: tuple[int, ...] = tuple(range(1, 9))
-    speculative_graph_budget: int = 64
     benchmark_selection: BenchmarkSelection | None = None
+
+    @property
+    def native_dense_activations(self) -> bool:
+        return self.parameters.native_dense_activations.enabled
+
+    @property
+    def stream_overlap(self) -> bool:
+        return self.parameters.stream_overlap.enabled
 
     @property
     def speculative_round_shapes(self):
@@ -91,7 +98,7 @@ class PreparationConfig(BasePreparationConfig):
         if self.benchmark_selection is not None:
             return self.benchmark_selection.speculative_round_shapes
         return parallel_speculative_shapes(self.max_active, self.speculative_widths,
-            self.speculative_token_capacity, self.speculative_graph_budget,
+            self.speculative_token_capacity, self.speculative_graph_budget or 64,
             fixed_width=self.speculative_fixed_width) if self.draft_checkpoint is not None else ()
 
     @property
@@ -103,13 +110,15 @@ class PreparationConfig(BasePreparationConfig):
         return max((batch * width for batch, width, _ in self.speculative_round_shapes), default=request_capacity(self.max_active))
 
     def __post_init__(self):
+        if not isinstance(self.parameters, NemotronHParameters):
+            raise TypeError("Nemotron-H PreparationConfig requires NemotronHParameters")
         if self.mtp_only and (self.draft_checkpoint is None
                 or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
             raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
         from ignition.components.capacity import image_capacity
         from ignition.planning import host_shape_error
 
-        object.__setattr__(self, "image_concurrency", image_capacity(self.max_active, self.image_concurrency))
+        image_capacity(self.max_active, self.image_concurrency)
         error = host_shape_error(self.roce_ring, self.roce_chain, None if self.hosts is None else len(self.hosts))
         if error:
             raise ValueError(error)

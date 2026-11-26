@@ -8,7 +8,7 @@ import contextlib
 import hashlib
 import json
 import os
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import torch
@@ -45,7 +45,8 @@ from ignition.progress import phase
 from ignition.preparation.tuning import RecordedPreparationSession, with_autotune_effort
 from ignition.preparation.tuning_replicas import TuningReplica
 
-from .recipe import RECIPE
+from .recipe import Glm53Parameters, RECIPE
+from hyperflare_recipes.parameters import ContextParallelParameters
 from .batch import BatchInputs, PreparedBatch
 from .generation import PreparedGeneration
 from .maintenance import PreparedMaintenance
@@ -77,34 +78,51 @@ def races_context_transport(config, world_size, device):
             and world_size == 4 and torch.cuda.get_device_capability(device) == (12, 0))
 
 
+def _default_parameters() -> Glm53Parameters:
+    return replace(
+        RECIPE.parameters,
+        max_concurrency=4,
+        speculation=None,
+        context_parallel=ContextParallelParameters(enabled=False),
+    )
+
+
 @dataclass(frozen=True)
 class PreparationConfig(BasePreparationConfig):
-    prompt_logprobs: bool = False
+    parameters: Glm53Parameters = field(default_factory=_default_parameters)
     devices: tuple[int, ...] = (0, 1)
     # Each rank's host when ranks run on separate hosts; devices are then host-local ordinals.
     hosts: tuple[str, ...] | None = None
-    roce_ring: bool = False
-    roce_chain: bool = False
-    image_concurrency: int | None = None
-    language_model_only: bool = False
     pages: int | None = None
     # Without fixed pages, KV pages fill the memory measured free after graph capture, at least this many.
     minimum_pages: int | None = None
     # The annotated chat template, resolved once before the ranks start so that a failed download surfaces
     # from the process that reports preparation errors; None makes a rank resolve it from the snapshot.
     chat_template: dict | None = None
-    mtp: bool = False
     # SM103 uses checkpoint-scaled A4; SM120/121 retain A16 with A4 prefill launches.
     expert_activation: str = "auto"
-    # Shard latent records and C4 pools across the tensor-parallel ranks (decode context parallelism).
-    context_parallel: bool = False
     # Expand routed experts' CSF block scales once at load instead of before every expert launch.
     expand_expert_scales: bool = False
-    # Run shared experts, KDA gate projections, and decode query chains on an auxiliary stream;
-    # without overlap every branch runs serially on the main stream.
-    stream_overlap: bool = True
+
+    @property
+    def native_dense_activations(self) -> bool:
+        return self.parameters.native_dense_activations.enabled
+
+    @property
+    def mtp(self) -> bool:
+        return self.parameters.speculation is not None
+
+    @property
+    def context_parallel(self) -> bool:
+        return self.parameters.context_parallel.enabled
+
+    @property
+    def stream_overlap(self) -> bool:
+        return self.parameters.stream_overlap.enabled
 
     def __post_init__(self):
+        if not isinstance(self.parameters, Glm53Parameters):
+            raise TypeError("GLM-5.3 PreparationConfig requires Glm53Parameters")
         if self.mtp_only and (not self.mtp
                 or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
             raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
@@ -145,7 +163,7 @@ class PreparationConfig(BasePreparationConfig):
         if not self.language_model_only:
             from ignition.components.capacity import image_capacity
 
-            object.__setattr__(self, "image_concurrency", image_capacity(self.max_active, self.image_concurrency))
+            image_capacity(self.max_active, self.image_concurrency)
         if self.pages is not None and (type(self.pages) is not int or not 0 < self.pages <= 2147483647):
             raise ValueError("page capacity must be a positive signed 32-bit integer")
         if self.minimum_pages is not None and (type(self.minimum_pages) is not int or self.minimum_pages <= 0

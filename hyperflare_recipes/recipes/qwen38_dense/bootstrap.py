@@ -5,7 +5,7 @@
 """Prepare a single-GPU dense Qwen text and image graph catalog with device-resident state."""
 
 import contextlib
-from dataclasses import dataclass, fields as dataclass_fields, replace
+from dataclasses import dataclass, field, fields as dataclass_fields, replace
 from functools import partial
 import hashlib
 import json
@@ -57,7 +57,16 @@ from .vision_state import (
 )
 from .weights import ModelWeights
 from .dflash import SpeculativePreparation
+from .recipe import Qwen38DenseParameters, RECIPE
+from ignition.parameters import VisionParameters
 from ignition.preparation.bootstrap import BasePreparationConfig
+
+
+def _default_parameters() -> Qwen38DenseParameters:
+    return replace(
+        RECIPE.parameters,
+        vision=VisionParameters(separable_encoder=True, language_model_only=True),
+    )
 
 
 def _terminal_prefill_capacities(prefill_capacities: tuple[int, ...], *, has_terminal_op: bool) -> tuple[int, ...]:
@@ -69,21 +78,30 @@ def _terminal_prefill_capacities(prefill_capacities: tuple[int, ...], *, has_ter
 
 @dataclass(frozen=True)
 class PreparationConfig(BasePreparationConfig):
-    prompt_logprobs: bool = False
-    online_mxfp8: bool = False
-    draft_head_quantization: str | None = None
+    parameters: Qwen38DenseParameters = field(default_factory=_default_parameters)
     device: int = 0
-    max_active: int = 32
-    # Image request slots; zero prepares the language model only.
-    image_concurrency: int = 0
     benchmark_selection: BenchmarkSelection | None = None
-    mtp: bool = True
     draft_snapshot: Path | None = None
-    speculative_graph_budget: int = 64
-    speculative_widths: tuple[int, ...] = (1, 2, 3, 4, 5, 6, 7, 8)
-    speculative_token_capacity: int | None = 128
+
+    @property
+    def native_dense_activations(self) -> bool:
+        return self.parameters.native_dense_activations.enabled
+
+    @property
+    def online_mxfp8(self) -> bool:
+        return self.parameters.online_mxfp8.enabled
+
+    @property
+    def draft_head_quantization(self) -> str | None:
+        return self.parameters.draft_quantization.draft_head_quantization
+
+    @property
+    def mtp(self) -> bool:
+        return self.parameters.speculation is not None
 
     def __post_init__(self):
+        if not isinstance(self.parameters, Qwen38DenseParameters):
+            raise TypeError("Qwen 3.8 Dense PreparationConfig requires Qwen38DenseParameters")
         if self.mtp_only and (not self.mtp
                 or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
             raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
@@ -129,7 +147,7 @@ class PreparationConfig(BasePreparationConfig):
         if self.mtp and self.draft_snapshot is None:
             raise ValueError("Qwen DFlash2 preparation requires a draft checkpoint")
         parallel_speculative_shapes(self.max_active, self.speculative_widths, self.speculative_token_capacity,
-            self.speculative_graph_budget, fixed_width=self.speculative_fixed_width)
+            self.speculative_graph_budget or 64, fixed_width=self.speculative_fixed_width)
         if self.speculative_fixed_width is not None and self.speculative_fixed_width not in self.speculative_widths:
             raise ValueError("fixed verification width must belong to the prepared catalog")
 
@@ -140,7 +158,7 @@ class PreparationConfig(BasePreparationConfig):
                 return ((1, 8, 8),)
             return self.benchmark_selection.speculative_round_shapes
         return (parallel_speculative_shapes(self.max_active, self.speculative_widths,
-            self.speculative_token_capacity, self.speculative_graph_budget,
+            self.speculative_token_capacity, self.speculative_graph_budget or 64,
             fixed_width=self.speculative_fixed_width) if self.mtp else ())
 
     @property

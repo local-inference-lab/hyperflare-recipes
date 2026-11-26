@@ -4,10 +4,28 @@
 
 """Nemotron-H Bolt and Super VL preparation capacities and serving defaults."""
 
+from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 
-from ignition.declaration import Checkpoint, RankCosts, RankUsage, Recipe, SamplingDefaults, Speculation
+from ignition.declaration import Checkpoint, RankCosts, RankUsage, Recipe, SamplingDefaults
+from ignition.parameters import (
+    PromptLogprobsParameters,
+    RecipeParameters,
+    SpeculationParameters,
+    VisionParameters,
+)
+from ignition.preparation.bootstrap import common_preparation_kwargs
+
+from hyperflare_recipes.parameters import NativeDenseActivationsParameters, StreamOverlapParameters
+
+
+@dataclass(frozen=True)
+class NemotronHParameters(RecipeParameters):
+    """Preparation parameters for Nemotron-H checkpoints."""
+
+    native_dense_activations: NativeDenseActivationsParameters = NativeDenseActivationsParameters()
+    stream_overlap: StreamOverlapParameters = StreamOverlapParameters()
 
 
 def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False,
@@ -18,7 +36,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         raise ValueError("Nemotron-H preparation requires one or two GPUs")
     if plan.world_size == 1 and ranks is not None:
         raise ValueError("single-rank Nemotron-H preparation does not use a multi-host rendezvous")
-    drafting = {}
+    draft = None
     if plan.speculation is not None:
         from huggingface_hub import snapshot_download
         from .draft_config import draft_source
@@ -26,22 +44,15 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         repo, rev = draft_source(plan.checkpoint.repository, Path(snapshot))
         draft = snapshot_download(repo, revision=rev, cache_dir=plan.hub_cache,
                                   allow_patterns=("config.json", "model.safetensors"))
-        drafting = dict(draft_checkpoint=draft, speculative_widths=plan.speculation.widths,
-            speculative_fixed_width=plan.speculation.fixed_width, speculative_token_capacity=plan.speculative_token_capacity,
-            speculative_graph_budget=plan.speculation.graph_budget or 64)
-    config = PreparationConfig(mtp_only=plan.speculation is not None and plan.speculation.mtp_only,
-        prompt_logprobs=plan.prompt_logprobs,
-        compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
-        native_dense_activations=plan.native_dense_activations, benchmark_selection=plan.benchmark_selection,
-        lock_gpu_clocks=plan.lock_gpu_clocks and plan.autotune_effort != "off",
+    config = PreparationConfig(
+        **common_preparation_kwargs(plan, compile_forwards=compile_forwards,
+                                    kernel_cache=kernel_cache, retain_graphs=retain_graphs),
         devices=tuple(range(plan.world_size)) if ranks is None else (0,) * plan.world_size,
         hosts=None if ranks is None else ranks.hosts,
-        roce_ring=plan.roce_ring, roce_chain=plan.roce_chain,
-        max_active=plan.concurrency, image_concurrency=plan.image_concurrency, context=plan.recipe.context,
-        stream_overlap=plan.stream_overlap,
-        prefill_chunk_size=plan.prefill_chunk, snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
-        headroom_bytes=plan.headroom_bytes + plan.reserve_bytes, compile_decoder=compile_forwards,
-        retain_graphs=retain_graphs, kernel_cache=kernel_cache, hub_cache=plan.hub_cache, **drafting)
+        benchmark_selection=plan.benchmark_selection,
+        hub_cache=plan.hub_cache,
+        draft_checkpoint=draft,
+    )
     if plan.world_size == 1:
         return prepare_model(snapshot, config, progress=progress, core_storage=core_storage)
     from ignition.preparation.rank_group import prepare_group
@@ -86,10 +97,14 @@ RECIPE = Recipe(
                 2: RankCosts(43_442_432, 262_144, 6 << 30),
             }),
     ),
-    context=262144, page_tokens=128, concurrency=32, max_concurrency=64, prefill_chunk=4096,
-    speculation=Speculation(draft_tokens=7, token_capacity=128, packed_verification=True, graph_budget=64), max_draft_tokens=7, verification_rows=0,
-    max_images=4, image_bytes=32 << 20,
-    stream_overlap=True,
+    context=262144, page_tokens=128, verification_rows=0, max_images=4, image_bytes=32 << 20,
+    parameters=NemotronHParameters(
+        max_concurrency=32, max_concurrency_limit=64, prefill_chunk=4096,
+        speculation=SpeculationParameters(draft_tokens=7, max_draft_tokens=7, token_capacity=128,
+                                          packed_verification=True, graph_budget=64),
+        vision=VisionParameters(),
+        prompt_logprobs=PromptLogprobsParameters(),
+    ),
     benchmark_world_sizes=(1,),
     ranks=MappingProxyType({
         1: RankCosts(107_365_120, 524_288, 4 << 30),

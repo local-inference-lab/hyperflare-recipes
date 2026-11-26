@@ -63,26 +63,56 @@ def test_suffix_declarations_preserve_full_prefill_sources():
     (32, True, 6, 256), (32, False, 1, 256), (1, True, 6, 256),
 ])
 def test_oneshot_capacity_excludes_prefills_assigned_to_dma(capacity, dspark, draft_width, expected):
-    config = PreparationConfig(max_active=capacity, dspark=dspark,
-        speculative_widths=tuple(range(1, draft_width + 1)), speculative_token_capacity=64)
+    from dataclasses import replace
+    from ignition.parameters import SpeculationParameters
+
+    base = PreparationConfig()
+    spec = None if not dspark else SpeculationParameters(
+        draft_tokens=draft_width - 1, max_draft_tokens=7, token_capacity=64,
+        packed_verification=True, draft_prefix_selection="gpu", graph_budget=64,
+    )
+    config = replace(base, parameters=replace(base.parameters, max_concurrency=capacity, speculation=spec))
     assert config.all_reduce_tokens == expected
 
 
 def test_oneshot_capacity_tracks_draft_requirement_below_dma_cutoff():
-    config = PreparationConfig(max_active=32, dspark=True,
-        speculative_widths=tuple(range(1, 7)), speculative_token_capacity=64,
-        prefill_chunk_size=64)
+    from dataclasses import replace
+    from ignition.parameters import SpeculationParameters
+
+    base = PreparationConfig()
+    spec = SpeculationParameters(
+        draft_tokens=5, max_draft_tokens=7, token_capacity=64,
+        packed_verification=True, draft_prefix_selection="gpu", graph_budget=64,
+    )
+    config = replace(base, parameters=replace(base.parameters, max_concurrency=32, prefill_chunk=64, speculation=spec))
     assert config.all_reduce_tokens == 160
 
 
 def test_short_prefill_still_fits_the_oneshot_channel():
-    config = PreparationConfig(max_active=1, dspark=False, prefill_chunk_size=64)
+    from dataclasses import replace
+
+    base = PreparationConfig()
+    config = replace(base, parameters=replace(base.parameters, max_concurrency=1, prefill_chunk=64, speculation=None))
     assert config.all_reduce_tokens == 64
 
 
 def test_three_rank_scratch_preserves_grouped_attention_and_unpadded_experts():
-    config = PreparationConfig(devices=(0, 1, 2), max_active=32,
-        speculative_widths=tuple(range(1, 9)), image_concurrency=4)
+    from dataclasses import replace
+    from ignition.parameters import SpeculationParameters, VisionParameters
+
+    base = PreparationConfig()
+    config = PreparationConfig(
+        devices=(0, 1, 2),
+        parameters=replace(
+            base.parameters,
+            max_concurrency=32,
+            speculation=SpeculationParameters(
+                draft_tokens=7, max_draft_tokens=7, token_capacity=128,
+                packed_verification=True, draft_prefix_selection="gpu", graph_budget=64,
+            ),
+            vision=VisionParameters(image_concurrency=4),
+        ),
+    )
     scratch = Scratch.allocate(128, 32, 3, "meta")
     assert config.draft_tokens == 7
     assert scratch.attention.query.shape == (128, 24, 512)

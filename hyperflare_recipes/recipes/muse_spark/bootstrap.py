@@ -6,7 +6,7 @@
 import contextlib
 import hashlib
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import torch
@@ -42,20 +42,32 @@ from .decoder import PreparedDecoder, PreparedResume, Scratch
 from .frontend import prepare_frontend, runtime_assets
 from .pool import PAGE_TOKENS, ContinuationPool, continuation_layout, page_bytes
 from .weights import ModelWeights
+from .recipe import MuseSparkParameters, RECIPE
 from ignition.preparation.bootstrap import BasePreparationConfig
+
+
+def _default_parameters() -> MuseSparkParameters:
+    return replace(RECIPE.parameters, speculation=None)
 
 
 @dataclass(frozen=True)
 class PreparationConfig(BasePreparationConfig):
-    prompt_logprobs: bool = False
+    parameters: MuseSparkParameters = field(default_factory=_default_parameters)
     devices: tuple[int, ...] = tuple(range(8))
     stream_overlap: bool = True
-    dflash: bool = False
     draft_snapshot: Path | None = None
-    speculative_widths: tuple[int, ...] = tuple(range(1, 9))
-    speculative_graph_budget: int = 64
+
+    @property
+    def native_dense_activations(self) -> bool:
+        return self.parameters.native_dense_activations.enabled
+
+    @property
+    def dflash(self) -> bool:
+        return self.parameters.speculation is not None
 
     def __post_init__(self):
+        if not isinstance(self.parameters, MuseSparkParameters):
+            raise TypeError("Muse Spark PreparationConfig requires MuseSparkParameters")
         if self.mtp_only and (not self.dflash
                 or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
             raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
@@ -79,7 +91,7 @@ class PreparationConfig(BasePreparationConfig):
         from ignition.components.capacity import parallel_speculative_shapes
 
         return parallel_speculative_shapes(self.max_active, self.speculative_widths,
-            self.speculative_token_capacity, self.speculative_graph_budget,
+            self.speculative_token_capacity, self.speculative_graph_budget or 64,
             fixed_width=self.speculative_fixed_width) if self.dflash else ()
 
     @property

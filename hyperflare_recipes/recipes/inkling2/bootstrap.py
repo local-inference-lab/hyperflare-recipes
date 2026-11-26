@@ -6,7 +6,7 @@
 import contextlib
 import hashlib
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -41,33 +41,51 @@ from .contract import prepare as prepare_contract
 from .decoder import PreparedDecoder, Scratch
 from .weights import ModelWeights
 from .pool import PAGE_TOKENS, ContinuationPool, RankGeometry, continuation_layout, page_specs
+from .recipe import Inkling2Parameters, RECIPE
 from ignition.preparation.bootstrap import BasePreparationConfig, validate_host_topology
+
+
+def _default_parameters() -> Inkling2Parameters:
+    return replace(RECIPE.parameters, autotune_effort="off", compiled_forwards=False)
 
 
 @dataclass(frozen=True)
 class PreparationConfig(BasePreparationConfig):
-    prompt_logprobs: bool = False
-    image_concurrency: int | None = None
-    autotune_effort: str = "off"
+    parameters: Inkling2Parameters = field(default_factory=_default_parameters)
     devices: tuple[int, ...] = (0, 1, 2, 3)
     # Device ordinals are host-local when each rank runs on its own host.
     hosts: tuple[str, ...] | None = None
-    roce_ring: bool = False
-    roce_chain: bool = False
     context: int = 1048576
-    max_active: int = 8
-    compile_decoder: bool = False
     decoder_layers: int | None = None
-    drafting: bool = True
-    vision: bool = True
-    speculative_widths: tuple[int, ...] = tuple(range(1, 9))
-    speculative_token_capacity: int | None = 128
-    speculative_graph_budget: int = 64
-    draft_head_quantization: str | None = None
-    markov_head_quantization: str | None = None
     benchmark_selection: object | None = None
 
+    @property
+    def native_dense_activations(self) -> bool:
+        return self.parameters.native_dense_activations.enabled
+
+    @property
+    def drafting(self) -> bool:
+        return self.parameters.speculation is not None
+
+    @property
+    def vision(self) -> bool:
+        return self.parameters.vision is not None and not self.parameters.vision.language_model_only
+
+    @property
+    def draft_head_quantization(self) -> str | None:
+        if self.parameters.draft_quantization is None:
+            return None
+        return self.parameters.draft_quantization.draft_head_quantization
+
+    @property
+    def markov_head_quantization(self) -> str | None:
+        if self.parameters.draft_quantization is None:
+            return None
+        return self.parameters.draft_quantization.markov_head_quantization
+
     def __post_init__(self):
+        if not isinstance(self.parameters, Inkling2Parameters):
+            raise TypeError("Inkling 2 PreparationConfig requires Inkling2Parameters")
         placements = tuple(zip(self.hosts or ("",) * len(self.devices), self.devices))
         if (not isinstance(self.devices, tuple) or len(self.devices) not in (1, 4)
                 or len(set(placements)) != len(self.devices)
@@ -101,7 +119,8 @@ class PreparationConfig(BasePreparationConfig):
             raise ValueError("DSpark proposal head quantization requires drafting")
         if self.snapshot_budget_bytes <= 0 or self.headroom_bytes < 0:
             raise ValueError("snapshot budget must be positive and headroom nonnegative")
-        object.__setattr__(self, "image_concurrency", image_capacity(self.max_active, self.image_concurrency) if self.vision else 0)
+        if self.vision:
+            image_capacity(self.max_active, self.image_concurrency)
         _ = self.speculative_round_shapes
 
     @property
@@ -109,7 +128,8 @@ class PreparationConfig(BasePreparationConfig):
         if self.benchmark_selection is not None:
             return self.benchmark_selection.speculative_round_shapes
         return (parallel_speculative_shapes(self.max_active, self.speculative_widths,
-            self.speculative_token_capacity, self.speculative_graph_budget, fixed_width=self.speculative_fixed_width)
+            self.speculative_token_capacity, self.speculative_graph_budget or 64,
+            fixed_width=self.speculative_fixed_width)
             if self.drafting else ())
 
     @property

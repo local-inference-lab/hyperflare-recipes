@@ -3,7 +3,7 @@
 
 """DeepSeek V4.1 row-sharded encoder attention, mla_wo compression/indexing, Engram overlap, and boundary parity."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -113,7 +113,6 @@ def test_replicated_attention_layer_schedule_and_exact_byte_accounting(monkeypat
     assert EXPECTED_TOTAL_BYTES - 17 * EXPECTED_LAYER_BYTES == 374_342_400
 
     assert ds_config.replicated_attention_bytes(4) == EXPECTED_TOTAL_BYTES
-    assert ds_recipe.RECIPE.replicated_attention_bytes(4) == EXPECTED_TOTAL_BYTES
     assert ds_config.replicated_attention_bytes(4, prompt_logprobs=True) == EXPECTED_TOTAL_BYTES
     assert ds_config.replicated_attention_bytes(4, mtp_only=True) == EXPECTED_TOTAL_BYTES
 
@@ -160,14 +159,20 @@ def test_replicated_attention_layer_schedule_and_exact_byte_accounting(monkeypat
     assert ds_config.replicated_attention_layer_bytes(wider_sink_text) > EXPECTED_LAYER_BYTES
 
     # PreparationConfig validation and safe plan extraction.
+    from dataclasses import replace
+
     assert PreparationConfig().row_shard_attention is False
-    valid_cfg = PreparationConfig(row_shard_prefill=True, row_shard_attention=True)
+    valid_cfg = PreparationConfig(
+        parameters=replace(ds_recipe.RECIPE.parameters, row_shard_prefill=True, row_shard_attention=True),
+    )
     assert valid_cfg.row_shard_attention is True
     for bad in (1, 0, "true", None):
         with pytest.raises(TypeError, match="row_shard_attention must be a boolean"):
-            PreparationConfig(row_shard_prefill=True, row_shard_attention=bad)
+            replace(ds_recipe.RECIPE.parameters, row_shard_prefill=True, row_shard_attention=bad)
     with pytest.raises(ValueError, match="row_shard_attention requires row_shard_prefill"):
-        PreparationConfig(row_shard_prefill=False, row_shard_attention=True)
+        PreparationConfig(
+            parameters=replace(ds_recipe.RECIPE.parameters, row_shard_prefill=False, row_shard_attention=True),
+        )
 
     captured = {}
 
@@ -178,71 +183,51 @@ def test_replicated_attention_layer_schedule_and_exact_byte_accounting(monkeypat
     import ignition.preparation.rank_group as rank_group
 
     monkeypatch.setattr(rank_group, "prepare_group", fake_prepare_group)
+    base_params = replace(ds_recipe.RECIPE.parameters, row_shard_prefill=True, row_shard_attention=False)
     base_plan = Plan(
         recipe=ds_recipe.RECIPE,
         checkpoint=ds_recipe.RECIPE.checkpoints[0],
         gpus=_sm120_gpus(4),
-        concurrency=32,
-        prefill_chunk=4096,
-        speculation=ds_recipe.RECIPE.speculation,
+        parameters=base_params,
         cache_target=8192,
         cache_states=256,
         pages=1024,
-        reserve_bytes=0,
         weights_bytes=1,
         graph_bytes=1,
-        image_concurrency=4,
-        row_shard_prefill=True,
     )
     ds_recipe.prepare("/tmp/snap", base_plan, compile_forwards=True, kernel_cache=None, progress=None)
     assert captured["config"].row_shard_prefill is True
     assert captured["config"].row_shard_attention is False
 
-    if "row_shard_attention" in Plan.__dataclass_fields__:
-        rsa_plan = Plan(
+    rsa_params = replace(ds_recipe.RECIPE.parameters, row_shard_prefill=True, row_shard_attention=True)
+    rsa_plan = Plan(
+        recipe=ds_recipe.RECIPE,
+        checkpoint=ds_recipe.RECIPE.checkpoints[0],
+        gpus=_sm120_gpus(4),
+        parameters=rsa_params,
+        cache_target=8192,
+        cache_states=256,
+        pages=1024,
+        weights_bytes=1,
+        graph_bytes=1,
+    )
+    ds_recipe.prepare("/tmp/snap", rsa_plan, compile_forwards=True, kernel_cache=None, progress=None)
+    assert captured["config"].row_shard_attention is True
+    with pytest.raises(UsageError, match="--row-shard-attention requires --row-shard-prefill"):
+        Plan(
             recipe=ds_recipe.RECIPE,
             checkpoint=ds_recipe.RECIPE.checkpoints[0],
             gpus=_sm120_gpus(4),
-            concurrency=32,
-            prefill_chunk=4096,
-            speculation=ds_recipe.RECIPE.speculation,
+            parameters=replace(ds_recipe.RECIPE.parameters, row_shard_prefill=False, row_shard_attention=True),
             cache_target=8192,
             cache_states=256,
             pages=1024,
-            reserve_bytes=0,
             weights_bytes=1,
             graph_bytes=1,
-            image_concurrency=4,
-            row_shard_prefill=True,
-            row_shard_attention=True,
         )
-        ds_recipe.prepare("/tmp/snap", rsa_plan, compile_forwards=True, kernel_cache=None, progress=None)
-        assert captured["config"].row_shard_attention is True
-        with pytest.raises(UsageError, match="--row-shard-attention requires --row-shard-prefill"):
-            Plan(
-                recipe=ds_recipe.RECIPE,
-                checkpoint=ds_recipe.RECIPE.checkpoints[0],
-                gpus=_sm120_gpus(4),
-                concurrency=32,
-                prefill_chunk=4096,
-                speculation=ds_recipe.RECIPE.speculation,
-                cache_target=8192,
-                cache_states=256,
-                pages=1024,
-                reserve_bytes=0,
-                weights_bytes=1,
-                graph_bytes=1,
-                image_concurrency=4,
-                row_shard_prefill=False,
-                row_shard_attention=True,
-            )
-        base_wb = ds_recipe.RECIPE.weights_bytes(
-            ds_recipe.RECIPE.checkpoints[0], 4, ds_recipe.RECIPE.speculation, "csf", row_shard_attention=False
-        )
-        rsa_wb = ds_recipe.RECIPE.weights_bytes(
-            ds_recipe.RECIPE.checkpoints[0], 4, ds_recipe.RECIPE.speculation, "csf", row_shard_attention=True
-        )
-        assert rsa_wb - base_wb == EXPECTED_TOTAL_BYTES
+    base_wb = ds_recipe.RECIPE.weights_bytes(ds_recipe.RECIPE.checkpoints[0], 4, base_params)
+    rsa_wb = ds_recipe.RECIPE.weights_bytes(ds_recipe.RECIPE.checkpoints[0], 4, rsa_params)
+    assert rsa_wb - base_wb == EXPECTED_TOTAL_BYTES
 
 
 def test_model_weights_replicated_attention_loading_and_misc_component_routing(monkeypatch):
@@ -1047,7 +1032,13 @@ def test_prepared_decoder_row_shard_attention_layer_routing_and_kv_runtime(monke
     ):
         ag_calls.clear()
         p_cfg = PreparationConfig(
-            prefill_chunk_size=chunk_sz, row_shard_prefill=True, row_shard_attention=rsa, dspark=False,
+            parameters=replace(
+                PreparationConfig().parameters,
+                prefill_chunk=chunk_sz,
+                row_shard_prefill=True,
+                row_shard_attention=rsa,
+                speculation=None,
+            ),
         )
         if not coord.spans_hosts:
             rets = ds_bootstrap._collective_runtimes(

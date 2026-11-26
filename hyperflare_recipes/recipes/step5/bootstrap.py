@@ -7,7 +7,7 @@
 import contextlib
 import hashlib
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
@@ -72,27 +72,45 @@ from .vision import (
 )
 from .vision_state import PreparedVisionGeneration
 from .weights import ModelWeights
+from .recipe import RECIPE, Step5Parameters
 from ignition.preparation.bootstrap import BasePreparationConfig
+
+
+def _default_parameters() -> Step5Parameters:
+    return RECIPE.parameters
 
 
 @dataclass(frozen=True)
 class PreparationConfig(BasePreparationConfig):
-    prompt_logprobs: bool = False
-    image_concurrency: int | None = None
+    parameters: Step5Parameters = field(default_factory=_default_parameters)
     devices: tuple[int, ...] = tuple(range(8))
     context: int = 1048576
-    mtp: bool = True
-    speculative_widths: tuple[int, ...] = (1, 2, 3, 4)
-    stream_overlap: bool = True
-    expert_scale_compression: str | None = None
+
+    @property
+    def native_dense_activations(self) -> bool:
+        return self.parameters.native_dense_activations.enabled
+
+    @property
+    def mtp(self) -> bool:
+        return self.parameters.speculation is not None
+
+    @property
+    def stream_overlap(self) -> bool:
+        return self.parameters.stream_overlap.enabled
+
+    @property
+    def expert_scale_compression(self) -> str | None:
+        return self.parameters.expert_scale_compression.encoding
 
     def __post_init__(self):
+        if not isinstance(self.parameters, Step5Parameters):
+            raise TypeError("Step-5 PreparationConfig requires Step5Parameters")
         if self.mtp_only and (not self.mtp
                 or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
             raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
         from ignition.components.capacity import image_capacity
 
-        object.__setattr__(self, "image_concurrency", image_capacity(self.max_active, self.image_concurrency))
+        image_capacity(self.max_active, self.image_concurrency)
         if self.expert_scale_compression not in (None, "csf"):
             raise ValueError("Step-5 expert scale compression must be None or 'csf'")
         if len(self.devices) not in (4, 8, 16) or len(set(self.devices)) != len(self.devices) or any(d < 0 for d in self.devices):

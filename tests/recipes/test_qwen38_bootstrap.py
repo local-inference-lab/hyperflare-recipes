@@ -299,29 +299,35 @@ def test_peer_resources_release_only_after_native_rank_drains(monkeypatch, fails
 
 
 def test_snapshot_budget_covers_the_selected_speculative_layout():
+    from dataclasses import replace
     from hyperflare_recipes.recipes.qwen38.bootstrap import PreparationConfig
+    from hyperflare_recipes.recipes.qwen38.recipe import RECIPE
     from hyperflare_recipes.recipes.qwen38.state import HybridStateLayout
 
     ordinary = HybridStateLayout.build().row_bytes
     speculative = HybridStateLayout.build(speculative_tokens=7).row_bytes
     assert speculative > ordinary
     PreparationConfig(snapshot_budget_bytes=ordinary)
+    mtp_params = replace(PreparationConfig().parameters, speculation=RECIPE.speculation)
     with pytest.raises(ValueError, match="at least one state row"):
-        PreparationConfig(mtp=True, snapshot_budget_bytes=ordinary)
-    config = PreparationConfig(mtp=True,
-                               snapshot_budget_bytes=speculative)
+        PreparationConfig(parameters=mtp_params, snapshot_budget_bytes=ordinary)
+    config = PreparationConfig(parameters=mtp_params, snapshot_budget_bytes=speculative)
     assert config.snapshot_budget_bytes == speculative
 
 
 def test_moe_decode_a16_requires_separate_graph_roles_and_aligned_experts():
+    from dataclasses import replace
+    from ignition.parameters import MixedPrefillParameters
     from hyperflare_recipes.recipes.qwen38.bootstrap import PreparationConfig
 
-    assert PreparationConfig(force_moe_decode_a16=True).force_moe_decode_a16
-    assert PreparationConfig(devices=(0, 1), force_moe_decode_a16=True).force_moe_decode_a16
+    base = PreparationConfig().parameters
+    a16 = replace(base, force_moe_decode_a16=True)
+    assert PreparationConfig(parameters=a16).force_moe_decode_a16
+    assert PreparationConfig(devices=(0, 1), parameters=a16).force_moe_decode_a16
     with pytest.raises(ValueError, match="separate prefill and decode graphs"):
-        PreparationConfig(force_moe_decode_a16=True, mixed_prefill=True)
+        PreparationConfig(parameters=replace(a16, mixed_prefill=MixedPrefillParameters(enabled=True)))
     with pytest.raises(ValueError, match="intermediate width divisible by 64"):
-        PreparationConfig(devices=(0, 1, 2, 3), force_moe_decode_a16=True)
+        PreparationConfig(devices=(0, 1, 2, 3), parameters=a16)
 
 
 def test_prepared_model_retains_persistent_storage_until_confirmed_drain(monkeypatch):
@@ -751,10 +757,11 @@ def test_qwen38_decoder_pipelined_prefill_gating(monkeypatch):
 @pytest.mark.parametrize("chunk, has_terminal", [(4096, True), (512, True), (4096, False)])
 def test_qualify_graph_execution_scenario_dispatches_terminal_prefill(tmp_path, chunk, has_terminal):
     """qualify.graph_execution.Scenario covers both non-terminal prefill and terminal_prefill graphs."""
+    from dataclasses import replace
     from hyperflare_recipes.recipes.qwen38.bootstrap import PreparationConfig
     from qualify.graph_execution import Scenario
 
-    caps = PreparationConfig(prefill_chunk_size=chunk).prefill_capacities
+    caps = PreparationConfig(parameters=replace(PreparationConfig().parameters, prefill_chunk=chunk)).prefill_capacities
     signatures = {}
     for cap in caps:
         signatures[f"prefill{cap}"] = GraphSignature("prefill", 1, cap, ())

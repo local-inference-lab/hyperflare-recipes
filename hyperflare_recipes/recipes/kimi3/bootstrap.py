@@ -5,7 +5,7 @@
 """Prepare Kimi K3 text and image graphs with tensor-parallel decoder storage."""
 
 import contextlib
-from dataclasses import dataclass, fields as dataclass_fields, replace
+from dataclasses import dataclass, field, fields as dataclass_fields, replace
 import hashlib
 import json
 from pathlib import Path
@@ -21,6 +21,11 @@ from hyperflare_recipes.components.prompt_logprobs import (
 from ignition.components.capacity import (
     batch_capacities, prefill_capacities, request_capacity,
     speculative_token_capacity, serving_modes,
+)
+from ignition.parameters import (
+    PromptLogprobsParameters,
+    SpeculationParameters,
+    VisionParameters,
 )
 from hyperflare_recipes.components.parallel import TensorParallelShard
 from hyperflare_recipes.components.paged_batch import BatchInputs, Metadata, PreparedBatch
@@ -49,6 +54,7 @@ from ignition.preparation.tuning_replicas import TuningReplica
 from ignition.progress import phase
 
 from .config import DSparkConfig, ModelConfig, PAGE_TOKENS
+from .recipe import Kimi3Parameters
 from hyperflare_recipes.recipes.kimi31.dflash_config import DFlash2Config
 from .contract import prepare as prepare_contract
 from .decoder import DecoderStorage, PreparedDecoder, Scratch
@@ -62,6 +68,23 @@ from ignition.preparation.bootstrap import BasePreparationConfig
 
 # Most rows of one all-reduce; larger prefill reductions run in chunks of this many rows.
 REDUCE_ROWS = 1024
+
+
+def _default_parameters() -> Kimi3Parameters:
+    return Kimi3Parameters(
+        max_concurrency=4,
+        max_concurrency_limit=64,
+        prefill_chunk=4096,
+        speculation=SpeculationParameters(
+            draft_tokens=7,
+            max_draft_tokens=7,
+            token_capacity=128,
+            packed_verification=True,
+            graph_budget=64,
+        ),
+        vision=VisionParameters(separable_encoder=True),
+        prompt_logprobs=PromptLogprobsParameters(),
+    )
 
 
 def target_tuning_identity(config, headers, world_size, *, online_mxfp8_scope="all", context_parallel_size=None):
@@ -84,35 +107,72 @@ def target_tuning_identity(config, headers, world_size, *, online_mxfp8_scope="a
 
 @dataclass(frozen=True)
 class PreparationConfig(BasePreparationConfig):
-    prompt_logprobs: bool = False
-    image_concurrency: int | None = None
+    parameters: Kimi3Parameters = field(default_factory=_default_parameters)
     devices: tuple[int, ...] = tuple(range(16))
     context: int = 1048576
     benchmark_selection: BenchmarkSelection | None = None
     # Learned draft checkpoint selected by the recipe's speculation method.
     draft_checkpoint: Path | None = None
-    draft_head_quantization: str | None = None
-    draft_body_quantization: str | None = None
-    markov_head_quantization: str | None = None
-    speculative_method: str | None = None
-    # Verification widths count the pending input and up to seven drafts.
-    speculative_widths: tuple[int, ...] = tuple(range(1, 9))
-    speculative_graph_budget: int = 64
-    # Store eligible attention, shared-expert, latent MoE, and DSpark projections as MXFP8.
-    online_mxfp8: bool = False
-    online_mxfp8_scope: str = "all"
-    # Shared experts overlap routing and routed experts on an auxiliary stream.
-    stream_overlap: bool = True
-    # Ranks share each page's context (decode context parallel over every rank, KV interleave 1).
-    context_parallel: bool = True
-    context_parallel_size: int = 16
-    # The MoonViT encoder and its graphs prepare beside the text model unless the plan serves text only.
-    vision: bool = True
     # Recipe-owned serving metadata travels with each rank's preparation configuration.
     sampling_defaults: dict | None = None
     frontend_template: str | None = None
 
+    @property
+    def native_dense_activations(self) -> bool:
+        return self.parameters.native_dense_activations.enabled
+
+    @property
+    def draft_head_quantization(self) -> str | None:
+        dq = getattr(self.parameters, "draft_quantization", None)
+        return None if dq is None else dq.draft_head_quantization
+
+    @property
+    def draft_body_quantization(self) -> str | None:
+        dq = getattr(self.parameters, "draft_quantization", None)
+        return None if dq is None else dq.draft_body_quantization
+
+    @property
+    def markov_head_quantization(self) -> str | None:
+        dq = getattr(self.parameters, "draft_quantization", None)
+        return None if dq is None else dq.markov_head_quantization
+
+    @property
+    def speculative_method(self) -> str | None:
+        return None if self.parameters.speculation is None else self.parameters.speculation.method
+
+    @property
+    def speculative_graph_budget(self) -> int:
+        if self.parameters.speculation is None or self.parameters.speculation.graph_budget is None:
+            return 64
+        return self.parameters.speculation.graph_budget
+
+    @property
+    def online_mxfp8(self) -> bool:
+        return self.parameters.online_mxfp8.enabled
+
+    @property
+    def online_mxfp8_scope(self) -> str:
+        return self.parameters.online_mxfp8.effective_scope
+
+    @property
+    def stream_overlap(self) -> bool:
+        return self.parameters.stream_overlap.enabled
+
+    @property
+    def context_parallel(self) -> bool:
+        return self.parameters.context_parallel.enabled
+
+    @property
+    def context_parallel_size(self) -> int:
+        return self.parameters.context_parallel.effective_size(len(self.devices))
+
+    @property
+    def vision(self) -> bool:
+        return self.parameters.vision is not None and not self.parameters.vision.language_model_only
+
     def __post_init__(self):
+        if not isinstance(self.parameters, Kimi3Parameters):
+            raise TypeError("Kimi PreparationConfig requires Kimi3Parameters")
         if self.markov_head_quantization is not None and (
                 self.markov_head_quantization != "fp8" or self.speculative_method != "dspark"):
             raise ValueError("row-scaled FP8 Markov weights require the sliding-window DSpark method")
@@ -133,16 +193,6 @@ class PreparationConfig(BasePreparationConfig):
             raise ValueError("online MXFP8 scope requires online conversion")
         if self.speculative_widths and max(self.speculative_widths) > 8:
             raise ValueError("Kimi K3 draft model supports at most seven draft tokens")
-        from ignition.components.capacity import image_capacity
-
-        if self.vision:
-            images = image_capacity(self.max_active, self.image_concurrency)
-        else:
-            if self.image_concurrency is not None and (type(self.image_concurrency) is not int
-                                                       or self.image_concurrency != 0):
-                raise ValueError("image concurrency must be zero or omitted when vision is disabled")
-            images = 0
-        object.__setattr__(self, "image_concurrency", images)
         if len(self.devices) != 16 or len(set(self.devices)) != 16 or any(d < 0 for d in self.devices):
             raise ValueError("Kimi K3 preparation requires sixteen distinct GPUs")
         if self.context_parallel_size not in (4, 8, 16):
@@ -177,7 +227,7 @@ class PreparationConfig(BasePreparationConfig):
 
     @property
     def drafting(self):
-        return self.draft_checkpoint is not None
+        return self.parameters.speculation is not None and self.draft_checkpoint is not None
 
     @property
     def page_tokens(self):
