@@ -170,6 +170,90 @@ def test_exact_cache_endpoint_cuda_graph(endpoint):
     endpoint_case(endpoint, "cuda")
 
 
+def high_page_checkpoint_case(device):
+    """Snapshot and restore physical pages whose byte offsets exceed signed int32."""
+    page_bytes = 16384
+    snapshot_page, restore_page = 131072, 131073
+    row_bytes = 65536
+    offset = 4096
+    cache = torch.empty((restore_page + 1, page_bytes), dtype=torch.uint8, device=device)
+    pattern = (torch.arange(page_bytes, dtype=torch.int64, device=device) * 13 + 7).remainder(251).to(torch.uint8)
+    cache[0].fill_(0x11)
+    cache[snapshot_page].copy_(pattern)
+    cache[restore_page].fill_(0xEE)
+
+    backing = torch.full((6, row_bytes), 0xA5, dtype=torch.uint8, device=device)
+    tables = torch.full((4, 4), -1, dtype=torch.int32, device=device)
+    tables[2, 1] = snapshot_page
+    tables[1, 1] = restore_page
+    pointers = torch.tensor([[cache.data_ptr(), offset]], dtype=torch.int64, device=device)
+    sources = torch.tensor([3], dtype=torch.int64, device=device)
+    destinations = torch.tensor([5], dtype=torch.int64, device=device)
+    operations = torch.zeros(1, dtype=torch.int32, device=device)
+    expected = torch.tensor([65], dtype=torch.int64, device=device)
+    count = torch.ones(1, dtype=torch.int32, device=device)
+    errors = torch.zeros(1, dtype=torch.int32, device=device)
+    requests = torch.tensor([2], dtype=torch.int64, device=device)
+    raw_slots = torch.tensor([-1], dtype=torch.int64, device=device)
+    args = (pointers, backing, tables, sources, destinations, operations, expected, count, errors,
+            requests, raw_slots, row_bytes, page_bytes, 4, -1, 1024)
+    grid = (1, 1, triton.cdiv(page_bytes, 1024))
+
+    def invoke():
+        launch(module._checkpoint_pages, grid, args, device)
+
+    if device == "cuda":
+        # Prime the Triton kernel before capture, then replay both snapshot and restore via CUDA graph.
+        invoke()
+        backing[5].fill_(0xA5)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            invoke()
+        torch.cuda.synchronize()
+        allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+    else:
+        invoke()
+
+    assert torch.equal(backing[5, offset:offset + page_bytes], pattern)
+    assert backing[5, :offset].eq(0xA5).all() and backing[5, offset + page_bytes:].eq(0xA5).all()
+    assert cache[0].eq(0x11).all() and cache[restore_page].eq(0xEE).all()
+
+    sources.fill_(5)
+    destinations.fill_(2)
+    requests.fill_(1)
+    raw_slots.fill_(0)
+    if device == "cuda":
+        allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+        graph.reset()
+    else:
+        invoke()
+
+    assert torch.equal(cache[restore_page], pattern)
+    assert torch.equal(cache[snapshot_page], pattern)
+    assert cache[0].eq(0x11).all()
+    assert torch.equal(backing[5, offset:offset + page_bytes], pattern)
+
+
+def test_checkpoint_pages_high_page_index_cpu(monkeypatch):
+    def unexpected_cuda_access():
+        pytest.fail("CPU cache checks must not access CUDA")
+
+    monkeypatch.setattr(torch.cuda, "_lazy_init", unexpected_cuda_access)
+    high_page_checkpoint_case("cpu")
+
+
+@CUDA
+def test_checkpoint_pages_high_page_index_cuda_graph():
+    assert os.environ.get("CUDA_VISIBLE_DEVICES")
+    high_page_checkpoint_case("cuda")
+
+
 def transfer_case(accepted, device):
     # Whole aligned tiles exercise the exact byte transfer and normalization kernel.
     block, row_bytes, slots = 4096, 16384, 34
