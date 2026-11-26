@@ -34,8 +34,20 @@ from hyperflare_recipes.components.recurrent import (
 # = 184 KiB/rank (737 KiB gathered, overlapped behind f_b_proj).
 # Scan packs per-row FP8 A_r [64, 8192] + FP32 A_sc [64, 256] + per-row INT16 B_r [64, 16384]
 # + FP32 B_sc [64, 256] + post-conv state [64, 1152] = 3.20 MiB/rank (12.81 MiB gathered).
-ROW_SHARD_SINIT_SHAPE = (64, 8192)
-ROW_SHARD_HALO_SHAPE = (3, 30720)
+def row_shard_sinit_shape(world_size: int) -> tuple[int, int]:
+    if world_size not in (2, 4):
+        raise ValueError(f"row-owned KDA requires TP2 or TP4, got {world_size}")
+    return (64, 32768 // world_size)
+
+
+def row_shard_halo_shape(world_size: int) -> tuple[int, int]:
+    if world_size not in (2, 4):
+        raise ValueError(f"row-owned KDA requires TP2 or TP4, got {world_size}")
+    return (3, 24576 + 24576 // world_size)
+
+
+ROW_SHARD_SINIT_SHAPE = row_shard_sinit_shape(4)
+ROW_SHARD_HALO_SHAPE = row_shard_halo_shape(4)
 ROW_SHARD_SCAN_SHAPE = (64, 26240)
 
 
@@ -111,10 +123,11 @@ class PreparedGlmKDA:
                 or state.convolution.shape[:2] != (state.recurrent.shape[0], 3 * self.local_width)):
             raise ValueError("GLM KDA state must match one TP1/TP2/TP4 head partition")
         if self.row_shard:
-            if mode != "prefill" or self.local_heads != 16 or records is not None:
-                raise ValueError("row-owned KDA requires TP4 prefill without verification records")
-            if rank_index is None or segment_eye is None or half_tokens != self.tokens * 4:
-                raise ValueError("row-owned KDA requires rank_index, segment_eye, and TP4 half_tokens")
+            if mode != "prefill" or self.local_heads not in (16, 32) or records is not None:
+                raise ValueError("row-owned KDA requires TP2 or TP4 prefill without verification records")
+            self.world = 64 // self.local_heads
+            if rank_index is None or segment_eye is None or half_tokens != self.tokens * self.world:
+                raise ValueError("row-owned KDA requires rank_index, segment_eye, and aligned half_tokens")
             if segment_pool is None or local_conv is None or seg_qkv is None or seg_beta is None:
                 raise ValueError("row-owned KDA requires declaration segment buffers")
             self.heads = 64
@@ -392,10 +405,10 @@ class PreparedGlmKDA:
 
 
     def pack_initial_state(self, metadata):
-        """Pack this rank's 16 decode heads of FP32 initial recurrent state as BF16 [64, 8192]."""
+        """Pack this rank's decode heads of FP32 initial recurrent state as BF16."""
         init_slot = metadata.initial_state_indices[:1].clamp_min(0).to(torch.int64)
-        s_init_16 = torch.index_select(self.state.recurrent, 0, init_slot).squeeze(0)
-        return s_init_16.contiguous().view(torch.bfloat16).reshape(ROW_SHARD_SINIT_SHAPE)
+        s_init_local = torch.index_select(self.state.recurrent, 0, init_slot).squeeze(0)
+        return s_init_local.contiguous().view(torch.bfloat16).reshape(row_shard_sinit_shape(self.world))
 
     @property
     def supports_zero_copy_segment(self):
@@ -445,11 +458,14 @@ class PreparedGlmKDA:
             raw_beta = torch.cat((raw_beta_a, raw_beta_b), dim=0)
         device = qkv.device
 
+        w = self.world
+        local_conv_w = 24576 // w
+        local_ch = 8192 // w
         prev_rank = (self.rank_index - 1).clamp_min(0)
         is_rank0 = self.rank_index == 0
-        hf = halo_full.view(4, 3, 30720)
-        c_init = hf[:, :, :6144].view(4, 3, 3, 2048).permute(2, 0, 3, 1).reshape(24576, 3)
-        prev_tail = torch.index_select(hf[:, :, 6144:], 0, prev_rank).squeeze(0).transpose(0, 1)
+        hf = halo_full.view(w, 3, 24576 + local_conv_w)
+        c_init = hf[:, :, :local_conv_w].view(w, 3, 3, local_ch).permute(2, 0, 3, 1).reshape(24576, 3)
+        prev_tail = torch.index_select(hf[:, :, local_conv_w:], 0, prev_rank).squeeze(0).transpose(0, 1)
         local_conv = torch.where(is_rank0.view(1, 1), c_init, prev_tail).unsqueeze(0).contiguous()
         conv_fresh = metadata.fresh[:1] & is_rank0
 
@@ -513,20 +529,21 @@ class PreparedGlmKDA:
         s0_raw = s_init_full.contiguous().view(torch.float32).reshape(64, 128, 128)
         s0 = torch.where(metadata.fresh[:1].view(1, 1, 1), torch.zeros_like(s0_raw), s0_raw)
 
-        sf = scan_full.view(4, 64, ROW_SHARD_SCAN_SHAPE[1])
-        A_q = sf[:, :, 0:8192].contiguous().view(torch.float8_e4m3fn).reshape(4, 64, 128, 128).float()
-        A_sc = sf[:, :, 8192:8448].contiguous().view(torch.float32).reshape(4, 64, 128, 1)
+        w = self.world
+        sf = scan_full.view(w, 64, ROW_SHARD_SCAN_SHAPE[1])
+        A_q = sf[:, :, 0:8192].contiguous().view(torch.float8_e4m3fn).reshape(w, 64, 128, 128).float()
+        A_sc = sf[:, :, 8192:8448].contiguous().view(torch.float32).reshape(w, 64, 128, 1)
         A_all = A_q * A_sc
-        B_q = sf[:, :, 8448:24832].contiguous().view(torch.int16).reshape(4, 64, 128, 128).float()
-        B_sc = sf[:, :, 24832:25088].contiguous().view(torch.float32).reshape(4, 64, 128, 1)
+        B_q = sf[:, :, 8448:24832].contiguous().view(torch.int16).reshape(w, 64, 128, 128).float()
+        B_sc = sf[:, :, 24832:25088].contiguous().view(torch.float32).reshape(w, 64, 128, 1)
         B_all = B_q * B_sc
-        conv_all = sf[:, :, 25088:26240].reshape(4, 24576, 3)
+        conv_all = sf[:, :, 25088:26240].reshape(w, 24576, 3)
 
-        s1 = torch.bmm(s0, A_all[0]) + B_all[0]
-        s2 = torch.bmm(s1, A_all[1]) + B_all[1]
-        s3 = torch.bmm(s2, A_all[2]) + B_all[2]
-        s4 = torch.bmm(s3, A_all[3]) + B_all[3]
-        s_in = torch.index_select(torch.stack((s0, s1, s2, s3), dim=0), 0, self.rank_index).squeeze(0)
+        states = [s0]
+        for r in range(w):
+            states.append(torch.bmm(states[-1], A_all[r]) + B_all[r])
+        s4 = states[w]
+        s_in = torch.index_select(torch.stack(tuple(states[:w]), dim=0), 0, self.rank_index).squeeze(0)
         pool[4].copy_(s_in)
 
         kda_prefill.segment_finalize(
@@ -551,12 +568,13 @@ class PreparedGlmKDA:
     def commit_state(self, s4, conv_all, metadata):
         """Write this rank's 16 decode heads of final recurrent and convolution state back to DeltaState."""
         active = (metadata.num_seqs > 0) & (metadata.num_tokens > 0)
+        w, lh, lw = self.world, self.local_heads, self.local_width
         last_rank = torch.div((metadata.num_tokens - 1).clamp_min(0), self.seg_tokens,
-                              rounding_mode="floor").clamp(0, 3).to(torch.int64)
+                              rounding_mode="floor").clamp(0, w - 1).to(torch.int64)
         conv_final = torch.index_select(conv_all, 0, last_rank).squeeze(0)
-        s_final_16 = torch.index_select(s4.view(4, 16, 128, 128), 0, self.rank_index).squeeze(0)
+        s_final_16 = torch.index_select(s4.view(w, lh, 128, 128), 0, self.rank_index).squeeze(0)
         conv_final_16 = torch.index_select(
-            conv_final.view(3, 4, 2048, 3), 1, self.rank_index).squeeze(1).reshape(6144, 3)
+            conv_final.view(3, w, lw, 3), 1, self.rank_index).squeeze(1).reshape(3 * lw, 3)
 
         zero_i64 = torch.zeros_like(metadata.final_state_indices[:1])
         final_slot = torch.where(active, metadata.final_state_indices[:1].clamp_min(0), zero_i64).to(torch.int64)

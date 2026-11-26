@@ -97,7 +97,7 @@ class Glm53Parameters(RecipeParameters):
         status_label=lambda v: "row-sharded attention" if v else None,
     )
     # Recipe capability constraints (never CLI flags or manifest entries).
-    row_shard_prefill_world_sizes: tuple[int, ...] = (4,)
+    row_shard_prefill_world_sizes: tuple[int, ...] = (2, 4)
 
     def __post_init__(self):
         if type(self.row_shard_prefill) is not bool:

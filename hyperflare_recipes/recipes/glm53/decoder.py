@@ -308,14 +308,16 @@ class PreparedGlmLayer:
                 seg_qkv = row_shard_buffers.kda_seg_qkv[:self.shard_tokens * 2]
                 seg_beta = row_shard_buffers.kda_seg_beta[:self.shard_tokens * 2]
             else:
-                sinit_sh = torch.zeros(ROW_SHARD_SINIT_SHAPE, dtype=torch.bfloat16, device=device)
-                sinit_full = torch.zeros((ROW_SHARD_SINIT_SHAPE[0] * 4, ROW_SHARD_SINIT_SHAPE[1]),
+                w = collective["runtime"].world_size
+                sinit_shape, halo_shape = row_shard_sinit_shape(w), row_shard_halo_shape(w)
+                sinit_sh = torch.zeros(sinit_shape, dtype=torch.bfloat16, device=device)
+                sinit_full = torch.zeros((sinit_shape[0] * w, sinit_shape[1]),
                                          dtype=torch.bfloat16, device=device)
-                halo_sh = torch.zeros(ROW_SHARD_HALO_SHAPE, dtype=torch.bfloat16, device=device)
-                halo_full = torch.zeros((ROW_SHARD_HALO_SHAPE[0] * 4, ROW_SHARD_HALO_SHAPE[1]),
+                halo_sh = torch.zeros(halo_shape, dtype=torch.bfloat16, device=device)
+                halo_full = torch.zeros((halo_shape[0] * w, halo_shape[1]),
                                         dtype=torch.bfloat16, device=device)
                 scan_sh = torch.zeros(ROW_SHARD_SCAN_SHAPE, dtype=torch.bfloat16, device=device)
-                scan_full = torch.zeros((ROW_SHARD_SCAN_SHAPE[0] * 4, ROW_SHARD_SCAN_SHAPE[1]),
+                scan_full = torch.zeros((ROW_SHARD_SCAN_SHAPE[0] * w, ROW_SHARD_SCAN_SHAPE[1]),
                                         dtype=torch.bfloat16, device=device)
                 seg_qkv = torch.zeros((self.shard_tokens * 2, 24768), dtype=torch.bfloat16, device=device)
                 seg_beta = torch.zeros((self.shard_tokens * 2, 64), dtype=torch.bfloat16, device=device)
@@ -515,14 +517,16 @@ class PreparedGlmLayer:
                 seg_qkv = row_shard_buffers.kda_seg_qkv[:rows]
                 seg_beta = row_shard_buffers.kda_seg_beta[:rows]
             else:
-                sinit_sh = torch.zeros(ROW_SHARD_SINIT_SHAPE, dtype=torch.bfloat16, device=device)
-                sinit_full = torch.zeros((ROW_SHARD_SINIT_SHAPE[0] * 4, ROW_SHARD_SINIT_SHAPE[1]),
+                w = collective["runtime"].world_size
+                sinit_shape, halo_shape = row_shard_sinit_shape(w), row_shard_halo_shape(w)
+                sinit_sh = torch.zeros(sinit_shape, dtype=torch.bfloat16, device=device)
+                sinit_full = torch.zeros((sinit_shape[0] * w, sinit_shape[1]),
                                          dtype=torch.bfloat16, device=device)
-                halo_sh = torch.zeros(ROW_SHARD_HALO_SHAPE, dtype=torch.bfloat16, device=device)
-                halo_full = torch.zeros((ROW_SHARD_HALO_SHAPE[0] * 4, ROW_SHARD_HALO_SHAPE[1]),
+                halo_sh = torch.zeros(halo_shape, dtype=torch.bfloat16, device=device)
+                halo_full = torch.zeros((halo_shape[0] * w, halo_shape[1]),
                                         dtype=torch.bfloat16, device=device)
                 scan_sh = torch.zeros(ROW_SHARD_SCAN_SHAPE, dtype=torch.bfloat16, device=device)
-                scan_full = torch.zeros((ROW_SHARD_SCAN_SHAPE[0] * 4, ROW_SHARD_SCAN_SHAPE[1]),
+                scan_full = torch.zeros((ROW_SHARD_SCAN_SHAPE[0] * w, ROW_SHARD_SCAN_SHAPE[1]),
                                         dtype=torch.bfloat16, device=device)
                 seg_qkv = torch.zeros((rows, 24768), dtype=torch.bfloat16, device=device)
                 seg_beta = torch.zeros((rows, 64), dtype=torch.bfloat16, device=device)

@@ -22,7 +22,7 @@ from hyperflare_recipes.components.vocabulary import PreparedVocabularyProjectio
 
 from .decoder import LayerScratch, PreparedGlmLayer
 from .kda import (
-    KDAScratch, ROW_SHARD_HALO_SHAPE, ROW_SHARD_SCAN_SHAPE, ROW_SHARD_SINIT_SHAPE,
+    KDAScratch, ROW_SHARD_SCAN_SHAPE, row_shard_halo_shape, row_shard_sinit_shape,
 )
 from .mla import MLAScratch
 from .moe import MoeScratch
@@ -74,13 +74,16 @@ class RowShardExchangeScratch:
                 max_prefill_tokens, mla_rows, blocks, device,
                 context_ranks=context.shards.world, remote=context.remote,
                 gather_context=True, shared_slab=shared_slab)
+        w = shard.world_size
+        sinit_shape = row_shard_sinit_shape(w)
+        halo_shape = row_shard_halo_shape(w)
         return cls(
-            sinit_sh=zeros(*ROW_SHARD_SINIT_SHAPE),
-            sinit_full=zeros(ROW_SHARD_SINIT_SHAPE[0] * 4, ROW_SHARD_SINIT_SHAPE[1]),
-            halo_sh=zeros(*ROW_SHARD_HALO_SHAPE),
-            halo_full=zeros(ROW_SHARD_HALO_SHAPE[0] * 4, ROW_SHARD_HALO_SHAPE[1]),
+            sinit_sh=zeros(*sinit_shape),
+            sinit_full=zeros(sinit_shape[0] * w, sinit_shape[1]),
+            halo_sh=zeros(*halo_shape),
+            halo_full=zeros(halo_shape[0] * w, halo_shape[1]),
             scan_sh=zeros(*ROW_SHARD_SCAN_SHAPE),
-            scan_full=zeros(ROW_SHARD_SCAN_SHAPE[0] * 4, ROW_SHARD_SCAN_SHAPE[1]),
+            scan_full=zeros(ROW_SHARD_SCAN_SHAPE[0] * w, ROW_SHARD_SCAN_SHAPE[1]),
             cache_sh=zeros(mla_rows, 768),
             cache_full=zeros(cache_full_rows, 768),
             kda_scratch=KDAScratch.allocate(seg_tokens, 64, device),
@@ -154,7 +157,7 @@ class DecoderScratch:
 def _prefill_shard_rows(enabled, mode, shard, runtime, scratch):
     tokens = scratch.embedding.shape[0]
     # Shard rows stay 128-aligned for the mHC and RMSNorm row tiles.
-    if (not enabled or mode != "prefill" or shard.world_size != 4 or tokens < DMA_PREFILL_TOKENS
+    if (not enabled or mode != "prefill" or shard.world_size not in (2, 4) or tokens < DMA_PREFILL_TOKENS
             or tokens % (128 * shard.world_size)
             or not (isinstance(runtime, pcie.DmaAllReduce) or _roce(runtime))
             or not row_shard_surfaces(runtime)):
@@ -170,7 +173,7 @@ def _prefill_shard_rows(enabled, mode, shard, runtime, scratch):
 
 def _prefill_pipelined(enabled, mode, shard, runtime, workspace, scratch):
     tokens = scratch.embedding.shape[0]
-    if (not enabled or mode != "prefill" or shard.world_size != 4 or tokens < PIPELINED_PREFILL_TOKENS
+    if (not enabled or mode != "prefill" or shard.world_size not in (2, 4) or tokens < PIPELINED_PREFILL_TOKENS
             or tokens % (2 * 128 * shard.world_size) or not isinstance(runtime, pcie.DmaAllReduce)
             or not row_shard_surfaces(runtime)
             or not isinstance(workspace, ScratchArena) or not workspace.overlap):
@@ -424,7 +427,7 @@ class PreparedDecoder:
                 and kda_rank_index is not None and (not self.full_feedback or sharded_feedback)):
             self.sharded_final_norm = True
             self.rank_index = kda_rank_index
-            boundary_buf = torch.zeros((5, 4096), dtype=torch.bfloat16, device=self.device)
+            boundary_buf = torch.zeros((weights.shard.world_size + 1, 4096), dtype=torch.bfloat16, device=self.device)
             self.final_boundary_reduce = PreparedAllReduce(
                 boundary_buf, torch.zeros_like(boundary_buf), runtime=boundary_runtime,
                 coordinator=coordinator, session=session, name=f"{name}.final_boundary")
@@ -585,12 +588,13 @@ class PreparedDecoder:
         local_idx = (idx - base).clamp(0, shard_rows - 1)
         selected = torch.index_select(norm_sh, 0, local_idx)
         local_sample = torch.where(in_shard.view(1, 1), selected, torch.zeros_like(selected))
-        boundary = torch.zeros((5, 4096), dtype=norm_sh.dtype, device=norm_sh.device)
+        world = self.weights.shard.world_size
+        boundary = torch.zeros((world + 1, 4096), dtype=norm_sh.dtype, device=norm_sh.device)
         boundary.index_copy_(0, self.rank_index, norm_sh[-1:])
-        boundary[4:5].copy_(local_sample)
+        boundary[world:world + 1].copy_(local_sample)
         reduced = self.final_boundary_reduce(boundary)
-        rank_tails = reduced[:4]
-        hidden = reduced[4:5]
+        rank_tails = reduced[:world]
+        hidden = reduced[world:world + 1]
         auxiliary = (norm_sh, rank_tails) if self.full_feedback else None
         logits = self.lm_head(hidden)
         return hidden, logits, auxiliary, records

@@ -105,7 +105,7 @@ def prepare(monkeypatch, tokens, runtime, *, enabled=True, mode="prefill", rank=
     (512, DmaRuntime(), {}), (1025, DmaRuntime(), {}), (1, DmaRuntime(), {}), (1028, DmaRuntime(), {}),
     (1024, DmaRuntime(), {"scoring": SimpleNamespace(prepare=lambda *a, **kw: None)}),
     (1024, DmaRuntime(scatter=False), {}), (1024, DmaRuntime(gather=False), {}),
-    (1024, DmaRuntime(), {"mode": "decode"}), (1024, DmaRuntime(), {"world": 2}),
+    (1024, DmaRuntime(), {"mode": "decode"}), (1024, DmaRuntime(), {"world": 3}),
 ])
 def test_ineligible_decoder_keeps_full_rows(monkeypatch, tokens, runtime, options):
     decoder = prepare(monkeypatch, tokens, runtime, **options)
@@ -333,7 +333,7 @@ def test_glm53_parameters_gate_row_shard_prefill_and_attention():
         Gpu(i, "NVIDIA RTX PRO 6000 Blackwell", f"GPU-{i}", 96 << 30, 90 << 30, (12, 0))
         for i in range(4)
     )
-    assert recipe.RECIPE.parameters.row_shard_prefill_world_sizes == (4,)
+    assert recipe.RECIPE.parameters.row_shard_prefill_world_sizes == (2, 4)
     assert PreparationConfig().row_shard_prefill is False
     assert PreparationConfig().row_shard_attention is False
 
@@ -343,12 +343,16 @@ def test_glm53_parameters_gate_row_shard_prefill_and_attention():
 
     ctx_tp4 = ParameterContext(recipe=recipe.RECIPE, checkpoint=recipe.RECIPE.checkpoints[1], gpus=sm120, world_size=4)
     enabled.validate(ctx_tp4)
-    assert enabled.filter_world_sizes((1, 2, 4), ctx_tp4) == (4,)
+    assert enabled.filter_world_sizes((1, 2, 4), ctx_tp4) == (2, 4)
     assert enabled.adjust_weights_bytes(1000, ctx_tp4) == 1000 + recipe.replicated_attention_bytes(4)
 
     ctx_tp2 = ParameterContext(recipe=recipe.RECIPE, checkpoint=recipe.RECIPE.checkpoints[1], gpus=sm120[:2], world_size=2)
-    with pytest.raises(UsageError, match="not supported at TP2"):
-        enabled.validate(ctx_tp2)
+    enabled.validate(ctx_tp2)
+    assert enabled.adjust_weights_bytes(1000, ctx_tp2) == 1000 + recipe.replicated_attention_bytes(2)
+
+    ctx_tp1 = ParameterContext(recipe=recipe.RECIPE, checkpoint=recipe.RECIPE.checkpoints[1], gpus=sm120[:1], world_size=1)
+    with pytest.raises(UsageError, match="requires tensor parallelism"):
+        enabled.validate(ctx_tp1)
 
     attn_only = replace(recipe.RECIPE.parameters, row_shard_prefill=False, row_shard_attention=True)
     with pytest.raises(UsageError, match="--row-shard-attention requires --row-shard-prefill"):
@@ -385,3 +389,31 @@ def test_roce_serial_row_shard_eligibility_and_reconstruction(monkeypatch):
     assert decoder.shard_rows is not None and decoder.shard_rows.numel() == 1024
     assert decoder.final_gather is not None
     assert all(not layer.pipelined and layer.gathered_input is not None for layer in decoder.layers)
+
+
+def test_tp2_roce_and_dma_row_shard_eligibility(monkeypatch):
+    class FakeRoceTP2:
+        def __init__(self):
+            self.world_size = 2
+            self.pipe_bytes = 64 << 20
+            self.rank = 0
+            self.should_reduce_scatter = lambda source: True
+            self.should_gather_shards = lambda source: True
+
+    monkeypatch.setattr(stack, "_roce", lambda rt: isinstance(rt, FakeRoceTP2))
+    monkeypatch.setattr(stack, "row_shard_surfaces", lambda rt: isinstance(rt, FakeRoceTP2))
+    monkeypatch.setattr(stack.PreparedReduceScatter, "fits",
+                        staticmethod(lambda rt, src, dst: isinstance(rt, FakeRoceTP2)))
+    monkeypatch.setattr(stack.PreparedGatherShards, "fits",
+                        staticmethod(lambda rt, src, dst: isinstance(rt, FakeRoceTP2)))
+
+    class DummyGather(stack.PreparedGatherShards):
+        def __init__(self, source, destination, *, runtime, name, **kwargs):
+            assert source.shape[0] * 2 == destination.shape[0]
+            self.name = name
+
+    monkeypatch.setattr(stack, "PreparedGatherShards", DummyGather)
+    decoder = prepare(monkeypatch, 4096, FakeRoceTP2(), world=2, workspace=FakeArena(overlap=True))
+    assert not decoder.pipelined
+    assert decoder.shard_rows is not None and decoder.shard_rows.numel() == 2048
+    assert decoder.final_gather is not None
