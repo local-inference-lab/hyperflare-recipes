@@ -71,10 +71,11 @@ class ModelWeights:
     head: object
     mtp: MTPWeights | None = None
     vision: object | None = None
+    replicated_attention: dict[int, dict[str, object]] | None = None
 
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, mtp=False, expert_activation="a4",
-             expand_expert_scales=False, language_model_only=False):
+             expand_expert_scales=False, language_model_only=False, row_shard_attention=False):
         import torch
 
         from .model import create_model_tree
@@ -108,6 +109,13 @@ class ModelWeights:
             for index in range(len(tree.model.language_model.layers)):
                 layers.append(LayerWeights(loader.load_attention(index), loader.load_mlp(index, scale_scratch=scales),
                                            loader.load_residual(index)))
+            replicated_attention = None
+            if row_shard_attention and shard.world_size > 1:
+                replicated_attention = {
+                    index: (loader.load_replicated_mla(index) if index % 4 == 3
+                            else loader.load_replicated_kda(index))
+                    for index in range(len(tree.model.language_model.layers))
+                }
             draft = loader.load_mtp(scales) if mtp else None
             if draft is not None and isinstance(head, torch.Tensor):
                 from hyperflare_recipes.components.vocabulary import nvfp4_draft_head
@@ -122,7 +130,7 @@ class ModelWeights:
                                     progress_label="Load vision weights") as loader:
                 vision = VisionWeights.load(tree.model.visual, loader)
         torch.cuda.synchronize(device)
-        return cls(tree, shard, tuple(layers), scales, allocated_tensor_bytes(device) - before, head, draft, vision)
+        return cls(tree, shard, tuple(layers), scales, allocated_tensor_bytes(device) - before, head, draft, vision, replicated_attention)
 
 
 class GlmWeightLoader(DirectWeightLoader):
@@ -194,22 +202,44 @@ class GlmWeightLoader(DirectWeightLoader):
             result[name] = self.load_tensor(f"{prefix}.{name}")
         return result
 
-    def _load_kda(self, prefix):
-        channels = self.shard.partition(8192, alignment=128)
-        heads = self.shard.partition(64)
+    def load_replicated_mla(self, layer):
+        """Load full 64-head MLA projections for row-owned prefill without altering decode shards."""
+        if layer >= 45 or layer % 4 != 3:
+            raise ValueError(f"GLM replicated MLA weights require a target indexed layer, got {layer}")
+        prefix = self._layer(layer) + ".self_attn"
+        if self.linear_format(f"{prefix}.kv_b_proj") not in ("mxfp8", "bfloat16"):
+            raise ValueError(f"{prefix}.kv_b_proj: MLA absorption requires BF16 or MXFP8 weights")
+        return {
+            "q_b_proj": self._projection(f"{prefix}.q_b_proj"),
+            "kv_b_proj": self.load_linear_group((f"{prefix}.kv_b_proj",)),
+            "o_proj": self._projection(f"{prefix}.o_proj"),
+        }
+
+    def load_replicated_kda(self, layer):
+        """Load full 64-head KDA projections and state parameters without duplicating replicated tensors."""
+        if layer >= 45 or layer % 4 == 3:
+            raise ValueError(f"GLM replicated KDA weights require a target linear layer, got {layer}")
+        return self._load_kda(self._layer(layer) + ".self_attn", full=True)
+
+    def _load_kda(self, prefix, *, full=False):
+        channels = None if full else self.shard.partition(8192, alignment=128)
+        heads = None if full else self.shard.partition(64)
         result = {name: self._projection(f"{prefix}.{name}", rows=channels)
                   for name in ("f_b_proj", "g_b_proj")}
         result["input_proj"] = self.load_mixed_linear_group(
             tuple(f"{prefix}.{name}" for name in ("q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj")),
             row_ranges=(channels,) * 3 + (heads, None))
-        result["g_a_proj"] = self._projection(f"{prefix}.g_a_proj")
+        if not full:
+            result["g_a_proj"] = self._projection(f"{prefix}.g_a_proj")
         result["o_proj"] = self._projection(f"{prefix}.o_proj", columns=channels)
-        result["A_log"] = self.load_tensor(f"{prefix}.A_log", extent=slice(*heads))
-        result["dt_bias"] = self.load_tensor(f"{prefix}.dt_bias", extent=slice(*channels))
-        result["o_norm.weight"] = self.load_tensor(f"{prefix}.o_norm.weight")
+        result["A_log"] = self.load_tensor(f"{prefix}.A_log", extent=None if heads is None else slice(*heads))
+        result["dt_bias"] = self.load_tensor(f"{prefix}.dt_bias", extent=None if channels is None else slice(*channels))
+        if not full:
+            result["o_norm.weight"] = self.load_tensor(f"{prefix}.o_norm.weight")
         result["conv1d.weight"] = persistent_cat([
             self.load_tensor(f"{prefix}.{name}_conv1d.weight",
-                             extent=slice(*channels), temporary=True) for name in ("q", "k", "v")
+                             extent=None if channels is None else slice(*channels), temporary=True)
+            for name in ("q", "k", "v")
         ]).squeeze(1)
         return result
 

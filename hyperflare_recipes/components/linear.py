@@ -197,8 +197,16 @@ class UnquantizedProjection:
             self.output = None
         return self
 
-    def __call__(self, source: torch.Tensor) -> torch.Tensor:
-        output = self.output
+    def __call__(self, source: torch.Tensor, output: torch.Tensor | None = None) -> torch.Tensor:
+        if output is not None:
+            template = self.output
+            shape, stride, dtype = (self.output_layout if template is None else
+                (tuple(template.shape), template.stride(), template.dtype))
+            if (tuple(output.shape) != shape or output.stride() != stride
+                    or output.dtype != dtype or output.device != source.device):
+                raise ValueError("projection output must preserve the prepared shape, strides, dtype, and device")
+        else:
+            output = self.output
         if output is None:
             shape, stride, dtype = self.output_layout
             output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)

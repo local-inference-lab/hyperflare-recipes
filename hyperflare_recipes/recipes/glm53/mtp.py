@@ -13,9 +13,9 @@ import triton.language as tl
 from b12x.attention.dsa_indexer import glm_pool
 from flashinfer.triton.norm import rms_norm, rms_norm_add_residual
 
-from ignition.components.collectives import PreparedAllReduce
+from ignition.components.collectives import PreparedAllReduce, PreparedGatherShards
 from hyperflare_recipes.components.embedding import PreparedEmbedding
-from hyperflare_recipes.components.linear import UnquantizedProjection
+from hyperflare_recipes.components.linear import UnquantizedProjection, prepare_projection
 from hyperflare_recipes.components.vocabulary import PreparedVocabularyProjection
 
 from .indexer import IndexMetadata
@@ -212,7 +212,7 @@ class PreparedMTP:
 
     def __init__(self, weights, state, metadata, *, mode, session, name, workspace,
                  runtime, vocabulary_runtime, coordinator, cache_only=False, max_cache_pages=None, scratch=None,
-                 context=None):
+                 context=None, row_shard_runtime=None):
         from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextAttention, Glm5NextTextMoE
 
         config = deepcopy(weights.tree.config.text_config)
@@ -234,10 +234,33 @@ class PreparedMTP:
         self.residual, self.normalized = scratch.residual, scratch.normalized
         self.attention_output, self.mlp_output = scratch.attention_output, scratch.mlp_output
         self.hidden = scratch.hidden
+        world = weights.shard.world_size
+        self.row_shard = False
+        self.shard_rows = rows
+        self.shard_qkv_a_proj = self.shard_gate_proj = self.cache_gather = None
+        if cache_only and row_shard_runtime is not None and world > 1 and rows % world == 0:
+            s_rows = rows // world
+            cache_sh = buffer(s_rows, 768)
+            cache_full = buffer(rows, 768)
+            if PreparedGatherShards.fits(row_shard_runtime, cache_sh, cache_full):
+                self.row_shard = True
+                self.shard_rows = s_rows
+                self.cache_gather = PreparedGatherShards(cache_sh, cache_full,
+                    runtime=row_shard_runtime, coordinator=coordinator, session=session,
+                    name=f"{name}.cache_gather")
+        s_rows = self.shard_rows
         self.embedding = PreparedEmbedding(weights.tree.model.language_model.embed_tokens.weight,
-            metadata.token_ids, self.embedded, num_rows=metadata.num_tokens, session=session, name=f"{name}.embedding")
-        self.projection = UnquantizedProjection(self.joined, weights.mtp.tensors["eh_proj"], self.residual,
-            session=session, name=f"{name}.eh_proj")
+            metadata.token_ids[:s_rows], self.embedded[:s_rows], num_rows=metadata.num_tokens,
+            session=session, name=f"{name}.embedding")
+        self.projection = UnquantizedProjection(self.joined[:s_rows], weights.mtp.tensors["eh_proj"],
+            self.residual[:s_rows], session=session, name=f"{name}.eh_proj")
+        if self.row_shard:
+            self.shard_qkv_a_proj = prepare_projection(self.normalized[:s_rows],
+                weights.mtp.attention["qkv_a_proj"], scratch.attention.projected_input[:s_rows],
+                session=session, name=f"{name}.shard_qkv_a_proj", workspace=workspace, activation_mode="auto")
+            self.shard_gate_proj = UnquantizedProjection(self.normalized[:s_rows],
+                weights.mtp.attention["indexer.index_kpool_compress_gate"],
+                scratch.attention.index.gate[:s_rows], session=session, name=f"{name}.shard_gate")
         self.attention = PreparedGlmMLA(attention, weights.mtp.attention, self.normalized, scratch.attention,
             state, metadata.indexed, mode=mode, session=session, name=f"{name}.mla", workspace=workspace,
             max_cache_pages=max_cache_pages, context=context)
@@ -261,6 +284,12 @@ class PreparedMTP:
     def functional(self, *, session):
         self.embedding.functional(session=session, dynamic_inputs=True)
         self.projection.functional(session=session)
+        if self.shard_qkv_a_proj is not None:
+            self.shard_qkv_a_proj.functional(session=session)
+        if self.shard_gate_proj is not None:
+            self.shard_gate_proj.functional(session=session)
+        if self.cache_gather is not None:
+            self.cache_gather.functional(session=session)
         self.attention.functional(session=session)
         if not self.cache_only:
             self.attention_reduce.functional(session=session)
@@ -302,3 +331,31 @@ class PreparedMTP:
         hidden = torch.empty_like(normalized)
         rms_norm_add_residual(mlp, residual, w["shared_head.norm"], self.eps, x_out=hidden)
         return hidden, self.head(hidden)
+
+    def absorb_sharded(self, indexed, token_ids_sh, positions_sh, hidden_sh, num_tokens_sh):
+        """Run row-sharded MTP cache absorption across TP ranks and gather only the 768-col cache payload."""
+        w = self.weights.tensors
+        a = self.attention
+        index = a.indexer
+        rows = token_ids_sh.shape[0]
+        device = token_ids_sh.device
+        embedded = self.embedding(token_ids=token_ids_sh, num_rows=num_tokens_sh)
+        embedded = embedded.masked_fill((positions_sh == 0)[:, None], 0)
+        joined = torch.empty((rows, 8192), dtype=embedded.dtype, device=device)
+        rms_norm(embedded, w["enorm"], joined[:, :4096], self.eps, round_before_weight=True)
+        rms_norm(hidden_sh, w["hnorm"], joined[:, 4096:], self.eps, round_before_weight=True)
+        residual = self.projection(joined)
+        normalized = torch.empty_like(residual)
+        rms_norm(residual, w["input_layernorm"], normalized, self.eps, round_before_weight=True)
+        projected = self.shard_qkv_a_proj(normalized)
+        cache_sh = torch.empty((rows, 768), dtype=embedded.dtype, device=device)
+        rms_norm(projected[:, 1536:2048], a.module.kv_a_layernorm.weight, cache_sh[:, :512],
+            self.eps, round_before_weight=True)
+        cache_sh[:, 512:640].copy_(index.module.k_norm(projected[:, 2048:2176]))
+        cache_sh[:, 640:768].copy_(self.shard_gate_proj(normalized))
+        cache_all = self.cache_gather(cache_sh)
+        a.writer(cache_all[:, :512].contiguous(), indexed.token_slots)
+        glm_pool.update_pools(index.cache, index.state.tail, indexed.state_slots,
+            indexed.query_start_loc, cache_all[:, 512:640].contiguous(),
+            cache_all[:, 640:768].contiguous(), index.ape, indexed.token_slots,
+            indexed.positions, plan=index.pool_plan)

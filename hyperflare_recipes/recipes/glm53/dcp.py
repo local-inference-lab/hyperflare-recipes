@@ -248,13 +248,61 @@ def _scatter_records(Records, End, Slab, first, row_words, WORLD: tl.constexpr, 
     owner = tl.program_id(1).to(tl.int64)
     start = tl.program_id(0) * TOKENS
     end = tl.load(End).to(tl.int64)
-    word = tl.arange(0, WORD_BLOCK)
-    for offset in tl.range(0, TOKENS):
-        local = first + start + offset
-        token = (local // 4) * 4 * WORLD + owner * 4 + local % 4
-        if token < end:
-            values = tl.load(Records + owner * row_words + (start + offset) * WORDS + word, mask=word < WORDS)
-            tl.store(Slab + token * WORDS + word, values, mask=word < WORDS)
+    if (first + start) * WORLD < end:
+        word = tl.arange(0, WORD_BLOCK)
+        for offset in tl.range(0, TOKENS):
+            local = first + start + offset
+            token = (local // 4) * 4 * WORLD + owner * 4 + local % 4
+            if token < end:
+                values = tl.load(Records + owner * row_words + (start + offset) * WORDS + word, mask=word < WORDS)
+                tl.store(Slab + token * WORDS + word, values, mask=word < WORDS)
+
+
+@triton.jit
+def _pack_index_pools(Cache, Table, End, Records, Rank, columns, row_words,
+                      WORLD: tl.constexpr, POOLS: tl.constexpr):
+    # Pack this rank's visible C4 pools (128B FP8 key + 4B FP32 scale = 33 int32 words) into its row.
+    # Each 64-pool index page holds 2048 key int32 words followed by 64 scale int32 words (2112 total).
+    rank = tl.load(Rank).to(tl.int64)
+    total_pools = tl.load(End).to(tl.int64) // 4
+    count = total_pools // WORLD + tl.minimum(tl.maximum(total_pools % WORLD - rank, 0), 1)
+    start = tl.program_id(0) * POOLS
+    if start < count:
+        w = tl.arange(0, 32)
+        for offset in tl.range(0, POOLS):
+            lp = start + offset
+            if lp < count:
+                page = tl.load(Table + tl.minimum(lp // 64, columns - 1)).to(tl.int64)
+                off = lp % 64
+                page_base = page * 2112
+                key_words = tl.load(Cache + page_base + off * 32 + w)
+                scale_word = tl.load(Cache + page_base + 2048 + off)
+                dst = Records + rank * row_words + lp * 33
+                tl.store(dst + w, key_words)
+                tl.store(dst + 32, scale_word)
+
+
+@triton.jit
+def _scatter_index_pools(Records, End, GlobalCache, row_words,
+                         WORLD: tl.constexpr, POOLS: tl.constexpr):
+    # Scatter every rank's gathered C4 pools into contiguous global 64-pool index pages.
+    owner = tl.program_id(1).to(tl.int64)
+    start = tl.program_id(0) * POOLS
+    total_pools = tl.load(End).to(tl.int64) // 4
+    if start * WORLD + owner < total_pools:
+        w = tl.arange(0, 32)
+        for offset in tl.range(0, POOLS):
+            lp = start + offset
+            pool = lp * WORLD + owner
+            if pool < total_pools:
+                src = Records + owner * row_words + lp * 33
+                key_words = tl.load(src + w)
+                scale_word = tl.load(src + 32)
+                gpage = pool // 64
+                goff = pool % 64
+                gbase = gpage * 2112
+                tl.store(GlobalCache + gbase + goff * 32 + w, key_words)
+                tl.store(GlobalCache + gbase + 2048 + goff, scale_word)
 
 
 def _launch(kernel, grid, args, **meta):
@@ -337,6 +385,72 @@ def scatter_records(records, end, slab, shards, first):
     window = words.shape[1] // 132
     _launch(_scatter_records, (triton.cdiv(window, _PULL_TOKENS), shards.world), (words, end, slab, first,
             words.stride(0)), WORLD=shards.world, TOKENS=_PULL_TOKENS, WORDS=132, WORD_BLOCK=256, num_warps=4)
+
+
+_POOL_TOKENS = 16
+
+
+def pool_gather_counts(end, world, max_local_pools):
+    """16-byte-aligned byte counts of C4 pools each rank owns below `end`, [world] int64."""
+    total_pools = end // 4
+    ranks = torch.arange(world, device=end.device)
+    owned = total_pools // world + (total_pools % world - ranks).clamp(0, 1)
+    # Four 132-byte pools = 528 bytes = 33 * 16 bytes, satisfying variable-length gather alignment.
+    aligned = ((owned + 3) // 4 * 4).clamp(0, max_local_pools)
+    return aligned * 132
+
+
+def pack_index_pools(cache, table, end, records, shards):
+    """Copy this rank's visible C4 pools from paged index cache into its row of `records` [world, pools * 132]."""
+    words = records.view(torch.uint8).view(torch.int32)
+    max_local_pools = words.shape[1] // 33
+    _launch(_pack_index_pools, (triton.cdiv(max_local_pools, _POOL_TOKENS),),
+            (cache.view(torch.int32), table, end, words, shards.index, table.shape[0], words.stride(0)),
+            WORLD=shards.world, POOLS=_POOL_TOKENS, num_warps=4)
+
+
+def scatter_index_pools(records, end, global_cache, shards):
+    """Scatter gathered C4 pools into contiguous global 64-pool index pages [global_pages, 64, 132]."""
+    words = records.view(torch.uint8).view(torch.int32)
+    max_local_pools = words.shape[1] // 33
+    _launch(_scatter_index_pools, (triton.cdiv(max_local_pools, _POOL_TOKENS), shards.world),
+            (words, end, global_cache.view(torch.int32), words.stride(0)),
+            WORLD=shards.world, POOLS=_POOL_TOKENS, num_warps=4)
+
+
+class PreparedPoolGather:
+    """Gather every rank's visible C4 pooled keys into contiguous global index pages.
+
+    Each C4 pool is 132 bytes (128 FP8 key bytes + 4 FP32 scale bytes), so gathering all
+    visible pools moves 1-4 MiB at 32K-128K context instead of exchanging 64 MiB of top-k
+    candidates per indexed layer.
+    """
+
+    def __init__(self, state, pool_records, pool_counts, global_cache, context, *, session, name):
+        if context.records is None:
+            raise ValueError("C4 pool gather requires a variable-length gather runtime")
+        self.state, self.context = state, context
+        self.max_local_pools = pool_records.shape[1] // 132
+        self.records_shape = tuple(pool_records.shape)
+        self.global_cache_shape = tuple(global_cache.shape)
+        self.gather = PreparedVarlenGather(pool_records, pool_counts,
+            runtime=context.records, session=session, coordinator=context.coordinator,
+            name=f"{name}.gather_pools")
+
+    def functional(self, *, session):
+        self.gather.functional(session=session)
+        return self
+
+    def __call__(self, table, end):
+        shards = self.context.shards
+        device = table.device
+        records = torch.empty(self.records_shape, dtype=torch.uint8, device=device)
+        counts = pool_gather_counts(end, shards.world, self.max_local_pools)
+        pack_index_pools(self.state.cache, table, end, records, shards)
+        self.gather(output=records, counts=counts)
+        global_cache = torch.empty(self.global_cache_shape, dtype=torch.uint8, device=device)
+        scatter_index_pools(records, end, global_cache, shards)
+        return global_cache
 
 
 class PreparedContextGather:
