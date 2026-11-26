@@ -473,10 +473,15 @@ class PreparedShardedQSA:
         self.device = attention.scratch.query.device
         self.plan = attention.plan
         self.selection_only = attention.sparse is not None
+        from ignition.components.collectives import _roce
+
+        # RoCE collectives must all be captured on one stream, so group-split QSA
+        # runs serially on the main stream when gathering over RoCE.
         self.overlap = (
             mode == "group"
             and isinstance(workspace, ScratchArena)
             and workspace.overlap
+            and not (gather_runtime is not None and _roce(gather_runtime))
         )
         self.stream = workspace.auxiliary_stream if self.overlap else None
         self.stream_handle = self.stream.cuda_stream if self.stream is not None else 0

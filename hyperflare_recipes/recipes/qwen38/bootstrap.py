@@ -104,6 +104,7 @@ class PreparationConfig(BasePreparationConfig):
     # on an auxiliary stream; without overlap every branch runs serially on the main stream.
     stream_overlap: bool = True
     shard_hyperconnections: bool = False
+    row_shard_prefill: bool = False
 
     def __post_init__(self):
         if self.mtp_only and (not self.mtp
@@ -145,6 +146,12 @@ class PreparationConfig(BasePreparationConfig):
                 raise ValueError("force_moe_decode_a16 requires rank-local expert intermediate width divisible by 64")
         if self.shard_hyperconnections and len(self.devices or (self.device,)) < 2:
             raise ValueError("--shard-hyperconnections requires tensor parallelism")
+        if type(self.row_shard_prefill) is not bool:
+            raise TypeError("row_shard_prefill must be a boolean")
+        if self.row_shard_prefill and len(self.devices or (self.device,)) < 2:
+            raise ValueError("--row-shard-prefill requires tensor parallelism")
+        if self.row_shard_prefill and self.shard_hyperconnections:
+            raise ValueError("--row-shard-prefill cannot be combined with --shard-hyperconnections")
         request_capacity(self.max_active)
         for name in ("device", "context", "prefill_chunk_size", "snapshot_budget_bytes", "headroom_bytes"):
             if type(getattr(self, name)) is not int:
@@ -238,7 +245,8 @@ def _identity(manifest, world_size=1, *, config=None, draft_config=None):
     if config is not None:
         value["arithmetic"] = dict(native_dense_activations=config.native_dense_activations,
             force_moe_decode_a16=config.force_moe_decode_a16,
-            shard_hyperconnections=config.shard_hyperconnections)
+            shard_hyperconnections=config.shard_hyperconnections,
+            **({"row_shard_prefill": True} if config.row_shard_prefill else {}))
         value["draft"] = None
         if config.mtp:
             value["draft"] = dict(method=config.speculative_method,
@@ -378,13 +386,29 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
         # Ranks on separate Sparks reduce and gather through one RoCEnante runtime: decode rows
         # one-shot, prefill chunks through the pipelined two-shot path.
         result_bytes = max((packed_broadcast_layout(layout.values())[1] for layout in result_layouts), default=0)
+        qsa_decode_enabled = False
+        qsa_prefill_enabled = False
+        qsa_decode_gather_bytes = 0
+        qsa_prefill_gather_bytes = 0
+        if shard.world_size in (2, 4):
+            qsa_decode_max_rows = min(128, max(config.request_capacity, sample_rows))
+            if config.context % (64 * shard.world_size) == 0 and qsa_decode_max_rows > 0:
+                qsa_decode_enabled = True
+                qsa_decode_gather_bytes = qsa_decode_max_rows * 2048 * 2
+            if config.prefill_chunk_size >= 512 and config.prefill_chunk_size % (32 * shard.world_size) == 0:
+                qsa_prefill_enabled = True
+                qsa_prefill_gather_bytes = (config.prefill_chunk_size // shard.world_size) * 1024 * 2
         collective = prefill_collective = vocabulary_collective = result_collective = create_roce_runtime(group, device,
             max_tokens=max(config.request_capacity, vocabulary_rows, hidden_rows), pipe_tokens=config.token_capacity, hidden_size=reduction_width,
             gather_bytes=max(vocabulary_rows * (248320 // shard.world_size) * 2,
                              hidden_rows * (2560 // shard.world_size) * 2,
+                             qsa_decode_gather_bytes,
+                             qsa_prefill_gather_bytes,
                              (result_bytes + 15) // 16 * 16), core_storage=core_storage, ring=config.roce_ring, ring_open=config.roce_chain)
         hidden_gather_collective = collective if has_dflash else None
         shortlist_gather_collective = collective if has_dflash else None
+        qsa_decode_gather_collective = collective if qsa_decode_enabled else None
+        qsa_prefill_gather_collective = collective if qsa_prefill_enabled else None
     elif group is not None:
         collective = create_all_reduce_runtime(group, device, max_tokens=max(config.token_capacity, draft_rows), hidden_size=reduction_width, ipc=ipc)
         if config.prefill_chunk_size >= _DMA_PREFILL_TOKENS:
@@ -421,7 +445,8 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                    "shard_hyperconnections": config.shard_hyperconnections,
                    "force_moe_decode_a16": config.force_moe_decode_a16,
                    "speculative_method": config.speculative_method,
-                   "online_mxfp8": config.online_mxfp8, "draft_head_quantization": config.draft_head_quantization},
+                   "online_mxfp8": config.online_mxfp8, "draft_head_quantization": config.draft_head_quantization,
+                   **({"row_shard_prefill": True} if config.row_shard_prefill else {})},
         headroom_bytes=config.headroom_bytes, benchmark_storage=core_storage)
     session.__enter__()
     graphs = {}
@@ -577,7 +602,8 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                                 embedding_injection=injection, max_cache_pages=planned_pages,
                                 sampling_workspace=sampling_workspace, result_runtime=result_collective,
                                 scoring=scoring if graph_kind == "scored_prefill" else None,
-                                sample=sample, **decoder_collectives)
+                                sample=sample, row_shard_prefill=config.row_shard_prefill and mode == "prefill",
+                                **decoder_collectives)
                             # Retain speculative prefill absorption on non-terminal chunks so
                             # classic MTP Layer-48 KV and DFlash2 draft KV rings remain complete
                             # at any dynamically selected prefix checkpoint cut.
@@ -744,6 +770,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
             "mixed_prefill": config.mixed_prefill,
             "compiled_decoder": compile_decoder, "rank": rank, "world_size": shard.world_size,
             "shard_hyperconnections": config.shard_hyperconnections,
+            "row_shard_prefill": config.row_shard_prefill,
                    "force_moe_decode_a16": config.force_moe_decode_a16}
         if scoring is not None:
             memory.update(scoring.memory_report())
