@@ -3,11 +3,13 @@
 
 """Inkling 2 checkpoint declarations and preparation entry points."""
 
+from pathlib import Path
 from types import MappingProxyType
 from dataclasses import replace
 
-from ignition.declaration import Checkpoint, RankCosts, RankUsage, Recipe, SamplingDefaults, Speculation
+from ignition.declaration import Checkpoint, RankCosts, RankUsage, Recipe, SamplingDefaults, Speculation, SpeculativeMethod
 
+from .dflash import WEIGHT_BYTES as DFLASH_WEIGHT_BYTES
 from .frontend import SAMPLING_DEFAULTS
 
 
@@ -23,14 +25,32 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
     if plan.prompt_logprobs:
         raise ValueError("Inkling 2 preparation does not capture prompt scoring graphs")
     speculation = plan.speculation
-    drafting = {} if speculation is None else dict(speculative_widths=speculation.widths,
-        speculative_fixed_width=speculation.fixed_width, speculative_token_capacity=plan.speculative_token_capacity,
+    method = "dspark" if speculation is None or not speculation.method else speculation.method
+    if plan.online_mxfp8 and (speculation is None or method != "dflash2"):
+        from ignition.errors import UsageError
+
+        raise UsageError("Inkling 2 online MXFP8 requires --speculative-method dflash2")
+    drafting = {} if speculation is None else dict(
+        speculative_method=method,
+        speculative_widths=speculation.widths,
+        speculative_fixed_width=speculation.fixed_width,
+        speculative_token_capacity=plan.speculative_token_capacity,
         speculative_graph_budget=speculation.graph_budget or 64,
         draft_head_quantization=speculation.draft_head_quantization,
-        markov_head_quantization=speculation.markov_head_quantization)
+        markov_head_quantization=speculation.markov_head_quantization,
+    )
+    if speculation is not None and method == "dflash2":
+        from huggingface_hub import snapshot_download
+        from .dflash import REPOSITORY, REVISION
+
+        drafting["draft_snapshot"] = Path(snapshot_download(
+            REPOSITORY, revision=REVISION, cache_dir=plan.hub_cache,
+            allow_patterns=("config.json", "model.safetensors"),
+        ))
     config = PreparationConfig(
         prompt_logprobs=plan.prompt_logprobs, compile_workers=plan.compile_workers,
         native_dense_activations=plan.native_dense_activations,
+        online_mxfp8=plan.online_mxfp8,
         lock_gpu_clocks=plan.lock_gpu_clocks and plan.autotune_effort != "off",
         autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
         devices=tuple(range(plan.world_size)) if ranks is None else (0,) * plan.world_size,
@@ -73,9 +93,16 @@ MINI_SAMPLING_DEFAULTS = SamplingDefaults(temperature=1., top_p=1., top_k=-1)
 MINI_RECIPE = replace(RECIPE, name="inkling2_mini", served_model_name="inkling-2-mini",
     sampling_defaults=MINI_SAMPLING_DEFAULTS, max_concurrency=8, prefill_chunk=8192,
     speculation=Speculation(draft_tokens=7, token_capacity=64, packed_verification=True, graph_budget=64),
+    online_mxfp8=True,
     draft_head_quantizations=("nvfp4", "mxfp8"), markov_head_quantizations=("nvfp4",),
     checkpoints=(Checkpoint(alias="inkling-2-mini", repository="thinkingmachines/Inkling-2-Mini",
         revision="ed40e7da625f594fc9c4990f5f66be24873c22d7", architecture="Inkling2LoopForConditionalGeneration",
         stored_bytes=19_525_870_752, device_bytes=20_263_810_112, draft_bytes=737_939_360),),
     ranks=MappingProxyType({1: RankCosts(107_347_968, 2_621_440, 3 << 30)}),
-    plain_ranks=MappingProxyType({1: RankCosts(98_435_072, 2_097_152, 3 << 30)}))
+    plain_ranks=MappingProxyType({1: RankCosts(98_435_072, 2_097_152, 3 << 30)}),
+    speculative_methods=MappingProxyType({
+        "dflash2": SpeculativeMethod(
+            MappingProxyType({1: RankCosts(119_406_592, 2_097_152, 4 << 30)}),
+            draft_bytes=DFLASH_WEIGHT_BYTES,
+        ),
+    }))

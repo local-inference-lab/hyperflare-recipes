@@ -558,3 +558,34 @@ def test_parallel_draft_prepare_binds_2d_shortlist_scores_example(monkeypatch):
         assert id_stride == (block * top_k, 1)
     kernel = draft_sampling._draft_shortlist_score_candidates
     assert {"candidate_stride", "score_stride", "id_stride"}.issubset(set(kernel.do_not_specialize))
+
+
+def test_selector_after_correction_softcap_and_valid_vocab_mask():
+    """Post-correction softcap applies after selector addition while preserving -inf for masked/OOB IDs."""
+    from hyperflare_recipes.components.candidate_selector import PreparedCandidateSelector
+
+    batch, block, top_k, vocab, valid_vocab, rank_dim = 2, 2, 4, 32, 28, 8
+    gen = torch.Generator().manual_seed(77)
+    selector = object.__new__(PreparedCandidateSelector)
+    selector.top_k = top_k
+    selector.post_softcap = 30.0
+    selector.valid_vocabulary = valid_vocab
+    selector.weights = {
+        "predecessor": torch.randn((vocab, rank_dim), generator=gen, dtype=torch.bfloat16),
+        "successor": torch.randn((vocab, rank_dim), generator=gen, dtype=torch.bfloat16),
+    }
+    features = torch.randn((batch, block, rank_dim), generator=gen, dtype=torch.bfloat16)
+    predecessor = torch.tensor([1, 2], dtype=torch.int64)
+    unary = torch.tensor([[[10.0, -5.0, -torch.inf, 2.0]] * block, [[40.0, 1.0, 0.0, 5.0]] * block], dtype=torch.float32)
+    ids = torch.tensor([[[3, 4, 5, 29]] * block, [[6, 7, -1, 27]] * block], dtype=torch.int64)
+    got = selector.score_shortlist(predecessor, 1, features, unary, ids)
+    # Index 2 of row 0 has unary=-inf (must stay -inf, NOT -30.0); index 3 of row 0 has id=29 >= valid_vocab (must be -inf).
+    assert got[0, 2] == -torch.inf
+    assert got[0, 3] == -torch.inf
+    assert got[1, 2] == -torch.inf
+    coded = selector.weights["predecessor"][predecessor] * features[:, 1]
+    for b_idx, k_idx in ((0, 0), (0, 1), (1, 0), (1, 1), (1, 3)):
+        tok = int(ids[b_idx, 1, k_idx])
+        raw = unary[b_idx, 1, k_idx] + torch.dot(selector.weights["successor"][tok], coded[b_idx]).float()
+        expected = 30.0 * torch.tanh(raw / 30.0)
+        assert torch.allclose(got[b_idx, k_idx], expected, atol=1e-6)

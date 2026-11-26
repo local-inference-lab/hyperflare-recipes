@@ -3,7 +3,7 @@
 
 """Direct loading of Inkling 2 vocabulary, whole-head attention and expert intermediate shards."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cached_property
 
 import torch
@@ -46,11 +46,12 @@ class ModelWeights:
     embedding_norm: torch.Tensor
     final_norm: torch.Tensor
     output_query: torch.Tensor
-    unembedding: torch.Tensor
+    unembedding: object
     allocated_bytes: int
     draft: object | None = None
     vision: object | None = None
     cross_pass_queries_t: torch.Tensor | None = None
+    draft_head: object | None = None
 
     @property
     def rank(self):
@@ -70,7 +71,8 @@ class ModelWeights:
 
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, drafting=True, vision=True, layers=None,
-             draft_head_quantization=None, markov_head_quantization=None):
+             draft_head_quantization=None, markov_head_quantization=None,
+             speculative_method="dspark", draft_snapshot=None, online_mxfp8=False):
         before = torch.cuda.memory_allocated(device)
         loader_type = InklingWeightLoader
         if "model.llm.embed.weight" in manifest.tensors:
@@ -106,11 +108,24 @@ class ModelWeights:
                         raw["vision_config"], **(dict(text_hidden_size=c.text.hidden) if c.text.loop is not None else {})))
                 tower = VisionWeights.load(module, loader)
         draft = None
+        draft_head = None
         if drafting:
-            from .dspark_weights import DraftWeights
-            draft = DraftWeights.load(manifest.snapshot, c, device, shard, target_head=head, progress=progress,
-                                      draft_head_quantization=draft_head_quantization,
-                                      markov_head_quantization=markov_head_quantization)
+            if speculative_method == "dflash2":
+                from hyperflare_recipes.components.dflash2_weights import DraftWeights as DFlashWeights
+                from hyperflare_recipes.components.vocabulary import mxfp8_draft_head, nvfp4_draft_head
+                from .dflash import load_config as load_dflash_config
+
+                dflash_config = load_dflash_config(draft_snapshot, c.text)
+                c = replace(c, draft=dflash_config)
+                draft = DFlashWeights.load(draft_snapshot, dflash_config, device, shard,
+                                           progress=progress, online_mxfp8=online_mxfp8)
+                if draft_head_quantization is not None:
+                    draft_head = {"nvfp4": nvfp4_draft_head, "mxfp8": mxfp8_draft_head}[draft_head_quantization](head)
+            else:
+                from .dspark_weights import DraftWeights
+                draft = DraftWeights.load(manifest.snapshot, c, device, shard, target_head=head, progress=progress,
+                                          draft_head_quantization=draft_head_quantization,
+                                          markov_head_quantization=markov_head_quantization)
         cross_pass_queries_t = None
         if c.text.loop is not None and count >= c.text.loop.core_end:
             core = range(c.text.loop.core_start, c.text.loop.core_end)
@@ -118,7 +133,8 @@ class ModelWeights:
                 torch.cat([loaded[i].message_queries for i in core], dim=0).t().contiguous()
             )
         return cls(c, shard, loaded, embedding, embed_norm, norm, query, head,
-                   torch.cuda.memory_allocated(device) - before, draft, tower, cross_pass_queries_t)
+                   torch.cuda.memory_allocated(device) - before, draft, tower, cross_pass_queries_t,
+                   draft_head)
 
 
 class InklingWeightLoader(DirectWeightLoader):

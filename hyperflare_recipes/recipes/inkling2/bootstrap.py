@@ -4,6 +4,7 @@
 """Prepare Inkling 2 text, vision and complete DSpark generation graphs."""
 
 import contextlib
+from functools import partial
 import hashlib
 import json
 from dataclasses import dataclass, replace
@@ -60,6 +61,9 @@ class PreparationConfig(BasePreparationConfig):
     decoder_layers: int | None = None
     drafting: bool = True
     vision: bool = True
+    speculative_method: str = "dspark"
+    draft_snapshot: Path | None = None
+    online_mxfp8: bool = False
     speculative_widths: tuple[int, ...] = tuple(range(1, 9))
     speculative_token_capacity: int | None = 128
     speculative_graph_budget: int = 64
@@ -88,6 +92,12 @@ class PreparationConfig(BasePreparationConfig):
             raise ValueError("decoder layer count must be in [6, 48]")
         if self.drafting and self.decoder_layers not in (None, 48):
             raise ValueError("the bundled DSpark drafter requires all target layers")
+        if self.speculative_method not in ("dspark", "dflash2"):
+            raise ValueError(f"unsupported Inkling 2 speculative method: {self.speculative_method!r}")
+        if self.drafting and self.speculative_method == "dflash2" and self.draft_snapshot is None:
+            raise ValueError("Inkling 2 DFlash2 preparation requires a draft checkpoint")
+        if self.online_mxfp8 and (not self.drafting or self.speculative_method != "dflash2"):
+            raise ValueError("Inkling 2 online MXFP8 requires --speculative-method dflash2")
         if self.mtp_only and (not self.drafting or max(self.speculative_widths, default=1) <= 1
                               or self.speculative_fixed_width == 1):
             raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
@@ -97,6 +107,8 @@ class PreparationConfig(BasePreparationConfig):
             raise ValueError(f"unsupported DSpark draft head quantization: {self.draft_head_quantization!r}")
         if self.markov_head_quantization not in (None, "nvfp4"):
             raise ValueError(f"unsupported DSpark Markov head quantization: {self.markov_head_quantization!r}")
+        if self.markov_head_quantization is not None and self.speculative_method == "dflash2":
+            raise ValueError("Inkling 2 DFlash2 does not use a Markov head")
         if (self.draft_head_quantization is not None or self.markov_head_quantization is not None) and not self.drafting:
             raise ValueError("DSpark proposal head quantization requires drafting")
         if self.snapshot_budget_bytes <= 0 or self.headroom_bytes < 0:
@@ -218,7 +230,11 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
         weights = ModelWeights.load(manifest, device, shard=shard, layers=config.decoder_layers,
                                     progress=progress, drafting=config.drafting, vision=config.vision,
                                     draft_head_quantization=config.draft_head_quantization,
-                                    markov_head_quantization=config.markov_head_quantization)
+                                    markov_head_quantization=config.markov_head_quantization,
+                                    speculative_method=config.speculative_method,
+                                    draft_snapshot=config.draft_snapshot,
+                                    online_mxfp8=config.online_mxfp8)
+        model = weights.config
         weights_bytes = torch.cuda.memory_allocated(device)
     if torch.cuda.get_device_properties(device).is_integrated:
         from ignition.preparation.host_memory import release_page_cache
@@ -255,13 +271,21 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
         width = max((w for _, w, _ in config.speculative_round_shapes), default=1)
         completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + width), device=device)
         coordinator = CollectivePreparation(group) if group is not None else None
+        local_vocabulary = weights.head.shape[0]
         runtime, vocabulary_runtime, sampling_runtime, logprob_runtime = _collective_runtimes(
             config, group, device, coordinator=coordinator, core_storage=core_storage,
-            hidden=text.hidden, local_vocabulary=weights.head.shape[0],
-            draft_block=model.draft.block)
+            hidden=text.hidden, local_vocabulary=local_vocabulary,
+            draft_block=model.draft.block_size)
         identity_payload = {"text": model.text.__dict__ | {"local_layers": sorted(model.text.local_layers)},
             "quantization": model.quantization, "headers": headers, "world_size": world,
             "decoder_layers": len(weights.layers), "contract": "inkling2.paged-text.v1"}
+        if config.drafting and config.speculative_method != "dspark":
+            draft_headers = [e.header_sha256 for e in inspect_indexed_checkpoint(config.draft_snapshot).shards]
+            identity_payload["speculative_method"] = config.speculative_method
+            identity_payload["draft"] = model.draft.text
+            identity_payload["draft_headers"] = draft_headers
+        if config.online_mxfp8:
+            identity_payload["online_mxfp8"] = True
         if config.draft_head_quantization is not None:
             identity_payload["draft_head_quantization"] = config.draft_head_quantization
         if config.markov_head_quantization is not None:
@@ -304,12 +328,25 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
     collectives = dict(runtime=runtime, vocabulary_runtime=vocabulary_runtime, coordinator=coordinator,
                        vision_state=vision_state, examples=examples)
     speculation = None
+    prefill_context_factory = None
     if config.drafting:
-        from .dspark import SpeculativePreparation
-        speculation = SpeculativePreparation(weights, pool, requests, inputs, decode_storage, decoder=decoder_type,
-            completion=completion, frame=frame, sequence=sequence, session=session, workspace=arena,
-            collectives=collectives, draft_tokens=config.draft_tokens, sampling_runtime=sampling_runtime,
-            logprob_runtime=logprob_runtime)
+        if config.speculative_method == "dflash2":
+            from hyperflare_recipes.components.dflash2 import PreparedContext as DFlashPreparedContext
+            from .dflash import SpeculativePreparation as DFlashSpeculativePreparation
+
+            speculation = DFlashSpeculativePreparation(weights, pool, requests, inputs, decode_storage,
+                decoder=decoder_type, completion=completion, frame=frame, sequence=sequence,
+                session=session, workspace=arena, collectives=collectives,
+                verification_width=max(config.speculative_widths))
+            prefill_context_factory = partial(DFlashPreparedContext, runtime=None, coordinator=coordinator,
+                compact_prefill=True, examples=examples)
+        else:
+            from .dspark import SpeculativePreparation
+            speculation = SpeculativePreparation(weights, pool, requests, inputs, decode_storage, decoder=decoder_type,
+                completion=completion, frame=frame, sequence=sequence, session=session, workspace=arena,
+                collectives=collectives, draft_tokens=config.draft_tokens, sampling_runtime=sampling_runtime,
+                logprob_runtime=logprob_runtime)
+            prefill_context_factory = speculation.forwards.context
     with phase(progress, "Construct graph catalog"):
         def add(name, forward, kind, rows, tokens, fields, enabled=None, packed=0):
             forwards[name] = forward
@@ -330,17 +367,21 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
                         mode=mode, session=session, workspace=arena, name=name, **collectives)
                     batch = PreparedBatch(inputs, requests, m, mode=mode, shard=shard, pool=pool,
                         validate_prefill=vision_state.validate_prefill if mode == "prefill" and vision_state else None)
+                    ctx_factory = (prefill_context_factory if mode == "prefill" else speculation.forwards.context) if enabled else None
                     forward = PreparedGeneration(decoder, batch, completion, frame, sequence, runtime=runtime,
                         coordinator=coordinator, session=session, name=name + ".generation", workspace=arena,
-                        context_factory=speculation.forwards.context if enabled else None)
+                        context_factory=ctx_factory)
                     fields = (*forward_inputs, *(vision_prefill.buffers() if mode == "prefill" and vision_prefill else ()))
                     add(name, forward, mode, rows, capacity if mode == "prefill" else 1, fields, enabled)
         if speculation is not None:
             from hyperflare_recipes.components.parallel_draft import PreparedParallelDraftRound
             for batch, width, packed in sorted(config.speculative_round_shapes, key=lambda x: (x[2], x[0]), reverse=True):
                 name = f"speculative{batch}x{width}-tokens{packed}"
-                forward = PreparedParallelDraftRound(speculation, batch, width, name, target_token_capacity=packed)
-                forward.prepare()
+                if config.speculative_method == "dflash2":
+                    forward = speculation.round(batch, width, name, target_token_capacity=packed)
+                else:
+                    forward = PreparedParallelDraftRound(speculation, batch, width, name, target_token_capacity=packed)
+                    forward.prepare()
                 add(name, forward, "speculative", batch, width, forward_inputs, True, packed)
         row_inputs = ("request_state_rows", "row_slot_ids", "row_generations", "live_rows")
         for enabled in serving_modes(config.drafting, config.mtp_only):
@@ -416,6 +457,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
     components = ("embedding", "embedding_norm", "final_norm", "output_query", "unembedding", "draft", "vision")
     if weights.cross_pass_queries_t is not None:
         components = (*components, "cross_pass_queries_t")
+    if weights.draft_head is not None:
+        components = (*components, "draft_head")
     rebuild_weights = declare_weights(weights, components=components)
     return PreparedModel(rebuild_weights=rebuild_weights, device=config.devices[rank], graphs=graphs, buffers=buffers,
         signatures={name: signatures[name] for name in graphs}, max_active=config.max_active, session=session,

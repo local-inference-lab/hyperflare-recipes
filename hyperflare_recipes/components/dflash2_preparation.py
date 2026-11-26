@@ -18,6 +18,9 @@ class DFlash2Preparation:
                  verification_width=8, study_width=None, runtime=None,
                  vocabulary_runtime=None, coordinator=None, block_size=None, gather_runtime=None, examples=None,
                  result_runtime=None, shortlist_runtime=None, block_proposal_broadcast=False, shortlist_only=False,
+                 output_multiplier=1., final_logit_softcapping=None,
+                 selector_softcap_mode="before_correction", valid_vocabulary=None,
+                 embedding_norm_weight=None,
                  ):
         width = verification_width if study_width is None else study_width
         if type(width) is not int or not 1 <= width <= 16:
@@ -37,7 +40,9 @@ class DFlash2Preparation:
         self.forwards = SimpleNamespace(decoder=decoder,
             context=partial(PreparedContext, runtime=gather_runtime, coordinator=coordinator, examples=self.examples),
             draft=partial(PreparedDraft, embedding=embedding, head=head,
-                output_multiplier=1., final_logit_softcapping=None,
+                output_multiplier=output_multiplier, final_logit_softcapping=final_logit_softcapping,
+                selector_softcap_mode=selector_softcap_mode, valid_vocabulary=valid_vocabulary,
+                embedding_norm_weight=embedding_norm_weight,
                 embedding_runtime=gather_runtime, examples=self.examples,
                 shortlist_only=shortlist_only, shortlist_runtime=shortlist_runtime), markov=None)
         self.rng = SpeculativeRngState.allocate(pool.backing.device, capacity=requests.capacity)

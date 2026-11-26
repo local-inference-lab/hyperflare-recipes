@@ -130,3 +130,53 @@ def test_mini_rejects_undeclared_proposal_head_quantization():
         PreparationConfig(devices=(0,), drafting=False, draft_head_quantization="nvfp4")
     with pytest.raises(ValueError, match="requires drafting"):
         PreparationConfig(devices=(0,), drafting=False, markov_head_quantization="nvfp4")
+
+
+def test_mini_dflash2_planning_and_rank_costs():
+    from hyperflare_recipes.components.dflash2_geometry import DFlash2Config
+    from hyperflare_recipes.recipes.inkling2 import dflash, pool
+    from hyperflare_recipes.recipes.inkling2.config import LoopConfig, MiniTextConfig
+
+    model = ResolvedModel(MINI_RECIPE, MINI_RECIPE.checkpoints[0])
+    args = _parser().parse_args([
+        "export", model.checkpoint.alias,
+        "--speculative-method", "dflash2",
+        "--online-mxfp8",
+        "--draft-head-quantization", "nvfp4",
+    ])
+    spec = preparation.speculation(args, model)
+    from ignition import planning
+    plan = planning.plan(
+        MINI_RECIPE, model.checkpoint, (gpu(0, 95),), selected=(0,), concurrency=8,
+        reserve_bytes=0, speculation=spec, online_mxfp8=True,
+    )
+    assert plan.speculation.method == "dflash2"
+    assert plan.online_mxfp8 is True
+    assert plan.speculation.draft_head_quantization == "nvfp4"
+
+    # Verify RankCosts match continuation_layout and page_specs down to the byte.
+    text = MiniTextConfig(
+        hidden=2304, layers=24, vocabulary=201024, valid_vocabulary=200058, heads=24, kv_heads=8, head_dim=128,
+        relative_width=16, relative_extent=1024, window=1024,
+        local_layers=frozenset(i for i in range(24) if i % 6 != 5),
+        eps=1e-6, qk_clip=22.627416997969522, relative_clip=8.0, log_scaling_floor=8192, log_scaling_alpha=0.1,
+        convolution_width=4, softcap=30.0, residual_block=6, experts=128, experts_per_token=8, intermediate=1152,
+        gate_softcap=4.0, up_softcap=25.0, route_scale=8.0, max_positions=1048576, eos_token=200006,
+        loop=LoopConfig(core_start=6, core_end=18, num_passes=3, gate_rank=64),
+    )
+    dflash_text = dict(
+        model_type="qwen3", architectures=["DFlash2DraftModel"], hidden_act="silu", dtype="bfloat16",
+        attention_bias=False, attention_dropout=0.0, tie_word_embeddings=False, use_sliding_window=True,
+        is_causal=False, layer_types=["sliding_attention"] * 5,
+    ) | dflash.EXPECTED
+    dflash_cfg = DFlash2Config.from_dict(
+        dflash_text, target_hidden=text.hidden, target_vocabulary=text.vocabulary,
+        target_layers=len(text.visits), expected=dflash.EXPECTED, allow_final_norm_tap=True,
+    )
+    cache_text = text.cache_config
+    geom = pool.RankGeometry.of(cache_text, 1)
+    layout = pool.continuation_layout(cache_text, geom, dflash_cfg)
+    pbytes = sum(shape[0] for _, shape in pool.page_specs(cache_text, geom, dflash_cfg))
+    declared = MINI_RECIPE.speculative_methods["dflash2"].ranks[1]
+    assert layout.row_bytes == declared.state_row_bytes, (layout.row_bytes, declared.state_row_bytes)
+    assert pbytes == declared.page_bytes, (pbytes, declared.page_bytes)
