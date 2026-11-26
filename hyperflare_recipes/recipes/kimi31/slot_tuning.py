@@ -3,15 +3,22 @@
 
 from dataclasses import asdict
 from functools import partial
+from hashlib import sha256
+import gc
+import json
 
 import torch
 from b12x.preparation import PreparedCall
 
 from hyperflare_recipes.components.candidate_selection import PreparedCandidateSelection
 from ignition.preparation.capture import capture_forwards
-from ignition.preparation.composition_tuning import PreparedComposition, plan_identity, race_compositions
+from ignition.preparation.composition_tuning import (
+    PreparedComposition,
+    plan_identity,
+    race_compositions,
+    trial_session,
+)
 from ignition.preparation.execution import GraphSignature
-from ignition.preparation.tuning import RecordedPreparationSession
 
 from .dcp import TOPK, selection_slots
 from .indexer import SharedBuffers
@@ -73,9 +80,10 @@ class SlotForward:
 
 
 class SlotTrial:
-    def __init__(self, context, reduction, geometry, control, session, name):
+    def __init__(self, context, reduction, geometry, control, session, name, *, defer_patterns=False):
         self.context, self.geometry, self.control = context, geometry, control
         device = context.shards.index.device
+        self._device = device
         rows, world = geometry.rows, context.shards.world
         indices = torch.full((rows, TOPK), -1, dtype=torch.int32, device=device)
         scores = torch.full_like(indices, -torch.inf, dtype=torch.float32)
@@ -105,10 +113,30 @@ class SlotTrial:
         self.merge.functional(session=session)
         self.local = PreparedLocalSlots(*self.inputs, *self.output, cache_pages=geometry.cache_pages,
                                         context=context, session=session, name=name + ".local")
-        self.patterns = [tuple(t.to(device) for t in slot_inputs(context.shards.rank, seed, length, rows=rows, world=world))
-                         for seed, length in _WORKLOAD]
+        self.patterns = []
         self.expected = []
         self.index = 0
+        if defer_patterns:
+            for dest, src in zip(self.inputs[:3], self._build_pattern(0), strict=True):
+                dest.copy_(src)
+        else:
+            self.prepare_patterns()
+
+    def _build_pattern(self, index):
+        seed, length = _WORKLOAD[index]
+        rows, world = self.geometry.rows, self.context.shards.world
+        return tuple(
+            t.to(self._device)
+            for t in slot_inputs(self.context.shards.rank, seed, length, rows=rows, world=world)
+        )
+
+    def prepare_patterns(self):
+        if not self.patterns:
+            self.patterns = [self._build_pattern(index) for index in range(len(_WORKLOAD))]
+
+    def release_patterns(self):
+        self.patterns.clear()
+        self.expected.clear()
 
     def produce(self, index):
         self.index = index
@@ -134,72 +162,104 @@ class SlotTrial:
                     for tensor in tensors if isinstance(tensor, torch.Tensor)}.values())
 
 
-def _measure(trial, bindings, session, namespace):
-    coordinator = trial.context.coordinator
-    device = trial.inputs[0].device
-    for local, merge in bindings:
-        if (plan_identity(local.plan) != plan_identity(trial.local.plan)
-                or [(role, plan_identity(plan)) for role, plan in merge.plans(merge.implementation)]
-                != [(role, plan_identity(plan)) for role, plan in trial.plans("global")]):
-            raise ValueError("slot trial plans differ from the model's sparse selection")
-    forwards = {kind: SlotForward(trial, kind == "local") for kind in ("global", "local")}
-    signatures = {kind: GraphSignature("decode", 1, trial.geometry.rows) for kind in forwards}
-    trial.produce(0)
-    graphs, compiled = capture_forwards(forwards, signatures, session=session, device=device,
-        stream=torch.cuda.Stream(device=device), pool=torch.cuda.graph_pool_handle(), coordinator=coordinator,
-        report_catalog=False, cache_root=namespace, retain_forwards=True)
+def _slot_forward_names(geometry, control):
+    identity = sha256(json.dumps((asdict(geometry), control), sort_keys=True).encode()).hexdigest()
+    return {kind: f"kimi31-slot-{geometry.rows}-{kind}-{identity}" for kind in ("global", "local")}
+
+
+def _measure_batch(fixtures, session, namespace):
+    if not fixtures:
+        return []
+    coordinator = fixtures[0][0].context.coordinator
+    device = fixtures[0][0].inputs[0].device
+    prepared = []
+    forwards, signatures = {}, {}
+    for trial, bindings in fixtures:
+        for local, merge in bindings:
+            if (plan_identity(local.plan) != plan_identity(trial.local.plan)
+                    or [(role, plan_identity(plan)) for role, plan in merge.plans(merge.implementation)]
+                    != [(role, plan_identity(plan)) for role, plan in trial.plans("global")]):
+                raise ValueError("slot trial plans differ from the model's sparse selection")
+        names = _slot_forward_names(trial.geometry, trial.control)
+        for kind, name in names.items():
+            forwards[name] = SlotForward(trial, kind == "local")
+            signatures[name] = GraphSignature("decode", 1, trial.geometry.rows)
+        prepared.append((trial, bindings, names))
+    graphs, compiled = {}, {}
+    results = []
     try:
-        for index in range(len(trial.patterns)):
-            trial.produce(index)
-            torch.cuda.synchronize(device)
-            coordinator.barrier(f"slot reference {index}", coordinator.ranks)
-            compiled["global"]()
-            torch.cuda.synchronize(device)
-            trial.expected.append(tuple(t.clone() for t in trial.output))
-        producers = tuple(partial(trial.produce, index) for index in range(len(_WORKLOAD) - 1))
-        candidates = {}
-        for kind, forward in compiled.items():
-            call = PreparedCall(run=forward, output=trial.output[1], produce=producers[0],
-                benchmark_producers=producers, reset=trial.reset, validate=trial.validate, owners=(trial,),
-                capture_safe=True, benchmark_repetitions=8)
-            candidates[kind] = PreparedComposition(forward, trial.plans(kind), call)
-        with session._tuning_clocks():
-            result = race_compositions(candidates, operation="interleaved-sparse-selection-slots",
-                geometry=dict(**asdict(trial.geometry), world_size=trial.context.shards.world, topk=TOPK),
-                numerics="ordered-fp32-keys-rank-major-ties-physical-slots", workload=dict(version=2,
-                    patterns=_WORKLOAD[:-1]), default="global", session=session, coordinator=coordinator,
-                cache_policy="warm", resident_bytes=trial.resident_bytes())
-        trial.produce(len(_WORKLOAD) - 1)
-        trial.reset()
-        torch.cuda.synchronize(device)
-        coordinator.barrier("slot selection holdout", coordinator.ranks)
-        compiled[result["implementation"]]()
-        torch.cuda.synchronize(device)
-        trial.validate()
-        for local, _ in bindings:
-            local.enabled = result["implementation"] == "local"
-        return dict(operation="interleaved-sparse-selection-slots", geometry=asdict(trial.geometry),
-                    global_merge=trial.control, **result)
+        graphs, compiled = capture_forwards(forwards, signatures, session=session, device=device,
+            stream=torch.cuda.Stream(device=device), pool=torch.cuda.graph_pool_handle(), coordinator=coordinator,
+            report_catalog=False, cache_root=namespace, retain_forwards=True)
+        for trial, bindings, names in prepared:
+            trial.prepare_patterns()
+            try:
+                for index in range(len(trial.patterns)):
+                    trial.produce(index)
+                    torch.cuda.synchronize(device)
+                    coordinator.barrier(f"slot reference {index}", coordinator.ranks)
+                    compiled[names["global"]]()
+                    torch.cuda.synchronize(device)
+                    trial.expected.append(tuple(t.clone() for t in trial.output))
+                producers = tuple(partial(trial.produce, index) for index in range(len(_WORKLOAD) - 1))
+                candidates = {}
+                for kind, name in names.items():
+                    forward = compiled[name]
+                    call = PreparedCall(run=forward, output=trial.output[1], produce=producers[0],
+                        benchmark_producers=producers, reset=trial.reset, validate=trial.validate, owners=(trial,),
+                        capture_safe=True, benchmark_repetitions=8)
+                    candidates[kind] = PreparedComposition(forward, trial.plans(kind), call)
+                resident_bytes = sum(t.resident_bytes() for t, _, _ in prepared)
+                with session._tuning_clocks():
+                    result = race_compositions(candidates, operation="interleaved-sparse-selection-slots",
+                        geometry=dict(**asdict(trial.geometry), world_size=trial.context.shards.world, topk=TOPK),
+                        numerics="ordered-fp32-keys-rank-major-ties-physical-slots", workload=dict(version=2,
+                            patterns=_WORKLOAD[:-1]), default="global", session=session, coordinator=coordinator,
+                        cache_policy="warm", resident_bytes=resident_bytes)
+                trial.produce(len(_WORKLOAD) - 1)
+                trial.reset()
+                torch.cuda.synchronize(device)
+                coordinator.barrier("slot selection holdout", coordinator.ranks)
+                compiled[names[result["implementation"]]]()
+                torch.cuda.synchronize(device)
+                trial.validate()
+                for local, _ in bindings:
+                    local.enabled = result["implementation"] == "local"
+                results.append(dict(operation="interleaved-sparse-selection-slots", geometry=asdict(trial.geometry),
+                                    global_merge=trial.control, **result))
+            finally:
+                trial.release_patterns()
+        return results
     finally:
         for graph in graphs.values():
             graph.reset()
         for forward in compiled.values():
             forward.retire_after_capture()
+        graphs.clear()
+        compiled.clear()
+        forwards.clear()
+        for trial, _, _ in prepared:
+            trial.values.clear()
+        prepared.clear()
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 def tune_local_slots(registry, session):
-    namespace = session.namespace.to_dict()
-    checkpoint, schema, numerics = (namespace.pop(key) for key in ("checkpoint", "workload_schema", "numerical_policy"))
-    with RecordedPreparationSession(device=registry.context.shards.index.device, checkpoint=checkpoint,
-            workload_schema=schema, numerical_policy=numerics, namespace=namespace,
-            coordinator=registry.context.coordinator, compile_workers=session.requested_compile_workers,
-            autotune_effort=session.autotune_effort,
-            headroom_bytes=session.headroom_bytes, lock_gpu_clocks=session.lock_gpu_clocks) as trials:
+    if not registry.slot_groups:
+        return []
+    device = registry.context.shards.index.device
+    coordinator = registry.context.coordinator
+    with trial_session(session, device=device, coordinator=coordinator) as trials:
         grouped = {}
         for geometry, bindings in registry.slot_groups.items():
             for local, merge in bindings:
                 grouped.setdefault((geometry, merge.implementation), []).append((local, merge))
-        fixtures = [(SlotTrial(registry.context, registry.reduction, geometry, control, trials, f"slot_trial.{index}"),
-                     bindings) for index, ((geometry, control), bindings) in enumerate(grouped.items())]
+        fixtures = [
+            (SlotTrial(registry.context, registry.reduction, geometry, control, trials, f"slot_trial.{index}",
+                       defer_patterns=True),
+             bindings)
+            for index, ((geometry, control), bindings) in enumerate(grouped.items())
+        ]
         trials.tune(show_progress=False)
-        return [_measure(trial, bindings, trials, registry.cache_root) for trial, bindings in fixtures]
+        return _measure_batch(fixtures, trials, registry.cache_root)

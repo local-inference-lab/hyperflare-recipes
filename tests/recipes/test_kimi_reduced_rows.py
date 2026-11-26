@@ -57,3 +57,124 @@ def test_compiler_workers_receive_operands_and_handles_without_cuda_resources(ge
             assert expected in names and "flare.pcie_all_reduce.default" not in names
         else:
             assert "flare.pcie_all_reduce.default" in names and "triton_kernel_wrapper_mutation" in names
+
+
+def test_row_reduction_tuning_batches_capture_forwards_and_defers_patterns(monkeypatch):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    import torch
+    from hyperflare_recipes.recipes.kimi3 import row_reductions
+
+    class FakeGraph:
+        def __init__(self):
+            self.reset_calls = 0
+
+        def reset(self):
+            self.reset_calls += 1
+
+    class FakeCompiled:
+        def __init__(self, name, fn):
+            self.name = name
+            self.fn = fn
+            self.retired = 0
+            self.calls = 0
+
+        def __call__(self):
+            self.calls += 1
+            return self.fn()
+
+        def retire_after_capture(self):
+            self.retired += 1
+
+    geometries = (
+        RowGeometry(3584, rows=4),
+        RowGeometry(7168, sources=1, mode=2, blocks=8, rows=4),
+        RowGeometry(7168, sources=4, mode=1, blocks=8, taps=5, rows=8, addend=True),
+    )
+    choices = []
+    grouped = []
+    for idx, geom in enumerate(geometries):
+        control = SimpleNamespace(handle=10 + idx, plan=f"plan-{idx}", stream=None)
+        choice = row_reductions.RowReductionChoice(SimpleNamespace(parts=[control]), geom)
+        row_reductions._BINDINGS[choice].layout = SimpleNamespace(
+            owner=SimpleNamespace(device=torch.device("cpu"), rank=0, stream=None)
+        )
+        choices.append(choice)
+        grouped.append(((geom, (f"ctrl-{idx}",)), [choice]))
+
+    capture_calls = []
+    all_graphs = []
+    all_compiled = []
+
+    fixtures_seen = []
+    orig_fixture = row_reductions._ReductionFixture
+
+    class TrackingFixture(orig_fixture):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            fixtures_seen.append(self)
+
+    monkeypatch.setattr(row_reductions, "_ReductionFixture", TrackingFixture)
+
+    def fake_capture(forwards, signatures, **kwargs):
+        capture_calls.append((list(forwards), {k: v.token_capacity for k, v in signatures.items()}))
+        # Deferred patterns keep pattern tensors off device during batched capture.
+        assert all(len(fixture.patterns) == 0 for fixture in fixtures_seen)
+        for fn in forwards.values():
+            assert fn.source.isfinite().all()
+        graphs = {}
+        compiled = {}
+        for name, fn in forwards.items():
+            g = FakeGraph()
+            c = FakeCompiled(name, lambda f=fn: f.out.zero_())
+            graphs[name] = g
+            compiled[name] = c
+            all_graphs.append(g)
+            all_compiled.append(c)
+        return graphs, compiled
+
+    raced_ops = []
+
+    def fake_race(candidates, *, operation, geometry, resident_bytes, **kwargs):
+        assert set(candidates) == {"separate", "fused"}
+        assert resident_bytes > 0
+        # Only the active group holds materialized patterns during its race.
+        assert sum(1 for fixture in fixtures_seen if fixture.patterns) == 1
+        raced_ops.append((operation, geometry["rows"], resident_bytes))
+        return {"implementation": "fused", "source": "tuned", "rejected_candidates": 0}
+
+    monkeypatch.setattr(row_reductions, "capture_forwards", fake_capture)
+    monkeypatch.setattr(row_reductions, "race_compositions", fake_race)
+    monkeypatch.setattr(torch.cuda, "Stream", lambda device=None: None)
+    monkeypatch.setattr(torch.cuda, "graph_pool_handle", lambda: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device=None: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    coordinator = SimpleNamespace(ranks=(0, 1), barrier=lambda name, ranks: None)
+    catalog = row_reductions.RowReductionTuning(coordinator, torch.device("cpu"), 1e-5, None)
+    monkeypatch.setattr(catalog, "groups", lambda: grouped)
+    session = SimpleNamespace(autotune=True, autotune_effort="default", _tuning_clocks=nullcontext)
+
+    report = catalog.tune(session)
+    assert len(capture_calls) == 1
+    assert len(capture_calls[0][0]) == 2 * len(geometries)
+    assert list(capture_calls[0][1].values()) == [4, 4, 4, 4, 8, 8]
+    assert len(report) == len(geometries)
+    assert [entry["geometry"]["rows"] for entry in report] == [4, 4, 8]
+    assert all(choice.fused for choice in choices)
+    assert all(g.reset_calls == 1 for g in all_graphs)
+    assert all(c.retired == 1 for c in all_compiled)
+    assert all(not fixture.patterns and not fixture.expected for fixture in fixtures_seen)
+
+
+def test_batch_groups_splits_deterministically_at_budget():
+    from hyperflare_recipes.recipes.kimi3.row_reductions import _batch_groups, _fixture_live_bytes
+
+    g_small = RowGeometry(3584, rows=4)
+    g_large = RowGeometry(7168, sources=4, mode=1, blocks=8, rows=64, addend=True)
+    entries = [((g_small, ("a",)), []), ((g_large, ("b",)), []), ((g_large, ("c",)), [])]
+    budget = _fixture_live_bytes(g_small) + _fixture_live_bytes(g_large)
+    batches = _batch_groups(entries, budget_bytes=budget)
+    assert len(batches) == 2
+    assert len(batches[0]) == 2 and len(batches[1]) == 1
+    assert _batch_groups([], budget_bytes=budget) == []

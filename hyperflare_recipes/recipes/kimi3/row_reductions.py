@@ -594,12 +594,50 @@ class RowReductionChoice:
         return output
 
 
+_ROW_TUNING_BATCH_BYTES = 256 << 20
+
+
+def _fixture_live_bytes(spec):
+    """Deterministic byte estimate for one trial fixture's live operands and outputs."""
+    rows, width = spec.rows, spec.width
+    columns = 224 if width == 3584 else width
+    bf16 = 2
+    total = (rows * width * 2 + rows * columns + columns) * bf16 + 4
+    if spec.addend:
+        total += rows * width * bf16
+    if spec.residual_norm:
+        total += rows * width * 2 * bf16
+    elif width == 7168:
+        total += (rows * 7168 + rows * spec.blocks * 7168) * bf16 + 7168 * 4
+        if spec.taps:
+            total += rows * spec.taps * 7168 * bf16
+    return total
+
+
+def _batch_groups(groups, budget_bytes=_ROW_TUNING_BATCH_BYTES):
+    """Partition agreed tuning groups into deterministic memory-bounded capture batches."""
+    batches, current, used = [], [], 0
+    for entry in groups:
+        (geometry, _), _ = entry
+        size = _fixture_live_bytes(geometry)
+        if current and used + size > budget_bytes:
+            batches.append(current)
+            current, used = [], 0
+        current.append(entry)
+        used += size
+    if current:
+        batches.append(current)
+    return batches
+
+
 class _ReductionFixture:
     """Private trial state, including each observable residual update and consumer output."""
 
-    def __init__(self, choice, eps):
+    def __init__(self, choice, eps, *, defer_patterns=False):
         self.choice = choice
         spec, owner = choice.spec, choice.layout.owner
+        self._owner = owner
+        self._device = owner.device
         self.eps = float(eps if spec.eps is None else spec.eps)
         device = owner.device
         rows = spec.rows
@@ -630,26 +668,43 @@ class _ReductionFixture:
                 self.tap = torch.empty((rows, spec.taps * 7168), dtype=torch.bfloat16, device=device)[:, :7168]
                 self.outputs.append(self.tap)
         self.patterns = []
-        for index in range(4):
-            generator = torch.Generator().manual_seed(307 + index)
-            partials = torch.randn((16, rows, spec.width), generator=generator).to(torch.bfloat16)
-            if index == 1:
-                partials[:, :, ::3] = torch.tensor(-0.0, dtype=torch.bfloat16)
-            if index == 2:
-                partials[1::2] = -partials[::2]
-            if index == 3:
-                partials[::4].mul_(32)
-            pattern = [partials[owner.rank].to(device)]
-            for value in self.state[1:]:
-                if value is self.addend:
-                    add_partials = torch.randn((16, rows, spec.width), generator=generator).to(torch.bfloat16)
-                    pattern.append(add_partials[owner.rank].to(device))
-                else:
-                    pattern.append(
-                        torch.randn(value.shape, generator=generator).to(device=device, dtype=value.dtype)
-                    )
-            self.patterns.append(pattern)
         self.expected = []
+        self.index = 0
+        if defer_patterns:
+            for target, source in zip(self.state, self._build_pattern(0), strict=True):
+                target.copy_(source)
+        else:
+            self.prepare_patterns()
+
+    def _build_pattern(self, index):
+        spec = self.choice.spec
+        rows, device, rank = spec.rows, self._device, self._owner.rank
+        generator = torch.Generator().manual_seed(307 + index)
+        partials = torch.randn((16, rows, spec.width), generator=generator).to(torch.bfloat16)
+        if index == 1:
+            partials[:, :, ::3] = torch.tensor(-0.0, dtype=torch.bfloat16)
+        if index == 2:
+            partials[1::2] = -partials[::2]
+        if index == 3:
+            partials[::4].mul_(32)
+        pattern = [partials[rank].to(device)]
+        for value in self.state[1:]:
+            if value is self.addend:
+                add_partials = torch.randn((16, rows, spec.width), generator=generator).to(torch.bfloat16)
+                pattern.append(add_partials[rank].to(device))
+            else:
+                pattern.append(
+                    torch.randn(value.shape, generator=generator).to(device=device, dtype=value.dtype)
+                )
+        return pattern
+
+    def prepare_patterns(self):
+        if not self.patterns:
+            self.patterns = [self._build_pattern(index) for index in range(4)]
+
+    def release_patterns(self):
+        self.patterns.clear()
+        self.expected.clear()
 
     def produce(self, index):
         self.index = index
@@ -847,21 +902,34 @@ class RowReductionTuning:
     def tune(self, session):
         if not session.autotune or session.autotune_effort == "off":
             return []
+        groups = list(self.groups())
+        if not groups:
+            return []
+        import gc
+
         report = []
-        for (geometry, controls), targets_for_plan in self.groups():
-            # ForwardCache keys compiled templates by name and graph signature.
-            # Distinct reductions and epilogues need distinct persistent templates.
-            identity = sha256(json.dumps((vars(geometry), controls), sort_keys=True).encode()).hexdigest()
-            names = {kind: f"kimi-row-{geometry.rows}x{geometry.width}-{kind}-{identity}" for kind in ("separate", "fused")}
-            representative = next(t for t in targets_for_plan if t.spec == geometry)
-            fixture = _ReductionFixture(representative, self.eps)
-            fixture.produce(0)
-            forwards = {names[kind]: _PreparedTrial(fixture, kind == "fused") for kind in names}
+        for batch in _batch_groups(groups):
+            entries = []
+            forwards, signatures = {}, {}
             graphs, compiled = {}, {}
             try:
+                for (geometry, controls), targets_for_plan in batch:
+                    # ForwardCache keys compiled templates by name and graph signature.
+                    # Distinct reductions and epilogues need distinct persistent templates.
+                    identity = sha256(json.dumps((vars(geometry), controls), sort_keys=True).encode()).hexdigest()
+                    names = {
+                        kind: f"kimi-row-{geometry.rows}x{geometry.width}-{kind}-{identity}"
+                        for kind in ("separate", "fused")
+                    }
+                    representative = next(t for t in targets_for_plan if t.spec == geometry)
+                    fixture = _ReductionFixture(representative, self.eps, defer_patterns=True)
+                    for kind, name in names.items():
+                        forwards[name] = _PreparedTrial(fixture, kind == "fused")
+                        signatures[name] = GraphSignature("decode", 1, geometry.rows)
+                    entries.append((geometry, targets_for_plan, representative, fixture, names))
                 graphs, compiled = capture_forwards(
                     forwards,
-                    {n: GraphSignature("decode", 1, geometry.rows) for n in forwards},
+                    signatures,
                     session=session,
                     device=self.device,
                     stream=torch.cuda.Stream(device=self.device),
@@ -871,70 +939,76 @@ class RowReductionTuning:
                     cache_root=self.cache_root,
                     retain_forwards=True,
                 )
-                for i in range(len(fixture.patterns)):
-                    fixture.produce(i)
-                    torch.cuda.synchronize(self.device)
-                    self.coordinator.barrier(f"Kimi row reference {i}", self.coordinator.ranks)
-                    compiled[names["separate"]]()
-                    fixture.reference()
-                producers = tuple(partial(fixture.produce, i) for i in range(3))
-                plan = representative.control_plan
-                candidates = {}
-                for kind, name in names.items():
-                    func = compiled[name]
-                    call = PreparedCall(
-                        run=func,
-                        output=fixture.out,
-                        produce=producers[0],
-                        benchmark_producers=producers,
-                        validate=fixture.validate,
-                        owners=(fixture,),
-                        capture_safe=True,
-                    )
-                    candidates[kind] = PreparedComposition(func, (("reduction", plan),), call)
-                function = (
-                    _reduced_residual_norm
-                    if geometry.residual_norm
-                    else (_reduced_norm if geometry.width == 3584 else _reduced_mix)
-                )
-                op_name = (
-                    "kimi-row-residual-norm-7168"
-                    if geometry.residual_norm
-                    else f"kimi-row-normalization-{geometry.width}"
-                )
-                direct_fo_tag = (
-                    "sw4_grid_v9b"
-                    if (geometry.residual_norm or geometry.width == 3584)
-                    else "sw4_grid_v14_mix"
-                )
-                with session._tuning_clocks():
-                    result = race_compositions(
-                        candidates,
-                        operation=op_name,
-                        geometry=vars(geometry),
-                        numerics=dict(epsilon=fixture.eps, kernel=function.cache_key, direct_fo=direct_fo_tag),
-                        workload=dict(
-                            version=4,
-                            seeds=(307, 308, 309),
-                            rows=geometry.rows,
-                            addend=geometry.addend,
-                            residual_norm=geometry.residual_norm,
-                        ),
-                        default="separate",
-                        session=session,
-                        coordinator=self.coordinator,
-                        cache_policy="warm",
-                        resident_bytes=fixture.nbytes,
-                    )
-                fixture.produce(3)
-                torch.cuda.synchronize(self.device)
-                self.coordinator.barrier("Kimi row holdout", self.coordinator.ranks)
-                compiled[names[result["implementation"]]]()
-                torch.cuda.synchronize(self.device)
-                fixture.validate()
-                for target in targets_for_plan:
-                    target.fused = result["implementation"] == "fused"
-                report.append(dict(geometry=vars(geometry), **result))
+                for geometry, targets_for_plan, representative, fixture, names in entries:
+                    fixture.prepare_patterns()
+                    try:
+                        for i in range(len(fixture.patterns)):
+                            fixture.produce(i)
+                            torch.cuda.synchronize(self.device)
+                            self.coordinator.barrier(f"Kimi row reference {i}", self.coordinator.ranks)
+                            compiled[names["separate"]]()
+                            fixture.reference()
+                        producers = tuple(partial(fixture.produce, i) for i in range(3))
+                        plan = representative.control_plan
+                        candidates = {}
+                        for kind, name in names.items():
+                            func = compiled[name]
+                            call = PreparedCall(
+                                run=func,
+                                output=fixture.out,
+                                produce=producers[0],
+                                benchmark_producers=producers,
+                                validate=fixture.validate,
+                                owners=(fixture,),
+                                capture_safe=True,
+                            )
+                            candidates[kind] = PreparedComposition(func, (("reduction", plan),), call)
+                        function = (
+                            _reduced_residual_norm
+                            if geometry.residual_norm
+                            else (_reduced_norm if geometry.width == 3584 else _reduced_mix)
+                        )
+                        op_name = (
+                            "kimi-row-residual-norm-7168"
+                            if geometry.residual_norm
+                            else f"kimi-row-normalization-{geometry.width}"
+                        )
+                        direct_fo_tag = (
+                            "sw4_grid_v9b"
+                            if (geometry.residual_norm or geometry.width == 3584)
+                            else "sw4_grid_v14_mix"
+                        )
+                        resident_bytes = sum(item[3].nbytes for item in entries)
+                        with session._tuning_clocks():
+                            result = race_compositions(
+                                candidates,
+                                operation=op_name,
+                                geometry=vars(geometry),
+                                numerics=dict(epsilon=fixture.eps, kernel=function.cache_key, direct_fo=direct_fo_tag),
+                                workload=dict(
+                                    version=4,
+                                    seeds=(307, 308, 309),
+                                    rows=geometry.rows,
+                                    addend=geometry.addend,
+                                    residual_norm=geometry.residual_norm,
+                                ),
+                                default="separate",
+                                session=session,
+                                coordinator=self.coordinator,
+                                cache_policy="warm",
+                                resident_bytes=resident_bytes,
+                            )
+                        fixture.produce(3)
+                        torch.cuda.synchronize(self.device)
+                        self.coordinator.barrier("Kimi row holdout", self.coordinator.ranks)
+                        compiled[names[result["implementation"]]]()
+                        torch.cuda.synchronize(self.device)
+                        fixture.validate()
+                        for target in targets_for_plan:
+                            target.fused = result["implementation"] == "fused"
+                        report.append(dict(geometry=vars(geometry), **result))
+                    finally:
+                        fixture.release_patterns()
             finally:
                 for graph in graphs.values():
                     graph.reset()
@@ -942,8 +1016,8 @@ class RowReductionTuning:
                     forward.retire_after_capture()
                 graphs.clear()
                 compiled.clear()
-                fixture = None
-                import gc
+                forwards.clear()
+                entries.clear()
                 gc.collect()
                 torch.cuda.empty_cache()
         return report
