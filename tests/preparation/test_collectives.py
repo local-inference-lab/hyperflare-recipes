@@ -291,23 +291,6 @@ def test_race_winners_prefer_lower_latency_then_lower_candidate_index():
         _tuning_results([race("c", 0, 0, assignment=False), race("c", 0, 1, assignment=False)])
 
 
-def test_sharded_finalists_preserve_empty_shards_and_rank_order():
-    from dataclasses import replace
-    from b12x.preparation import FinalistPolicy, FinalistRecord, FrozenMapping, TuningRequirement
-    from ignition.preparation.collectives import _tuning_results
-
-    policy = FinalistPolicy(family_fields=("width",))
-    assignment = FrozenMapping({"width": 1})
-    first = TuningRequirement("qkv", (0, 1, 2, 3), assignment, 5., 0,
-        finalist_policy=policy,
-        finalists=(FinalistRecord(assignment=assignment, family=assignment, candidate_index=0, latency_us=5.),))
-    shards = (first, *(replace(first, assignment=None, latency_us=None, candidate_index=None,
-                              finalists=()) for _ in range(3)))
-    assert _tuning_results(shards) == shards
-    with pytest.raises(ValueError, match="policies differ"):
-        _tuning_results((first, replace(shards[1], finalist_policy=None)))
-
-
 def test_ranks_report_whether_a_value_matches_every_rank(monkeypatch):
     owner = coordinator(monkeypatch)
     monkeypatch.setattr(dist, "get_rank", lambda: 4)

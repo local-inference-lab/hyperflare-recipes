@@ -78,26 +78,10 @@ def _forward_factories(mla_compute_mode, *, vision,
                     mla_compute_mode=mla_compute_mode, examples=examples))
 
 
-def _can_race_contextual_plans(config, signatures, device):
-    if not config.joint_tuning:
-        return False
-    if config.autotune_effort == "off":
-        raise ValueError("--joint-tuning requires --autotune-effort default or audit")
-    from b12x.quantization import mla_norm_mxfp8
-
-    if not mla_norm_mxfp8.is_supported(device):
-        raise ValueError("--joint-tuning requires fused MXFP8 query normalization on the selected device")
-    if not any(signature.kind in ("prefill", "terminal_prefill", "scored_prefill", "decode", "speculative")
-               for signature in signatures.values()):
-        raise ValueError("--joint-tuning requires prepared text graphs")
-    return True
-
-
 @dataclass(frozen=True)
 class PreparationConfig(BasePreparationConfig):
     prompt_logprobs: bool = False
     image_concurrency: int | None = None
-    joint_tuning: bool = False
     devices: tuple[int, ...] = (0, 1, 2, 3)
     # Device ordinals are host-local when each rank runs on its own Spark.
     hosts: tuple[str, ...] | None = None
@@ -603,26 +587,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
     if feature_pool is not None:
         feature_pool.release_backing()
     try:
-        contextual = None
-        if _can_race_contextual_plans(config, signatures, device):
-            from .contextual_selection import CatalogContextualSelection
-
-            contextual = CatalogContextualSelection(forwards, signatures,
-                coordinator=coordinator, collective=collective, device=device,
-                graph_pool=core_storage.graph_pool.id, cache_root=config.kernel_cache,
-                compile_decoder=config.compile_decoder, warmup_storage=core_storage,
-                progress=progress)
         with phase(progress, "Prepare and tune kernels") as stage, core_storage.transient():
             tuning = session.tune(show_progress=progress is not None and rank == 0,
-                                  console=stage.console, contextual=contextual)
-        if contextual is not None and progress is not None:
-            from .contextual_selection import contextual_summary
-
-            summary = contextual_summary(tuning["contextual_tuning"])
-            if hasattr(progress, "console"):
-                progress.console.print(summary, markup=False)
-            else:
-                progress(summary)
+                                  console=stage.console)
         stream, graph_pool = torch.cuda.Stream(device=device), core_storage.graph_pool.id
         if speculation is not None:
             speculation.release_examples()

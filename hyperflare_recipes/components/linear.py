@@ -20,7 +20,7 @@ from hyperflare_recipes.fixtures import blockscaled_gemm as gemm_fixtures
 from hyperflare_recipes.fixtures.projection import input_factory
 from ignition.preparation.scratch import ScratchArena, prime_owners, scratch_storage
 from ignition.preparation.tensor_metadata import record_numeric_tensor
-from ignition.preparation.tuning import benchmark_resource, declare, register_context_plan, register_finalizer
+from ignition.preparation.tuning import benchmark_resource, declare, register_finalizer
 
 
 def prepare_projection(source, weight, output, *, session, name, workspace, activation_mode="auto", staging=None,
@@ -368,7 +368,6 @@ class QuantizedProjection:
             requests.append(self.plan.request(name=name,
                 prepare_call=prepare_projection, benchmark_call=benchmark_projection))
             declare(session, tuple(requests))
-            register_context_plan(session, name, self)
             register_finalizer(session, lambda: setattr(self, "workspace", selected_workspace()), workspace=workspace)
             return
         if self.sm103:

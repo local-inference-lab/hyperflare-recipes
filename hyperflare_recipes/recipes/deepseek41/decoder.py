@@ -902,15 +902,6 @@ class PreparedLayer:
         if self.concurrent_shared is not None:
             self.shared = None
 
-    def __call__(self, incoming, pre_mix, metadata, indices, selection, *, boundary=None, window_cache=None,
-                 image_mask=None, engram_projected=None, engram_gathered=None, engram_overlap=None,
-                 engram_project=None, ffn_engram_overlaps=None, shard_inputs=None):
-        incoming, next_mix, records, selection, _ = self._run(incoming, pre_mix, metadata, indices,
-            selection, boundary=boundary, window_cache=window_cache, image_mask=image_mask,
-            engram_projected=engram_projected, engram_gathered=engram_gathered, engram_overlap=engram_overlap,
-            engram_project=engram_project, ffn_engram_overlaps=ffn_engram_overlaps, shard_inputs=shard_inputs)
-        return incoming, next_mix, records, selection
-
     def _prepare_attn_shard(self, normalized):
         if self.attn_quantizer_plan is None:
             return normalized
@@ -1278,7 +1269,7 @@ class PreparedLayer:
         p_eng_0 = None
         if ffn_eng_0 is not None:
             p_eng_0 = cr_e0.start(eng_src_0, dependencies=(p_meta_b.output,))
-        partial_a, route_ids_a = self._run_ffn_gathered(vals_a_full, meta_a_full)
+        partial_a, _ = self._run_ffn_gathered(vals_a_full, meta_a_full)
         vals_b_full = self.cr_ffn_vals_1.finish(p_vals_b, partial_a)
         meta_b_full = self.cr_ffn_meta_1.finish(p_meta_b, vals_b_full)
         mlp0_dep = meta_b_full
@@ -1300,7 +1291,7 @@ class PreparedLayer:
         p_eng_1 = None
         if ffn_eng_1 is not None:
             p_eng_1 = cr_e1.start(eng_src_1, dependencies=(p_mlp_a.output,))
-        partial_b, route_ids_b = self._run_ffn_gathered(vals_b_full, meta_b_full)
+        partial_b, _ = self._run_ffn_gathered(vals_b_full, meta_b_full)
         mlp_a = self.cr_mlp_0.finish(p_mlp_a, partial_b)
         mlp1_dep = mlp_a
         if p_eng_1 is not None:
@@ -1328,16 +1319,11 @@ class PreparedLayer:
             mlp_b = self.cr_mlp_1.finish(p_mlp_b, res_a)
             incoming = (mlp_a, res_a, post_a, comb_a, mlp_b, res_b, post_b, comb_b)
             next_mix = (next_mix_a, next_mix_b)
-        observations = {
-            "attention_hc.normalized": attention_normalized,
-            "router.ids": torch.cat((route_ids_a, route_ids_b), dim=0),
-            "output": incoming[0],
-        }
-        return incoming, next_mix, records, selection, observations
+        return incoming, next_mix, records, selection
 
-    def _run(self, incoming, pre_mix, metadata, indices, selection, *, boundary=None, window_cache=None,
-             image_mask=None, engram_projected=None, engram_gathered=None, engram_overlap=None,
-             engram_project=None, ffn_engram_overlaps=None, shard_inputs=None):
+    def __call__(self, incoming, pre_mix, metadata, indices, selection, *, boundary=None, window_cache=None,
+                 image_mask=None, engram_projected=None, engram_gathered=None, engram_overlap=None,
+                 engram_project=None, ffn_engram_overlaps=None, shard_inputs=None):
         if getattr(self, "row_shard_dma", False):
             return self._run_row_shard_dma(incoming, pre_mix, metadata, indices, selection,
                 window_cache=window_cache, image_mask=image_mask, engram_projected=engram_projected,
@@ -1383,8 +1369,6 @@ class PreparedLayer:
             if self.attention.mode == "prefill":
                 self.attention.commit(metadata.lengths, records, metadata)
             att_a = self.cr_att_0.finish(p_att_a, out_b)
-            attention_normalized = norm_a
-            observations = {}
         elif pipelined_attn == "mla_wo":
             if pipelined_attn_hc:
                 mlp_a, prev_res_a, prev_post_a, prev_comb_a, p_mlp_b, prev_res_b, prev_post_b, prev_comb_b = incoming
@@ -1404,7 +1388,6 @@ class PreparedLayer:
                 post_a, post_b = post[:h], post[h:]
                 comb_a, comb_b = comb[:h], comb[h:]
                 attn_mix_a, attn_mix_b = attn_mix[:h], attn_mix[h:]
-            attention_normalized = normalized
             pending_engram = None
             if engram_overlap is not None:
                 prepare_engram, cr_engram, bounds, engram_state, use_gather = engram_overlap
@@ -1431,7 +1414,6 @@ class PreparedLayer:
             if self.attention.mode == "prefill":
                 self.attention.commit(metadata.lengths, records, metadata)
             att_a = self.cr_att_0.finish(p_att_a, out_b)
-            observations = {}
         else:
             if pipelined_attn_hc:
                 mlp_a, prev_res_a, prev_post_a, prev_comb_a, p_mlp_b, prev_res_b, prev_post_b, prev_comb_b = incoming
@@ -1454,7 +1436,6 @@ class PreparedLayer:
                     residual, post, comb, normalized = self.attention_hc(*incoming, pre_mix=pre_mix, pre_out=attn_mix)
             else:
                 (residual, post, comb, normalized), attn_mix = boundary
-            attention_normalized = normalized
             pending_engram = None
             if engram_overlap is not None:
                 prepare_engram, cr_engram, bounds, engram_state, use_gather = engram_overlap
@@ -1466,7 +1447,7 @@ class PreparedLayer:
                 begin, end = bounds
                 pending_engram = cr_engram.start(
                     engram_state["partial"][begin:end].clone(), dependencies=(normalized,))
-            attended, records, selection, observations = self.attention._run(normalized, metadata, selection,
+            attended, records, selection = self.attention(normalized, metadata, selection,
                 indices=indices, window_cache=window_cache)
             att_reduce_deps = ()
             if pending_engram is not None:
@@ -1537,11 +1518,7 @@ class PreparedLayer:
                 mlp_b = self.cr_mlp_1.finish(p_mlp_b, res_full)
                 mlp_full = torch.cat((mlp_a, mlp_b), dim=0)
                 incoming = (mlp_full, res_full, post_full, comb_full)
-            observations = {"attention." + key: value for key, value in observations.items()}
-            observations.update({"attention_hc.normalized": attention_normalized,
-                                 "router.ids": torch.cat((route_a.ids, route_b.ids), dim=0),
-                                 "output": incoming[0]})
-            return incoming, next_mix, records, selection, observations
+            return incoming, next_mix, records, selection
 
         if getattr(self, "split_mhc", False):
             pending_attn_hc = self.attention_hc.start_sinkhorn(residual, attended)
@@ -1565,11 +1542,7 @@ class PreparedLayer:
             post, comb, next_mix = self.ffn_hc.finish_sinkhorn(pending_ffn_hc, output)
             incoming = ((self.post(output, residual, post, comb),) if self.post is not None
                         else (output, residual, post, comb))
-            observations = {"attention." + key: value for key, value in observations.items()}
-            observations.update({"attention_hc.normalized": attention_normalized,
-                                 "router.ids": route.ids,
-                                 "output": incoming[0]})
-            return incoming, next_mix, records, selection, observations
+            return incoming, next_mix, records, selection
 
         attention_output = (self.attention_reduce(attended, dependencies=att_reduce_deps)
                             if att_reduce_deps else self.attention_reduce(attended))
@@ -1587,10 +1560,7 @@ class PreparedLayer:
                   if getattr(self.mlp_reduce, "fused_addend", False) else self.mlp_reduce(routed + shared))
         incoming = ((self.post(output, residual, post, comb),) if self.post is not None
                     else (output, residual, post, comb))
-        observations = {"attention." + key: value for key, value in observations.items()}
-        observations.update({"attention_hc.normalized": attention_normalized, "router.ids": route.ids,
-                             "output": incoming[0]})
-        return incoming, next_mix, records, selection, observations
+        return incoming, next_mix, records, selection
 
 
 class PreparedDecoder:

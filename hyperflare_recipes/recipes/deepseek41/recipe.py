@@ -28,7 +28,6 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         prompt_logprobs=plan.prompt_logprobs,
         compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
         native_dense_activations=plan.native_dense_activations,
-        joint_tuning=plan.joint_tuning,
         lock_gpu_clocks=plan.lock_gpu_clocks and plan.autotune_effort != "off",
         image_concurrency=plan.image_concurrency,
         devices=tuple(range(plan.world_size)) if ranks is None else (0,) * plan.world_size,
@@ -69,7 +68,7 @@ RECIPE = Recipe(
     max_draft_tokens=7, max_images=4, image_bytes=32 << 20,
     # Single-row decode runs the shared expert on an auxiliary stream.
     stream_overlap=True,
-    joint_tuning=True, vocabulary_parallel_world_sizes=(4, 6),
+    vocabulary_parallel_world_sizes=(4, 6),
     row_shard_prefill_world_sizes=(4,),
     **({"replicated_attention_bytes": replicated_attention_bytes}
        if "replicated_attention_bytes" in Recipe.__dataclass_fields__ else {}),

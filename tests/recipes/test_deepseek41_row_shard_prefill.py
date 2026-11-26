@@ -31,7 +31,7 @@ def _sm120_gpus(count: int, capability: tuple[int, int] = (12, 0)) -> tuple[Gpu,
     )
 
 
-def _make_plan(*, gpus: tuple[Gpu, ...], row_shard_prefill: bool, joint_tuning: bool = False) -> Plan:
+def _make_plan(*, gpus: tuple[Gpu, ...], row_shard_prefill: bool) -> Plan:
     return Plan(
         recipe=ds_recipe.RECIPE,
         checkpoint=ds_recipe.RECIPE.checkpoints[0],
@@ -46,12 +46,11 @@ def _make_plan(*, gpus: tuple[Gpu, ...], row_shard_prefill: bool, joint_tuning: 
         weights_bytes=1,
         graph_bytes=1,
         image_concurrency=4,
-        joint_tuning=joint_tuning,
         row_shard_prefill=row_shard_prefill,
     )
 
 
-def test_recipe_and_plan_gate_row_shard_prefill_to_tp4_without_joint_tuning(monkeypatch):
+def test_recipe_and_plan_gate_row_shard_prefill_to_tp4(monkeypatch):
     assert ds_recipe.RECIPE.row_shard_prefill_world_sizes == (4,)
 
     default_cfg = PreparationConfig()
@@ -61,7 +60,7 @@ def test_recipe_and_plan_gate_row_shard_prefill_to_tp4_without_joint_tuning(monk
         with pytest.raises(TypeError, match="row_shard_prefill must be a boolean"):
             PreparationConfig(row_shard_prefill=invalid)
 
-    valid_plan = _make_plan(gpus=_sm120_gpus(4), row_shard_prefill=True, joint_tuning=False)
+    valid_plan = _make_plan(gpus=_sm120_gpus(4), row_shard_prefill=True)
     assert valid_plan.row_shard_prefill is True
 
     captured = {}
@@ -83,15 +82,12 @@ def test_recipe_and_plan_gate_row_shard_prefill_to_tp4_without_joint_tuning(monk
     assert result == "prepared"
     assert captured["config"].row_shard_prefill is True
 
-    with pytest.raises(UsageError, match="--row-shard-prefill cannot be combined with --joint-tuning"):
-        _make_plan(gpus=_sm120_gpus(4), row_shard_prefill=True, joint_tuning=True)
-
     for world in (3, 6):
         with pytest.raises(UsageError, match="--row-shard-prefill is not supported at TP"):
-            _make_plan(gpus=_sm120_gpus(world), row_shard_prefill=True, joint_tuning=False)
+            _make_plan(gpus=_sm120_gpus(world), row_shard_prefill=True)
 
     with pytest.raises(UsageError, match="not qualified on SM103"):
-        _make_plan(gpus=_sm120_gpus(4, capability=(10, 3)), row_shard_prefill=True, joint_tuning=False)
+        _make_plan(gpus=_sm120_gpus(4, capability=(10, 3)), row_shard_prefill=True)
 
 
 class _FakeDmaRuntime:
@@ -444,10 +440,9 @@ def test_prepared_layer_row_shard_clamps_partial_tails_and_reconstructs_mxfp8_sc
             inc_b = torch.ones((shard_tokens, 4, hidden), dtype=torch.bfloat16)
             pm_a = torch.zeros((shard_tokens, 4), dtype=torch.float32)
             pm_b = torch.zeros((shard_tokens, 4), dtype=torch.float32)
-            (_, _), _, _, _, obs = layer._run_row_shard_dma(
+            (_, _), _, _, _ = layer._run_row_shard_dma(
                 (inc_a, inc_b), (pm_a, pm_b), metadata, "indices", ("sel", None, None)
             )
-            assert obs["router.ids"].shape == (tokens, top_k)
 
         for rank in range(world):
             call_a = router_calls[2 * rank]

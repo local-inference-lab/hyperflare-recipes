@@ -755,16 +755,6 @@ Standalone proposal, verification, and joined wider speculative graphs are not
 registered in the packed catalog. Image preprocessing preserves the checkpoint's
 row-major patch layout and 1024-token image limit.
 
-`--joint-tuning` enables joint selection of QKV projection, query normalization,
-and query expansion plans. It covers every prepared text execution shape,
-including prefill, ordinary decode, width-one continuations, packed target
-verification, and DSpark proposals. Matching operator declarations share a
-selection scored across their layer contexts; distinct declarations are tuned
-independently. Batch capacity, physical token capacity, attention mode, and mHC
-seams determine the measured contexts. The option defaults to off and requires
-MXFP8 query normalization on the selected GPUs and `--autotune-effort default`
-or `audit`. It adds preparation time without changing the serving graph catalog.
-
 `--speculative-token-capacity` bounds physical target rows;
 `--speculative-graph-budget` independently controls the number of packed rounds.
 For each power-of-two request bucket `B`, the catalog retains capacities
@@ -942,7 +932,7 @@ For a TP4, single-request configuration with seven drafts, run:
   --max-concurrency 1 --mtp-draft-tokens 7 --speculative-token-capacity 8 \
   --prefill-chunk-size 4096 --expert-scale-compression native --mla-compute-mode bf16 \
   --draft-head-quantization nvfp4 --markov-head-quantization fp8 \
-  --vocabulary-parallel-sampling --joint-tuning
+  --vocabulary-parallel-sampling
 ```
 
 Use a fresh weight export when first enabling this option: the Markov head's

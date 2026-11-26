@@ -192,7 +192,6 @@ def test_replicated_attention_layer_schedule_and_exact_byte_accounting(monkeypat
         weights_bytes=1,
         graph_bytes=1,
         image_concurrency=4,
-        joint_tuning=False,
         row_shard_prefill=True,
     )
     ds_recipe.prepare("/tmp/snap", base_plan, compile_forwards=True, kernel_cache=None, progress=None)
@@ -214,7 +213,6 @@ def test_replicated_attention_layer_schedule_and_exact_byte_accounting(monkeypat
             weights_bytes=1,
             graph_bytes=1,
             image_concurrency=4,
-            joint_tuning=False,
             row_shard_prefill=True,
             row_shard_attention=True,
         )
@@ -235,7 +233,6 @@ def test_replicated_attention_layer_schedule_and_exact_byte_accounting(monkeypat
                 weights_bytes=1,
                 graph_bytes=1,
                 image_concurrency=4,
-                joint_tuning=False,
                 row_shard_prefill=False,
                 row_shard_attention=True,
             )
@@ -1426,7 +1423,7 @@ def test_mla_wo_row_shard_dma_schedule_and_engram_ffn_window_overlap(monkeypatch
     else:
         incoming = (torch.zeros((st, 4, hidden), dtype=torch.bfloat16), torch.zeros((st, 4, hidden), dtype=torch.bfloat16))
 
-    _, _, _, out_sel, _ = layer._run_row_shard_dma(
+    _, _, _, out_sel = layer._run_row_shard_dma(
         incoming, pm, metadata, "indices", ((None, None), None, None),
         ffn_engram_overlaps=ffn_overlaps, engram_project=(fake_engram, engram_state),
     )
