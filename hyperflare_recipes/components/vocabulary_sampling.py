@@ -74,7 +74,7 @@ def _score_tiles(
     tile, lane_row = tl.program_id(0), tl.program_id(1)
     position = STEP if SAMPLE else lane_row % WIDTH
     request_row = lane_row if SAMPLE else lane_row // WIDTH
-    partial = Partials + lane_row * 5 * BLOCKS + tile
+    partial = Partials + lane_row * 6 * BLOCKS + tile
     if HAS_LIMITS:
         limit = tl.load(Limits + request_row)
         active = (position < limit - 1) if SAMPLE else (position < limit)
@@ -84,6 +84,7 @@ def _score_tiles(
             tl.store(partial + 2 * BLOCKS, -float("inf"))
             tl.store(partial + 3 * BLOCKS, 0.0)
             tl.store(partial + 4 * BLOCKS, 1.0)
+            tl.store(partial + 5 * BLOCKS, 0.0)
             return
     local_id = tile * BLOCK + tl.arange(0, BLOCK)
     global_id = tl.load(VocabularyOffset) + local_id
@@ -123,7 +124,9 @@ def _score_tiles(
         invalid |= (tl.load(Params + slot * 6 + 1) != 1) | (tl.load(Params + slot * 6 + 2) != 0)
     maximum = tl.max(value, 0)
     stable_max = tl.where(tl.abs(maximum) < float("inf"), maximum, 0.0)
-    mass = tl.sum(tl.exp(value - stable_max), 0)
+    exp_val = tl.exp(value - stable_max)
+    mass = tl.sum(exp_val, 0)
+    mass2 = tl.sum(exp_val * exp_val, 0)
     choice = value
     if SAMPLE:
         choice += _token_noise(tl.load(Seeds + request_row), tl.load(Offsets + request_row) + 4 * STEP, global_id)
@@ -135,6 +138,7 @@ def _score_tiles(
     tl.store(partial + 2 * BLOCKS, tl.max(choice, 0))
     tl.store(partial + 3 * BLOCKS, (tl.load(VocabularyOffset) + tile * BLOCK + winner).to(tl.float32))
     tl.store(partial + 4 * BLOCKS, invalid.to(tl.float32))
+    tl.store(partial + 5 * BLOCKS, mass2)
 
 
 @triton.jit
@@ -196,12 +200,13 @@ def _score_tiles_markov_batched(
             for i in tl.static_range(ROWS_PER_CTA):
                 row = r_base + i
                 if row < BATCH:
-                    partial = Partials + row * 5 * BLOCKS + tile
+                    partial = Partials + row * 6 * BLOCKS + tile
                     tl.store(partial, -float("inf"))
                     tl.store(partial + BLOCKS, 0.0)
                     tl.store(partial + 2 * BLOCKS, -float("inf"))
                     tl.store(partial + 3 * BLOCKS, 0.0)
                     tl.store(partial + 4 * BLOCKS, 1.0)
+                    tl.store(partial + 5 * BLOCKS, 0.0)
             return
 
     vocab_offset = tl.load(VocabularyOffset)
@@ -237,7 +242,7 @@ def _score_tiles_markov_batched(
     for i in tl.static_range(ROWS_PER_CTA):
         request_row = r_base + i
         if request_row < BATCH:
-            partial = Partials + request_row * 5 * BLOCKS + tile
+            partial = Partials + request_row * 6 * BLOCKS + tile
             row_active = True
             if HAS_LIMITS:
                 row_active = STEP < tl.load(Limits + request_row) - 1
@@ -247,6 +252,7 @@ def _score_tiles_markov_batched(
                 tl.store(partial + 2 * BLOCKS, -float("inf"))
                 tl.store(partial + 3 * BLOCKS, 0.0)
                 tl.store(partial + 4 * BLOCKS, 1.0)
+                tl.store(partial + 5 * BLOCKS, 0.0)
             else:
                 present = present_base
                 bias = tl.sum(tl.where(cols[None, :] == i, acc, 0.0), axis=1)
@@ -288,7 +294,9 @@ def _score_tiles_markov_batched(
                     )
                 maximum = tl.max(value, 0)
                 stable_max = tl.where(tl.abs(maximum) < float("inf"), maximum, 0.0)
-                mass = tl.sum(tl.exp(value - stable_max), 0)
+                exp_val = tl.exp(value - stable_max)
+                mass = tl.sum(exp_val, 0)
+                mass2 = tl.sum(exp_val * exp_val, 0)
                 choice = value + _token_noise(
                     tl.load(Seeds + request_row), tl.load(Offsets + request_row) + 4 * STEP, global_id
                 )
@@ -299,18 +307,22 @@ def _score_tiles_markov_batched(
                 tl.store(partial + 2 * BLOCKS, tl.max(choice, 0))
                 tl.store(partial + 3 * BLOCKS, (vocab_offset + tile * BLOCK + winner).to(tl.float32))
                 tl.store(partial + 4 * BLOCKS, invalid.to(tl.float32))
+                tl.store(partial + 5 * BLOCKS, mass2)
 
 
 @triton.jit
 def _softmax_records(Partials, Summary, BLOCKS: tl.constexpr, PAD: tl.constexpr):
     row = tl.program_id(0)
     tile = tl.arange(0, PAD)
-    base = Partials + row * 5 * BLOCKS + tile
+    base = Partials + row * 6 * BLOCKS + tile
     maxima = tl.load(base, tile < BLOCKS, other=-float("inf"))
     weights = tl.load(base + BLOCKS, tile < BLOCKS, other=0.0)
+    weights2 = tl.load(base + 5 * BLOCKS, tile < BLOCKS, other=0.0)
     maximum = tl.max(maxima, 0)
     origin = tl.where(tl.abs(maximum) < float("inf"), maximum, 0.0)
-    mass = tl.sum(weights * tl.exp(maxima - origin), 0)
+    scale = tl.exp(maxima - origin)
+    mass = tl.sum(weights * scale, 0)
+    mass2 = tl.sum(weights2 * scale * scale, 0)
     candidates = tl.load(base + 2 * BLOCKS, tile < BLOCKS, other=-float("inf"))
     selected = tl.argmax(candidates, 0, tie_break_left=True)
     ids = tl.load(base + 3 * BLOCKS, tile < BLOCKS, other=0.0)
@@ -323,7 +335,15 @@ def _softmax_records(Partials, Summary, BLOCKS: tl.constexpr, PAD: tl.constexpr)
         tl.where(
             word == 1,
             mass,
-            tl.where(word == 2, tl.max(candidates, 0), tl.where(word == 3, identifier, tl.where(word == 4, bad, 0.0))),
+            tl.where(
+                word == 2,
+                tl.max(candidates, 0),
+                tl.where(
+                    word == 3,
+                    identifier,
+                    tl.where(word == 4, bad, tl.where(word == 5, mass2, 0.0)),
+                ),
+            ),
         ),
     )
     tl.store(Summary + row * _WORDS + word, record)
@@ -337,6 +357,7 @@ def _finish_distribution(
     Valid,
     Tokens,
     TileMass,
+    Confidence,
     Limits,
     Slots,
     Generations,
@@ -358,6 +379,7 @@ def _finish_distribution(
     RANK_PAD: tl.constexpr,
     HAS_MASSES: tl.constexpr = False,
     HAS_LIMITS: tl.constexpr = False,
+    HAS_CONFIDENCE: tl.constexpr = False,
 ):
     tile, distribution = tl.program_id(0), tl.program_id(1)
     row = distribution if SAMPLE else distribution // WIDTH
@@ -372,6 +394,8 @@ def _finish_distribution(
                 tl.store(Valid + row * WIDTH + position, False)
                 if SAMPLE:
                     tl.store(Tokens + row * WIDTH + position, 0)
+                if HAS_CONFIDENCE:
+                    tl.store(Confidence + row * WIDTH + position, 0.0)
             return
     rank = tl.arange(0, RANK_PAD)
     records = Gathered + (distribution * WORLD + rank) * _WORDS
@@ -379,7 +403,8 @@ def _finish_distribution(
     masses = tl.load(records + 1, rank < WORLD, other=0.0)
     maximum = tl.max(maxima, 0)
     origin = tl.where(tl.abs(maximum) < float("inf"), maximum, 0.0)
-    total = tl.sum(masses * tl.exp(maxima - origin), 0)
+    scale = tl.exp(maxima - origin)
+    total = tl.sum(masses * scale, 0)
     invalid = tl.sum(tl.load(records + 4, rank < WORLD, other=0.0), 0)
     valid = (
         (tl.abs(maximum) < float("inf"))
@@ -418,6 +443,12 @@ def _finish_distribution(
         tl.store(Valid + row * WIDTH + position, valid)
         if SAMPLE:
             tl.store(Tokens + row * WIDTH + position, tl.where(valid, token, 0))
+        if HAS_CONFIDENCE:
+            masses2 = tl.load(records + 5, rank < WORLD, other=0.0)
+            total2 = tl.sum(masses2 * scale * scale, 0)
+            denom = tl.where(total > 0.0, total * total, 1.0)
+            conf = tl.minimum(tl.maximum(total2 / denom, 0.0), 1.0)
+            tl.store(Confidence + row * WIDTH + position, tl.where(valid, conf, 0.0))
 
 
 @triton.jit
@@ -707,6 +738,7 @@ class PreparedVocabularySoftmax:
         tokens=None,
         tile_masses=None,
         token_limits=None,
+        confidence=None,
     ):
         if logits.ndim != 3 or logits.dtype not in (torch.bfloat16, torch.float32) or logits.stride(-1) != 1:
             raise ValueError("vocabulary logits require BF16/FP32 [batch,width,local vocabulary]")
@@ -733,6 +765,8 @@ class PreparedVocabularySoftmax:
             _tensor(tile_masses, (b, w, blocks), torch.float32, device, "tile probability masses")
         if token_limits is not None:
             _tensor(token_limits, (b,), torch.int32, device, "token limits")
+        if confidence is not None:
+            _tensor(confidence, (b, w), torch.float32, device, "distribution confidence")
         self.markov = embedding is not None
         fp8 = isinstance(head, RowScaledFP8MarkovWeight)
         values = head.values if fp8 else head
@@ -766,6 +800,7 @@ class PreparedVocabularySoftmax:
         self.logits, self.probabilities, self.valid = logits, probabilities, valid
         self.tile_masses, self.has_masses = tile_masses, tile_masses is not None
         self.limits, self.has_token_limits = token_limits, token_limits is not None
+        self.confidence, self.has_confidence = confidence, confidence is not None
         self.state, self.slots, self.generations, self.live_rows = requests, slots, generations, live_rows
         self.candidates, self.start, self.world, self.batch, self.width, self.local = (
             candidates,
@@ -783,7 +818,7 @@ class PreparedVocabularySoftmax:
         summary_rows = b if sample else b * w
         self.scratch = bind_scratch(
             dict(
-                partials=((summary_rows, 5, blocks), torch.float32),
+                partials=((summary_rows, 6, blocks), torch.float32),
                 summary=((summary_rows, SUMMARY_WORDS), torch.float32),
                 gathered=((summary_rows, world * SUMMARY_WORDS), torch.float32),
             ),
@@ -890,6 +925,7 @@ class PreparedVocabularySoftmax:
                     self.valid,
                     self.tokens,
                     self.tile_masses,
+                    self.confidence,
                     self.limits,
                     self.slots,
                     self.generations,
@@ -913,6 +949,7 @@ class PreparedVocabularySoftmax:
                 RANK_PAD=triton.next_power_of_2(self.world),
                 HAS_MASSES=self.has_masses,
                 HAS_LIMITS=self.has_token_limits,
+                HAS_CONFIDENCE=self.has_confidence,
                 num_warps=4,
                 enable_fp_fusion=False,
             )
@@ -925,7 +962,7 @@ class PreparedVocabularySoftmax:
         values = dict(self.scratch, logits=self.logits, probabilities=self.probabilities,
             valid=self.valid, candidates=self.candidates, pending=self.pending,
             seeds=self.seeds, offsets=self.offsets, tokens=self.tokens,
-            tile_masses=self.tile_masses, limits=self.limits)
+            tile_masses=self.tile_masses, limits=self.limits, confidence=self.confidence)
         self.local_layout = {name: (tuple(value.shape), value.dtype) for name, value in values.items()
                              if value is not None}
         names = {id(value): name for name, value in values.items() if value is not None}
@@ -936,37 +973,39 @@ class PreparedVocabularySoftmax:
                 operation.args = tuple(None if id(value) in names else value for value in operation.args)
         self.gather.functional(session=session)
         self.logits = self.probabilities = self.valid = self.candidates = self.pending = None
-        self.seeds = self.offsets = self.tokens = self.scratch = self.tile_masses = self.limits = None
+        self.seeds = self.offsets = self.tokens = self.scratch = self.tile_masses = self.limits = self.confidence = None
         return self
 
     def run(self, logits, candidates, *, pending=None, seeds=None, offsets=None,
-            probabilities=None, valid=None, tokens=None, tile_masses=None, token_limits=None):
+            probabilities=None, valid=None, tokens=None, tile_masses=None, token_limits=None, confidence=None):
         return self._run_steps(self.steps, logits, candidates, pending=pending, seeds=seeds,
             offsets=offsets, probabilities=probabilities, valid=valid, tokens=tokens,
-            tile_masses=tile_masses, token_limits=token_limits)
+            tile_masses=tile_masses, token_limits=token_limits, confidence=confidence)
 
     def run_step(self, step, logits, candidates, *, pending=None, seeds=None, offsets=None,
-                 probabilities=None, valid=None, tokens=None, tile_masses=None, token_limits=None):
+                 probabilities=None, valid=None, tokens=None, tile_masses=None, token_limits=None, confidence=None):
         """Draw one prepared position after its recurrent correction becomes available."""
         if not self.sample or not 0 <= step < self.width:
             raise ValueError("a proposal step must select one prepared sampling position")
         return self._run_steps(self.steps[step:step + 1], logits, candidates, pending=pending,
             seeds=seeds, offsets=offsets, probabilities=probabilities, valid=valid, tokens=tokens,
-            tile_masses=tile_masses, token_limits=token_limits)
+            tile_masses=tile_masses, token_limits=token_limits, confidence=confidence)
 
     def _run_steps(self, steps, logits, candidates, *, pending, seeds, offsets, probabilities, valid, tokens,
-                   tile_masses=None, token_limits=None):
+                   tile_masses=None, token_limits=None, confidence=None):
         if (token_limits is not None) != self.has_token_limits:
             raise ValueError("vocabulary distribution token limits must match the prepared mask contract")
         if self.has_masses and tile_masses is None:
             raise ValueError("vocabulary distribution requires caller-owned tile_masses when prepared with masses")
+        if self.has_confidence and confidence is None:
+            raise ValueError("vocabulary distribution requires caller-owned confidence when prepared with confidence")
         local = {name: torch.empty(shape, dtype=dtype, device=logits.device)
                  for name, (shape, dtype) in self.local_layout.items()
-                 if name not in ("logits", "candidates", "pending", "seeds", "offsets", "limits", "tile_masses")}
+                 if name not in ("logits", "candidates", "pending", "seeds", "offsets", "limits", "tile_masses", "confidence")}
         local.update(logits=logits, candidates=candidates, pending=pending, seeds=seeds, offsets=offsets,
                      limits=token_limits)
         for name, value in (("probabilities", probabilities), ("valid", valid), ("tokens", tokens),
-                            ("tile_masses", tile_masses)):
+                            ("tile_masses", tile_masses), ("confidence", confidence)):
             if value is not None:
                 local[name] = value
         for score, summary, normalize in steps:

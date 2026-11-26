@@ -34,6 +34,7 @@ from .attention import (
     PreparedGlobalKV, Rotary, ShardAttentionInputs, normalize,
 )
 from .decoder_prefill import PreparedDecoderSuffix
+from .config import DFly2Config
 from .engram import EngramScratch, PreparedEngram, PreparedTableRequests
 
 
@@ -360,7 +361,7 @@ class PreparedLayer:
                  window_metadata=None, examples=None, pipelined_ffn=False, pipelined_attn_hc=False,
                  defer_mlp_b=False, defer_engram_reduce=False, pipelined_attn=None,
                  row_shard_dma=False, shard_rows=None, replicated_attention=None,
-                 kv_runtime=None, engram_min_gather_chunks=1):
+                 kv_runtime=None, engram_min_gather_chunks=1, dfly_target_layer=None):
         s, text = scratch, pool.config.text
         self.scratch, self.carry = s, carry
         self.metadata = metadata
@@ -533,7 +534,8 @@ class PreparedLayer:
             window_metadata=window_metadata, examples=examples, pipelined_mode=self.pipelined_attn,
             qkv_encoded=attn_qkv_encoded,
             shard_tokens=self.shard_tokens if self.row_shard_attention else None,
-            replicated_weights=replicated_attention if self.row_shard_attention else None)
+            replicated_weights=replicated_attention if self.row_shard_attention else None,
+            dfly_target_layer=dfly_target_layer)
         if self.row_shard_dma:
             st = self.shard_tokens
             self.attention_reduce = None
@@ -1605,11 +1607,25 @@ class PreparedDecoder:
             self.output_scratch = examples[output_key]
         if suffix_runtime is not None and not _runtime_accepts(suffix_runtime, self.output_scratch.attention.output):
             suffix_runtime = None
-        self.aux_layers = () if (self.encoder_only or weights.draft is None) else weights.config.draft.target_layers
-        if self.packing is not None and any(layer <= decoder_start for layer in self.aux_layers):
-            raise ValueError("bounded decoder feedback requires draft target layers after its global-KV boundary")
-        self.auxiliary_shape = (0, 0) if self.encoder_only else (self.output_metadata.token_ids.numel(), len(self.aux_layers) * 5120)
-        self.auxiliary = None if self.encoder_only else torch.zeros(self.auxiliary_shape, dtype=torch.bfloat16, device=metadata.positions.device)
+        self.dfly2_indices = (not self.encoder_only and weights.draft is not None
+                              and isinstance(weights.config.draft, DFly2Config))
+        if self.dfly2_indices:
+            self.aux_layers = ()
+            self.index_capture_layers = weights.config.draft.target_index_layers
+            if self.packing is not None and any(layer <= decoder_start for layer in self.index_capture_layers):
+                raise ValueError("bounded decoder index capture requires DFly2 layers after its global-KV boundary")
+            self.auxiliary_shape = (self.output_metadata.token_ids.numel(), len(self.index_capture_layers),
+                                    weights.config.draft.index_topk)
+            self.auxiliary_dtype = torch.int32
+            self.auxiliary = torch.zeros(self.auxiliary_shape, dtype=torch.int32, device=metadata.positions.device)
+        else:
+            self.index_capture_layers = ()
+            self.aux_layers = () if (self.encoder_only or weights.draft is None) else weights.config.draft.target_layers
+            if self.packing is not None and any(layer <= decoder_start for layer in self.aux_layers):
+                raise ValueError("bounded decoder feedback requires draft target layers after its global-KV boundary")
+            self.auxiliary_shape = (0, 0) if self.encoder_only else (self.output_metadata.token_ids.numel(), len(self.aux_layers) * 5120)
+            self.auxiliary_dtype = torch.bfloat16
+            self.auxiliary = None if self.encoder_only else torch.zeros(self.auxiliary_shape, dtype=torch.bfloat16, device=metadata.positions.device)
         self.safe_tokens = torch.zeros_like(metadata.token_ids) if self.vision is not None else metadata.token_ids
         self.embedding = PreparedEmbedding(weights.embedding, self.safe_tokens, scratch.embedding,
             num_rows=metadata.live_counts[:1], session=session, name=name + ".embedding").functional(session=session, dynamic_inputs=True)
@@ -1997,7 +2013,8 @@ class PreparedDecoder:
         )
         staging = (None if self.staging_shape is None else torch.empty(
             self.staging_shape, dtype=torch.uint8, device=embedding.device))
-        auxiliary = None if self.encoder_only else torch.empty(self.auxiliary_shape, dtype=torch.bfloat16, device=embedding.device)
+        auxiliary = (None if self.encoder_only
+                     else torch.empty(self.auxiliary_shape, dtype=self.auxiliary_dtype, device=embedding.device))
         suffix, records = None, []
         has_image_mask = any(layer.has_image_mask for layer in self.layers)
         image_mask = metadata.token_ids >= 129280 if has_image_mask else None
@@ -2052,6 +2069,9 @@ class PreparedDecoder:
                 boundary=boundary, window_cache=None if staging is None else staging[index],
                 image_mask=image_mask, engram_projected=engram_projected, engram_gathered=engram_gathered,
                 engram_overlap=engram_overlap, engram_project=engram_project, **layer_kw)
+            if self.index_capture_layers and index in self.index_capture_layers:
+                column = self.index_capture_layers.index(index)
+                auxiliary[:, column, :].copy_(selection[0])
             records.append(record)
         if self.encoder_only:
             self.encoder_boundary(incoming, pre_mix, metadata, indices)

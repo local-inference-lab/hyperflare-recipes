@@ -384,7 +384,7 @@ class DraftQuantizationParameters(ParameterGroup):
         scope=ParameterScope.DRAFT_WEIGHT,
         requires_speculation=True,
         default_label="checkpoint precision",
-        help="prepare eligible DFlash2 draft-body projections as MXFP8 independently of"
+        help="prepare eligible DFlash2 or DFly2 draft-body projections as MXFP8 independently of"
              " target and proposal-head precision",
     )
     markov_head_quantization: str | None = param(
@@ -418,8 +418,8 @@ class DraftQuantizationParameters(ParameterGroup):
                 if label == "--draft-body-quantization":
                     raise UsageError("draft body quantization requires positive learned draft depth")
                 raise UsageError("draft head quantization requires positive learned draft depth")
-        if self.draft_body_quantization is not None and spec is not None and spec.method != "dflash2":
-            raise UsageError("--draft-body-quantization requires --speculative-method dflash2")
+        if self.draft_body_quantization is not None and spec is not None and spec.method not in ("dflash2", "dfly2"):
+            raise UsageError("--draft-body-quantization requires --speculative-method dflash2 or dfly2")
 
     def manifest_parameters(self, context: ParameterContext) -> list[tuple[str, ParameterScope, Any]]:
         if context.root is None or context.root.speculation is None:

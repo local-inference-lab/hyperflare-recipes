@@ -44,8 +44,13 @@ class PreparedPackedSpeculativeRound:
         self.confidence_output = confidence_output
         device = o.pool.backing.device
         confidence = torch.empty((b, s.width - 1), dtype=torch.float32, device=device)
-        self.confidence_head = PreparedDraftConfidence(s, o.weights.draft.confidence_head, confidence,
-            name=name + ".confidence_head", bias=getattr(o.weights.draft, "confidence_bias", None))
+        if getattr(o.weights.draft, "confidence_head", None) is not None:
+            self.confidence_head = PreparedDraftConfidence(s, o.weights.draft.confidence_head, confidence,
+                name=name + ".confidence_head", bias=getattr(o.weights.draft, "confidence_bias", None))
+        else:
+            if not getattr(s, "distribution_confidence", False):
+                raise ValueError("packed GPU verification without a confidence head requires vocabulary-parallel distribution confidence")
+            self.confidence_head = None
         validation_input = torch.empty((2, o.requests.capacity), dtype=torch.bfloat16, device=device)
         self.validation_shape = tuple(validation_input.shape)
         self.validation = PreparedAllReduce(validation_input, torch.empty_like(validation_input),
@@ -75,7 +80,7 @@ class PreparedPackedSpeculativeRound:
         probabilities = torch.empty(s.probability_shape, dtype=torch.float32, device=slots.device)
         proposal = s.propose(advance_rng=False, probabilities=probabilities)
         s.commit_draft_rng(proposal=proposal)
-        confidence = self.confidence_head(proposal)
+        confidence = proposal.confidence if self.confidence_head is None else self.confidence_head(proposal)
         source_valid = (proposal.active & torch.isfinite(confidence).all(1)
                         & (confidence >= 0).all(1) & (confidence <= 1).all(1))
         self.broadcast((confidence,))

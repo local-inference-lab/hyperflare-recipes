@@ -28,7 +28,9 @@ def page_bytes(config):
     return sum(shape[0] for _, shape in page_specs(config))
 
 
-def continuation_layout(config, *, dspark=False):
+def continuation_layout(config, *, dspark=False, dfly2=False):
+    if dspark and dfly2:
+        raise ValueError("continuation layout cannot enable both DSpark and DFly2 regions")
     regions = [(f"layer{i}.window", (config.text["sliding_window"] * SWA_RECORD_BYTES,), torch.uint8)
                for i in range(config.layers)]
     for source in config.sources:
@@ -42,6 +44,9 @@ def continuation_layout(config, *, dspark=False):
     if dspark:
         regions.extend((f"draft{i}.window", (128 * SWA_RECORD_BYTES,), torch.uint8)
                        for i in range(config.draft.layers))
+    elif dfly2:
+        regions.extend((f"draft_index{i}", (config.draft.index_topk,), torch.int32)
+                       for i in range(len(config.draft.target_index_layers)))
     regions.extend((
         ("last_hidden", (config.text["hidden_size"],), torch.bfloat16),
         ("consumed_tokens", (1,), torch.int64),
@@ -56,8 +61,8 @@ class ContinuationPool(PagedStateStorage):
 
     @classmethod
     def allocate(cls, config, slots, pages, device, *, storage=None, maximum_pages=None, maximum_rows=None,
-                 backed_slots=None, dspark=False):
-        backing = PagedStateStorage.allocate(continuation_layout(config, dspark=dspark), page_specs(config),
+                 backed_slots=None, dspark=False, dfly2=False):
+        backing = PagedStateStorage.allocate(continuation_layout(config, dspark=dspark, dfly2=dfly2), page_specs(config),
             slots, pages, device, storage=storage, maximum_pages=maximum_pages, maximum_rows=maximum_rows,
             backed_slots=backed_slots)
         return cls(backing.backing, backing.layout, backing.memory_capacity,
@@ -67,3 +72,5 @@ class ContinuationPool(PagedStateStorage):
         """Expose the reserved row extent to cache writers; admission bounds physical rows."""
         return self.reserved_region(f"{'draft' if draft else 'layer'}{layer}.window")
 
+    def draft_index(self, ordinal):
+        return self.region(f"draft_index{ordinal}")

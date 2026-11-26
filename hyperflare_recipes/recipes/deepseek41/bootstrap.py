@@ -53,7 +53,10 @@ from ignition.progress import phase
 from hyperflare_recipes.components.paged_batch import BatchInputs, Metadata, PreparedBatch
 from .recipe import DeepSeek41Parameters, RECIPE
 from .attention import INDEXER_QUERY_ROWS
+from .config import DFly2Config
 from .decoder import PreparedDecoder, Scratch, DraftScratch
+from .dfly2 import PreparedDFly2Context, PreparedDFly2Draft
+from .dfly2_weights import DFly2Weights
 from hyperflare_recipes.components.dspark import PreparedContext, PreparedMarkov
 from .dspark import PreparedDraft
 from .engram import Tables
@@ -66,6 +69,7 @@ from ignition.preparation.bootstrap import BasePreparationConfig
 
 
 _CONTEXT = partial(PreparedContext, compact_prefill=True)
+_CONTEXT_DFLY2 = partial(PreparedDFly2Context, compact_prefill=True)
 
 
 def _default_parameters() -> DeepSeek41Parameters:
@@ -96,13 +100,18 @@ def _prepare_draft(*args, draft_vocabulary_runtime, vocabulary_runtime=None, **k
 
 def _forward_factories(mla_compute_mode, *, vision,
                        draft_vocabulary_runtime=None, kv_runtime=None, examples=None,
-                       row_shard_prefill=False, row_shard_attention=False):
+                       row_shard_prefill=False, row_shard_attention=False, dfly2=False):
     """Bind attention arithmetic and the proposal head's BF16 gather channel."""
+    draft_factory = (
+        partial(PreparedDFly2Draft, mla_compute_mode=mla_compute_mode, examples=examples)
+        if dfly2 else
+        partial(_prepare_draft, draft_vocabulary_runtime=draft_vocabulary_runtime,
+                mla_compute_mode=mla_compute_mode, examples=examples)
+    )
     return (partial(PreparedDecoder, vision=vision, mla_compute_mode=mla_compute_mode,
                     kv_runtime=kv_runtime, examples=examples, row_shard_prefill=row_shard_prefill,
                     row_shard_attention=row_shard_attention),
-            partial(_prepare_draft, draft_vocabulary_runtime=draft_vocabulary_runtime,
-                    mla_compute_mode=mla_compute_mode, examples=examples))
+            draft_factory)
 
 
 @dataclass(frozen=True)
@@ -115,6 +124,7 @@ class PreparationConfig(BasePreparationConfig):
     minimum_pages: int = 8
     # An explicit cache capacity makes memory comparisons independent of automatic sizing.
     kv_pages: int | None = None
+    draft_checkpoint: str | None = None
     speculation_reference_graphs: bool = False
 
     @property
@@ -124,6 +134,14 @@ class PreparationConfig(BasePreparationConfig):
     @property
     def dspark(self) -> bool:
         return self.parameters.speculation is not None
+
+    @property
+    def speculative_method(self) -> str | None:
+        return None if self.parameters.speculation is None else self.parameters.speculation.method
+
+    @property
+    def draft_body_quantization(self) -> str | None:
+        return self.parameters.draft_quantization.draft_body_quantization
 
     @property
     def draft_head_quantization(self) -> str | None:
@@ -170,14 +188,32 @@ class PreparationConfig(BasePreparationConfig):
     def __post_init__(self):
         if not isinstance(self.parameters, DeepSeek41Parameters):
             raise TypeError("DeepSeek V4.1 PreparationConfig requires DeepSeek41Parameters")
+        if self.speculative_method not in (None, "dspark", "dfly2"):
+            raise ValueError("DeepSeek V4.1 speculative method must be None, 'dspark', or 'dfly2'")
         if self.mtp_only and (not self.dspark
                 or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
             raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
-        if (self.draft_head_quantization is not None or self.markov_head_quantization is not None) and (
-                not self.dspark or self.draft_tokens < 1):
+        if (self.draft_head_quantization is not None or self.markov_head_quantization is not None
+                or self.draft_body_quantization is not None) and (not self.dspark or self.draft_tokens < 1):
             raise ValueError("draft precision overrides require positive learned draft depth")
-        if self.speculative_widths and max(self.speculative_widths) > 8:
-            raise ValueError("DeepSeek V4.1 draft model supports at most seven draft tokens")
+        if self.is_dfly2:
+            if not self.draft_tokens:
+                raise ValueError("DeepSeek V4.1 DFly2 requires positive draft depth")
+            if max(self.speculative_widths) > 6:
+                raise ValueError("DeepSeek V4.1 DFly2-B6 supports at most five draft tokens")
+            if not self.draft_checkpoint:
+                raise ValueError("DeepSeek V4.1 DFly2 requires a resolved draft checkpoint")
+            if not self.vocabulary_parallel_sampling:
+                raise ValueError("DeepSeek V4.1 DFly2 requires --vocabulary-parallel-sampling")
+            if self.markov_head_quantization is not None:
+                raise ValueError("DeepSeek V4.1 DFly2 has no Markov transition head")
+            if self.draft_body_quantization not in (None, "mxfp8"):
+                raise ValueError("DeepSeek V4.1 DFly2 draft body quantization must be None or 'mxfp8'")
+        else:
+            if self.speculative_widths and max(self.speculative_widths) > 8:
+                raise ValueError("DeepSeek V4.1 draft model supports at most seven draft tokens")
+            if self.draft_body_quantization is not None:
+                raise ValueError("DeepSeek V4.1 draft body quantization requires --speculative-method dfly2")
         from hyperflare_recipes.components.compressed_mla import validate_mla_compute_mode
 
         validate_mla_compute_mode(self.mla_compute_mode)
@@ -252,12 +288,20 @@ class PreparationConfig(BasePreparationConfig):
         return max(self.request_capacity, max((tokens for _, tokens in self.packed_speculative_shapes), default=0))
 
     @property
+    def is_dfly2(self):
+        return self.dspark and self.speculative_method == "dfly2"
+
+    @property
     def draft_tokens(self):
         return max(self.speculative_widths) - 1 if self.dspark else 0
 
     @property
+    def draft_block_size(self):
+        return (self.draft_tokens + 1) if self.is_dfly2 else self.draft_tokens
+
+    @property
     def all_reduce_tokens(self):
-        return max(self.decode_tokens, self.request_capacity * self.draft_tokens,
+        return max(self.decode_tokens, self.request_capacity * self.draft_block_size,
                    *(capacity for capacity in self.prefill_capacities if capacity < 512))
 
     @property
@@ -315,8 +359,8 @@ def _prepare_speculation_catalog(config, speculation, *, add, buffers,
 
 def _collective_runtimes(config, group, device, *, coordinator, core_storage, verification_samples):
     """Share one RoCE channel across ordered graph collectives on separate hosts."""
-    tokens = max(config.prefill_chunk_size, config.decode_tokens, config.request_capacity * config.draft_tokens)
-    sample_rows = max(verification_samples, config.request_capacity * config.draft_tokens)
+    tokens = max(config.prefill_chunk_size, config.decode_tokens, config.request_capacity * config.draft_block_size)
+    sample_rows = max(verification_samples, config.request_capacity * config.draft_block_size)
     layouts = ()
     if config.dspark:
         from hyperflare_recipes.components.draft_sampling import PreparedDraftBlockBroadcast
@@ -347,7 +391,7 @@ def _collective_runtimes(config, group, device, *, coordinator, core_storage, ve
     vocabulary = create_all_gather_runtime(group, device, max_rows=sample_rows,
         columns=local_vocab * len(config.devices) * 2, ipc=ipc)
     draft_vocabulary = (create_all_gather_runtime(group, device, max_rows=sample_rows,
-        columns=local_vocab * len(config.devices), ipc=ipc) if config.dspark else None)
+        columns=local_vocab * len(config.devices), ipc=ipc) if (config.dspark and not config.is_dfly2) else None)
     result = create_result_broadcast_runtime(group, device, layouts=layouts, ipc=ipc) if layouts else None
     return collective, prefill, vocabulary, result, draft_vocabulary
 
@@ -392,15 +436,41 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         and not coordinator.spans_hosts
         and max(config.prefill_capacities, default=0) >= 512
     )
+    dfly_identity = None
     with core_storage.transient():
-        weights = ModelWeights.load(manifest, device, shard=shard, progress=progress, dspark=config.dspark,
-                                    confidence=config.draft_tokens > 0,
+        weights = ModelWeights.load(manifest, device, shard=shard, progress=progress,
+                                    dspark=config.dspark and not config.is_dfly2,
+                                    confidence=config.draft_tokens > 0 and not config.is_dfly2,
                                     expert_scale_compression=config.expert_scale_compression,
-                                    draft_head_quantization=config.draft_head_quantization,
-                                    markov_head_quantization=config.markov_head_quantization,
+                                    draft_head_quantization=None if config.is_dfly2 else config.draft_head_quantization,
+                                    markov_head_quantization=None if config.is_dfly2 else config.markov_head_quantization,
                                     vocabulary_parallel_sampling=config.vocabulary_parallel_sampling,
                                     engram_full_projection=load_engram_full,
                                     row_shard_attention=config.row_shard_attention)
+        if config.is_dfly2:
+            dfly_snapshot = Path(config.draft_checkpoint).resolve()
+            dfly_manifest = inspect_indexed_checkpoint(dfly_snapshot)
+            dfly_identity = {
+                "config": json.loads((dfly_manifest.metadata_path / "config.json").read_text()),
+                "headers": [s.header_sha256 for s in dfly_manifest.shards],
+                "body_quantization": config.draft_body_quantization,
+                "head_quantization": config.draft_head_quantization,
+            }
+            del dfly_manifest
+            dfly_cfg = DFly2Config.load(dfly_snapshot, weights.config)
+            dfly_model_cfg = replace(weights.config, draft_override=dfly_cfg)
+            dfly_weights = DFly2Weights.load(
+                dfly_snapshot, dfly_model_cfg, device, shard=shard, target_head=weights.head,
+                progress=progress, expert_scale_compression=config.expert_scale_compression,
+                draft_head_quantization=config.draft_head_quantization,
+                draft_body_quantization=config.draft_body_quantization,
+            )
+            weights = replace(
+                weights,
+                config=dfly_model_cfg,
+                draft=dfly_weights,
+                allocated_bytes=weights.allocated_bytes + dfly_weights.allocated_bytes,
+            )
         release_unused()
     if progress is not None:
         progress("Target head: BF16 checkpoint weights with FP32 accumulation and logits")
@@ -413,7 +483,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
     tables = Tables.prepare(manifest, weights.config, tokens=max(config.prefill_chunk_size, config.decode_tokens),
         device=device, sequence=sequence, frame=frame, host_allocator=core_storage.host_allocate, progress=progress, shard=shard)
     with phase(progress, "Allocate model state and collectives"):
-        layout = continuation_layout(weights.config, dspark=config.dspark)
+        layout = continuation_layout(weights.config, dspark=config.dspark and not config.is_dfly2, dfly2=config.is_dfly2)
         snapshots = layout.snapshot_capacity(config.snapshot_budget_bytes)
         if snapshots < 1:
             raise ValueError("snapshot budget must hold a complete DeepSeek continuation")
@@ -428,7 +498,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         pool = ContinuationPool.allocate(weights.config, state_rows + 1, pages, device,
             storage=core_storage, maximum_pages=total_memory // bytes_per_page,
             maximum_rows=total_memory // layout.row_bytes,
-            backed_slots=min(state_rows + 1, 1 + execution_rows + slots), dspark=config.dspark)
+            backed_slots=min(state_rows + 1, 1 + execution_rows + slots),
+            dspark=config.dspark and not config.is_dfly2, dfly2=config.is_dfly2)
         requests = DeviceRequestState.allocate(device, vocab_size=129280, capacity=slots)
         inputs = BatchInputs.allocate(config.prefill_chunk_size, blocks, device, capacity=slots)
         admission = AdmissionBuffers.allocate(device, vocab_size=129280, capacity=slots)
@@ -450,9 +521,13 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                 group, device, max_rows=verification_samples, columns=512 * shard.world_size,
                 ipc=core_storage.peer_storage))
         tables = replace(tables, readiness_runtime=collective)
-        identity = hashlib.sha256(json.dumps({"config": json.loads((metadata_path / "config.json").read_text()),
+        identity_payload = {"config": json.loads((metadata_path / "config.json").read_text()),
             "headers": [s.header_sha256 for s in manifest.shards], "world_size": shard.world_size,
-            "contract": "deepseek41.graph-inputs.v1"}, sort_keys=True).encode()).hexdigest()
+            "contract": "deepseek41.graph-inputs.v1"}
+        if dfly_identity is not None:
+            identity_payload["speculative_method"] = "dfly2"
+            identity_payload["dfly2"] = dfly_identity
+        identity = hashlib.sha256(json.dumps(identity_payload, sort_keys=True).encode()).hexdigest()
         session = RecordedPreparationSession(
             compile_workers=config.compile_workers, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
             native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
@@ -491,7 +566,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             draft_vocabulary_runtime=draft_vocabulary_collective,
             kv_runtime=kv_collective, examples=examples,
             row_shard_prefill=config.row_shard_prefill,
-            row_shard_attention=config.row_shard_attention)
+            row_shard_attention=config.row_shard_attention,
+            dfly2=config.is_dfly2)
         buffers = dict(inputs.buffers(), **tables.buffers(), **commands.buffers(), **{
             name: getattr(admission, name) for name in admission.__dataclass_fields__},
             state_pool=pool.backing, memory_capacity=pool.memory_capacity,
@@ -512,8 +588,14 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                 block_proposal_broadcast=True,
                 vocabulary_parallel_sampling=config.vocabulary_parallel_sampling,
                 sampling_runtime=sampling_collective, logprob_runtime=logprob_collective,
-                forwards=DSparkForwards(decoder_factory, DraftScratch, _CONTEXT,
-                    draft_factory, PreparedMarkov))
+                forwards=DSparkForwards(
+                    decoder_factory, DraftScratch,
+                    _CONTEXT_DFLY2 if config.is_dfly2 else _CONTEXT,
+                    draft_factory,
+                    None if config.is_dfly2 else PreparedMarkov,
+                ),
+                block_size=config.draft_block_size if config.is_dfly2 else None,
+                logit_offset=1 if config.is_dfly2 else 0)
 
     scoring = PromptScoring.allocate(config, device, buffers, frame=frame, group=group,
         ipc=core_storage.peer_storage, runtime=collective, coordinator=coordinator)
@@ -578,9 +660,14 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                             input_vocabulary=INPUT_VOCABULARY if vision_state is not None else None,
                             validate_prefill=vision_state.validate_prefill if vision_state is not None and mode == "prefill" else None,
                             )
+                        ctx_factory = (
+                            (PreparedDFly2Context if graph_kind == "scored_prefill" else _CONTEXT_DFLY2)
+                            if config.is_dfly2 else
+                            (PreparedContext if graph_kind == "scored_prefill" else _CONTEXT)
+                        )
                         forward = PreparedGeneration(decoder, batch, completion, frame, sequence, runtime=collective,
                             coordinator=coordinator, session=session, name=name + ".generation", workspace=arena,
-                            context_factory=PreparedContext if graph_kind == "scored_prefill" else _CONTEXT,
+                            context_factory=ctx_factory,
                             sample=sample)
                         fields = (*forward_inputs, "vision_token_indices", "vision_feature_slot") if mode == "prefill" and vision_state is not None else forward_inputs
                         add(name, forward, graph_kind, rows, capacity if mode == "prefill" else 1, fields, enabled=enabled)
@@ -678,6 +765,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         "mla_compute_mode": config.mla_compute_mode,
         "row_shard_prefill": config.row_shard_prefill,
         "row_shard_attention": config.row_shard_attention,
+        "speculative_method": config.speculative_method,
+        "draft_body_quantization": config.draft_body_quantization,
         "draft_head_quantization": config.draft_head_quantization,
         "markov_head_quantization": config.markov_head_quantization,
         "vocabulary_parallel_sampling": config.vocabulary_parallel_sampling,

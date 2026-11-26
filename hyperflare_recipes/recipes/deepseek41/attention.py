@@ -17,7 +17,7 @@ from b12x.preparation import PreparedCall
 from hyperflare_recipes.components import sm103_projection
 from hyperflare_recipes.components.compressed_mla import PreparedCompressedCacheWriter, PreparedCompressedMLA
 from hyperflare_recipes.components.attention_output import PreparedGroupedOutputProjection
-from hyperflare_recipes.components.linear import QuantizedProjection, UnquantizedProjection
+from hyperflare_recipes.components.linear import BatchedUnquantizedProjection, QuantizedProjection, UnquantizedProjection
 from hyperflare_recipes.components.mla_norm_quant import PreparedMLANormQuant
 from hyperflare_recipes.components.mxfp4_indexer import PreparedMXFP4Indexer
 from hyperflare_recipes.components.projection_overlap import (
@@ -518,14 +518,53 @@ def _commit_window(Staged, Window, State, Starts, Lengths, STRIDE: tl.constexpr,
     tl.store(Window + row * STRIDE + ((start + token) % 128) * 528 + offset, value, valid)
 
 
+class PreparedBF16GroupedOutputProjection:
+    """BF16 grouped low-rank attention output projection with inverse RoPE."""
+
+    def __init__(self, source, weights, output, *, session, name, angles=None):
+        self.groups = int(weights["groups"])
+        self.angles = angles
+        tokens, _, head_dim = source.shape
+        group_width = source.shape[1] * head_dim // self.groups
+        rank = weights["wo_a"].shape[0] // self.groups
+        wo_a_g = weights["wo_a"].view(self.groups, rank, group_width).transpose(1, 2).contiguous()
+        self.mid_shape = (self.groups, tokens, rank)
+        mid = torch.zeros(self.mid_shape, dtype=torch.bfloat16, device=source.device)
+        flat = torch.zeros((tokens, self.groups * rank), dtype=torch.bfloat16, device=source.device)
+        self.wo_a = BatchedUnquantizedProjection(
+            torch.zeros((self.groups, tokens, group_width), dtype=torch.bfloat16, device=source.device),
+            wo_a_g, mid, major="n", session=session, name=name + ".wo_a",
+        )
+        self.wo_b = UnquantizedProjection(flat, weights["wo_b"], output, session=session, name=name + ".wo_b")
+        self.plan = self.wo_b.plan
+
+    def functional(self, *, session):
+        self.wo_a.functional(session=session)
+        self.wo_b.functional(session=session)
+        return self
+
+    def __call__(self, source, *, positions=None, cos_sin_cache=None):
+        del positions
+        x = source.clone() if self.angles is not None else source
+        if self.angles is not None:
+            self.angles.apply(x, cos_sin_cache, inverse=True)
+        tokens = x.shape[0]
+        grouped = x.reshape(tokens, self.groups, -1).transpose(0, 1).contiguous()
+        mid = self.wo_a(grouped).transpose(0, 1).contiguous().reshape(tokens, -1)
+        return self.wo_b(mid)
+
+
 class PreparedAttention:
     def __init__(self, layer, weights, source, scratch, metadata, pool, rotary, *, mode,
                  world, session, name, workspace, replay_start=None, window_staging=None,
                  mla_compute_mode="auto", window_metadata=None, examples=None, pipelined_mode=None,
-                 qkv_encoded=None, shard_tokens=None, replicated_weights=None):
+                 qkv_encoded=None, shard_tokens=None, replicated_weights=None, dfly_target_layer=None):
         self.layer, self.weights, self.scratch, self.metadata = layer, weights, scratch, metadata
         self.pool, self.rotary, self.mode = pool, rotary, mode
         self.replay_start = replay_start
+        self.dfly_target_layer = dfly_target_layer
+        if dfly_target_layer is not None and mode != "draft":
+            raise ValueError("dfly_target_layer is only valid in draft attention mode")
         if pipelined_mode not in (None, "full", "mla_wo"):
             raise ValueError(f"unsupported pipelined attention mode: {pipelined_mode!r}")
         if qkv_encoded is not None and pipelined_mode != "full":
@@ -548,7 +587,10 @@ class PreparedAttention:
         config = pool.config
         draft = mode == "draft"
         self.ratio = 0 if draft else config.text["compress_ratios"][layer]
-        self.source = None if draft else config.source(layer)
+        self.source = (config.source(dfly_target_layer) if dfly_target_layer is not None
+                       else (None if draft else config.source(layer)))
+        self.dfly_indexed = dfly_target_layer is not None
+        self.use_compressed_rope = bool(self.ratio) or self.dfly_indexed
         self.eps = config.text["rms_norm_eps"]
         tokens, device = source.shape[0], source.device
         if pipelined_mode is not None and (tokens < 2 or tokens % 2 != 0):
@@ -588,7 +630,8 @@ class PreparedAttention:
         def zeros(shape, dtype):
             return torch.zeros(shape, dtype=dtype, device=device)
         self.window_page_size = 128 if mode == "decode" else 128 + metadata.max_query_tokens
-        self.window = pool.window(layer, draft=draft)
+        self.window = (pool.window(dfly_target_layer, draft=False) if dfly_target_layer is not None
+                       else pool.window(layer, draft=draft))
         if window_staging is not None:
             if (mode != "verify" or window_staging.shape != (rows, self.window_page_size * 528)
                     or window_staging.dtype != torch.uint8 or window_staging.device != device
@@ -615,7 +658,7 @@ class PreparedAttention:
         self.window_indices = window_metadata.window_indices
         self.window_lengths = window_metadata.window_lengths
         self.token_offsets = window_metadata.token_offsets
-        self.angles = window_metadata.rotary_angles(rotary, compressed=bool(self.ratio), ratio=0)
+        self.angles = window_metadata.rotary_angles(rotary, compressed=self.use_compressed_rope, ratio=0)
         self.index_angles = (window_metadata.rotary_angles(rotary, compressed=True, ratio=0)
                              if "index_q" in weights else None)
         geometry = window_metadata.compressed(self.ratio) if self.ratio else None
@@ -651,6 +694,10 @@ class PreparedAttention:
             ("qkv_a", weights["qkv_a"], source[:prefix_tokens], scratch.projected[:prefix_tokens]),
             ("q_b", q_b_weight, scratch.query_low[:prefix_tokens], query_buf.view(prefix_tokens, -1)),
         ):
+            if isinstance(w, torch.Tensor):
+                self.projections[key] = UnquantizedProjection(values, w, out,
+                    session=session, name=f"{name}.{key}")
+                continue
             packed_mxfp8 = use_b12x_mxfp8 and isinstance(
                 getattr(w, "weight", None), mxfp8.MXFP8Rows)
             use_quantized_seam = packed_mxfp8 and not use_a16_qkv
@@ -681,13 +728,18 @@ class PreparedAttention:
             self.window_norm = (PreparedRMSNorm(scratch.projected[:prefix_tokens, 1280:], weights["kv_norm"],
                 scratch.window_values[:prefix_tokens], eps=self.eps, session=session, name=name + ".kv_norm")
                 if self.norm_quant is None else None)
-        self.output_projection = PreparedGroupedOutputProjection(
-            attended_buf, output_weight, scratch.output[:mla_tokens],
-            session=session, name=name + ".output", workspace=workspace,
-            inv_rope=self.angles is not None,
-            heads_per_group=attended_buf.shape[1] // getattr(output_weight, "groups", 1),
-            nope_dim=448, rope_dim=64, positions=self.token_offsets[:mla_tokens],
-            cos_sin_cache=None if self.angles is None else self.angles.values[:mla_tokens])
+        if isinstance(output_weight, dict):
+            self.output_projection = PreparedBF16GroupedOutputProjection(
+                attended_buf, output_weight, scratch.output[:mla_tokens],
+                session=session, name=name + ".output", angles=self.angles)
+        else:
+            self.output_projection = PreparedGroupedOutputProjection(
+                attended_buf, output_weight, scratch.output[:mla_tokens],
+                session=session, name=name + ".output", workspace=workspace,
+                inv_rope=self.angles is not None,
+                heads_per_group=attended_buf.shape[1] // getattr(output_weight, "groups", 1),
+                nope_dim=448, rope_dim=64, positions=self.token_offsets[:mla_tokens],
+                cos_sin_cache=None if self.angles is None else self.angles.values[:mla_tokens])
         self.window_writer = PreparedCompressedCacheWriter(scratch.window_values[:window_tokens], self.window_cache,
             self.window_slots[:window_tokens], page_size=self.window_page_size, kind="swa", session=session,
             name=f"{name}.window_write",
@@ -728,10 +780,11 @@ class PreparedAttention:
                     page_size=128 // self.ratio, session=session, name=f"{name}.index{first}", workspace=workspace,
                     mode="prefill" if mode == "prefill" else "decode", **candidates)
                 self.selectors.append(selector)
-        indexed = {} if not self.ratio else dict(indexed=pool.pages[f"layer{self.source.layer}.latent_page"],
+        indexed = ({} if (not self.ratio and not self.dfly_indexed) else dict(
+            indexed=pool.pages[f"layer{self.source.layer}.latent_page"],
             indexed_indices=scratch.selected[:mla_tokens], indexed_lengths=self.index_lengths[:mla_tokens],
             page_table=self.page_table[:mla_tokens],
-            indexed_page_size=128 // self.ratio)
+            indexed_page_size=128 // (1 if self.dfly_indexed else self.ratio)))
         self.attention = PreparedCompressedMLA(query_buf[:mla_tokens], self.window_cache,
             self.window_indices[:mla_tokens], self.window_lengths[:mla_tokens], sink_weight,
             attended_buf,
@@ -748,6 +801,7 @@ class PreparedAttention:
         if (mode in ("decode", "verify", "draft") and not (mode == "decode" and tokens == 1)
                 and isinstance(workspace, ScratchArena) and workspace.overlap
                 and self.angles is not None and self.angles.split
+                and isinstance(self.projections["q_b"], QuantizedProjection)
                 and not (self.projections["q_b"].encoded is not None
                          and self.projections["q_b"].quantizer_plan is not None)):
             overlap_indexer = (self.global_kv is not None and bool(self.selectors)
@@ -806,6 +860,7 @@ class PreparedAttention:
     def _finalize_standalone_rope(self):
         if (not self.row_shard_attention and self.concurrent_query is None
                 and self.angles is not None and self.angles.split
+                and isinstance(self.projections["q_b"], QuantizedProjection)
                 and self.projections["q_b"].encoded is None
                 and self.projections["q_b"].encoded_layout is None):
             self.q_b_fused_rope = register_tc_gemv_rope(
@@ -1145,11 +1200,12 @@ class PreparedAttention:
         if self.mode == "prefill":
             gather_rows(self.window, m.state_rows, window_cache[:, :128 * 528])
         qkv = self.projections["qkv_a"]
-        qkv_encoded_bases = (None if qkv.encoded_layout is None else tuple(
+        qkv_encoded_bases = (None if getattr(qkv, "encoded_layout", None) is None else tuple(
             torch.empty(shape, dtype=dtype, device=source.device) for shape, dtype in qkv.encoded_layout))
-        projected = qkv(source, encoded_bases=qkv_encoded_bases)
+        projected = (qkv(source, encoded_bases=qkv_encoded_bases) if isinstance(qkv, QuantizedProjection)
+                     else qkv(source))
         encoded_bases = None
-        layer_angles = indices.angles[(bool(self.ratio), 0)]
+        layer_angles = indices.angles[(self.use_compressed_rope, 0)]
         if self.fused_qkv_norm_rope:
             query_low, window_values = _q_kv_norm_rope(
                 projected, self.q_norm_weight, self.kv_norm_weight, layer_angles, self.eps)
@@ -1172,7 +1228,9 @@ class PreparedAttention:
                 query = run_mxfp8_projection_rope(
                     self.projections["q_b"], query_low, layer_angles, head_dim=512).view(self.query_shape)
             else:
-                query = self.projections["q_b"](query_low, encoded_bases=encoded_bases).view(self.query_shape)
+                qb = self.projections["q_b"]
+                query = (qb(query_low, encoded_bases=encoded_bases) if isinstance(qb, QuantizedProjection)
+                         else qb(query_low)).view(self.query_shape)
                 self.angles.apply(query, layer_angles)
         self.window_writer(window_values, indices.window_slots,
                            history_rows=m.state_rows if self.mode in ("verify", "draft") else None, cache=window_cache)
@@ -1226,10 +1284,15 @@ class PreparedAttention:
                 dependency = selected
         if self.concurrent_query is not None and not joined_query:
             query = self.concurrent_query.finish(pending, dependency).view(self.query_shape)
-        attended = self.attention(query, indices.window_indices, indices.window_lengths,
-            indexed_indices=selected if self.ratio else None,
-            indexed_lengths=geometry.index_lengths if self.ratio else None,
-            page_table=m.token_page_table if self.ratio else None, window=window_cache)
+        if self.dfly_indexed:
+            attended = self.attention(query, indices.window_indices, indices.window_lengths,
+                indexed_indices=selected, indexed_lengths=candidates,
+                page_table=m.token_page_table, window=window_cache)
+        else:
+            attended = self.attention(query, indices.window_indices, indices.window_lengths,
+                indexed_indices=selected if self.ratio else None,
+                indexed_lengths=geometry.index_lengths if self.ratio else None,
+                page_table=m.token_page_table if self.ratio else None, window=window_cache)
         output = self.output_projection(attended, positions=self.token_offsets, cos_sin_cache=layer_angles)
         record = window_cache, records
         if self.mode == "prefill":

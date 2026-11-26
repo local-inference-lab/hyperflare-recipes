@@ -7,10 +7,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
-from ignition.declaration import Checkpoint, RankCosts, RankUsage, Recipe, SamplingDefaults, SamplingRange
+from ignition.declaration import (
+    Checkpoint, RankCosts, RankUsage, Recipe, SamplingDefaults, SamplingRange, SpeculativeMethod,
+)
 from ignition.errors import UsageError
 from ignition.parameters import (
     ParameterContext,
@@ -29,7 +32,21 @@ from hyperflare_recipes.parameters import (
     NativeDenseActivationsParameters,
     StreamOverlapParameters,
 )
-from .config import replicated_attention_bytes
+from .config import DFLY2_REPOSITORY, DFLY2_REVISION, replicated_attention_bytes
+
+
+def _resolve_dfly2_checkpoint(snapshot, plan):
+    local = Path(snapshot) / "dfly2"
+    if (local / "config.json").is_file():
+        return str(local)
+    from huggingface_hub import snapshot_download
+
+    return str(snapshot_download(
+        DFLY2_REPOSITORY,
+        revision=DFLY2_REVISION,
+        cache_dir=plan.hub_cache,
+        allow_patterns=("config.json", "model.safetensors*", "*.index.json"),
+    ))
 
 
 @dataclass(frozen=True)
@@ -41,6 +58,7 @@ class DeepSeek41Parameters(RecipeParameters):
     expert_scale_compression: ExpertScaleCompressionParameters = ExpertScaleCompressionParameters(encoding="csf")
     draft_quantization: DraftQuantizationParameters = DraftQuantizationParameters(
         draft_head_choices=("nvfp4", "mxfp8"),
+        draft_body_choices=("mxfp8",),
         markov_head_choices=("nvfp4", "fp8"),
     )
     mla_compute_mode: str = param(
@@ -110,6 +128,17 @@ class DeepSeek41Parameters(RecipeParameters):
 
     def validate(self, context: ParameterContext) -> None:
         super().validate(context)
+        if self.speculation is not None and self.speculation.method == "dfly2":
+            if self.speculation.draft_tokens < 1:
+                raise UsageError("DeepSeek V4.1 DFly2 requires positive draft depth")
+            if self.speculation.draft_tokens > 5:
+                raise UsageError("DeepSeek V4.1 DFly2-B6 supports at most five draft tokens")
+            if not self.vocabulary_parallel_sampling:
+                raise UsageError("DeepSeek V4.1 DFly2 requires --vocabulary-parallel-sampling")
+            if self.draft_quantization.markov_head_quantization is not None:
+                raise UsageError("DeepSeek V4.1 DFly2 has no Markov transition head")
+        elif self.draft_quantization.draft_body_quantization is not None:
+            raise UsageError("DeepSeek V4.1 draft body quantization requires --speculative-method dfly2")
         if self.vocabulary_parallel_sampling:
             if self.speculation is None or self.speculation.draft_tokens < 1:
                 raise UsageError("vocabulary-parallel sampling requires positive learned draft depth")
@@ -179,6 +208,11 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
     from ignition.preparation.rank_group import prepare_group
     from .bootstrap import PreparationConfig, prepare_rank
 
+    draft_checkpoint = (
+        _resolve_dfly2_checkpoint(snapshot, plan)
+        if plan.speculation is not None and plan.speculation.method == "dfly2"
+        else None
+    )
     config = PreparationConfig(
         **common_preparation_kwargs(
             plan, compile_forwards=compile_forwards, kernel_cache=kernel_cache, retain_graphs=retain_graphs,
@@ -186,6 +220,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         devices=tuple(range(plan.world_size)) if ranks is None else (0,) * plan.world_size,
         hosts=None if ranks is None else ranks.hosts,
         minimum_pages=plan.minimum_pages,
+        draft_checkpoint=draft_checkpoint,
     )
     return prepare_group(snapshot, config, prepare_rank, progress=progress, core_storage=core_storage,
                          ranks=ranks, checkpoint=plan.checkpoint)
@@ -200,6 +235,14 @@ RECIPE = Recipe(
     served_model_name="DeepSeek-V4.1-Flash",
     prepare=prepare,
     usage=usage,
+    speculative_methods=MappingProxyType({
+        "dspark": SpeculativeMethod(MappingProxyType({
+            world: RankCosts(3_043_840, 113_920, 8 << 30) for world in (3, 4, 6)
+        }), draft_bytes=7_932_874_632),
+        "dfly2": SpeculativeMethod(MappingProxyType({
+            world: RankCosts(2_847_232, 113_920, 8 << 30) for world in (3, 4, 6)
+        }), draft_bytes=8_847_248_264),
+    }),
     # Recommended sampling, including top-p 1.0: https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017#minimal-inference.
     # Repetition-penalty bounds enable measured use over prompt + output, matching vLLM/HF semantics.
     sampling_defaults=SamplingDefaults(

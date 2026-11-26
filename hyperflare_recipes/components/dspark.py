@@ -55,6 +55,8 @@ class SpeculativePreparation:
         vocabulary_parallel_sampling=False,
         sampling_runtime=None,
         logprob_runtime=None,
+        block_size=None,
+        logit_offset=0,
     ):
         self.forwards = forwards
         self.page_tokens = page_tokens
@@ -75,8 +77,8 @@ class SpeculativePreparation:
         self.generation = torch.zeros_like(requests.generation)
         self.offset = torch.zeros_like(requests.generation)
         draft = weights.config.draft
-        self.logit_offset = 0
-        self.block_size = max(1, draft_tokens)
+        self.logit_offset = logit_offset
+        self.block_size = max(1, draft_tokens) if block_size is None else block_size
         tokens = requests.capacity * self.block_size
         self.draft_scratch = forwards.scratch.allocate(
             tokens,

@@ -123,11 +123,75 @@ def replicated_attention_bytes(world_size, *, prompt_logprobs=False, mtp_only=Fa
     return len(layers) * replicated_attention_layer_bytes(config.text)
 
 
+DFLY2_REPOSITORY = "AngelSlim/DS-V4.1-Flash-DFly2-B6"
+DFLY2_REVISION = "d08e55a6897b1974307ea9771038838de5986e66"
+
+
+@dataclass(frozen=True)
+class DFly2Config:
+    layers: int
+    block_size: int
+    noise_token: int
+    target_kv_layers: tuple[int, ...]
+    target_index_layers: tuple[int, ...]
+    index_topk: int
+    experts: int
+    top_k: int
+    correction_intermediate: int
+    mtp_fusion: str
+    max_block_slots: int
+
+    @property
+    def target_layers(self):
+        return self.target_index_layers
+
+    @classmethod
+    def load(cls, checkpoint, target_config):
+        raw = json.loads((Path(checkpoint) / "config.json").read_text())
+        if raw.get("architectures") != ["DFlyDeepseekV41DraftModel"] or "dfly_config" not in raw:
+            raise ValueError("DeepSeek V4.1 DFly2 checkpoint requires DFlyDeepseekV41DraftModel with dfly_config")
+        dfly = raw["dfly_config"]
+        text = raw.get("text_config", target_config.text)
+        target_text = target_config.text
+        kv_layers = tuple(int(i) for i in dfly["target_kv_layers"])
+        index_layers = tuple(int(i) for i in dfly["target_index_layers"])
+        hc = dfly.get("hidden_correction") or {}
+        ac = dfly.get("attentive_correction") or {}
+        rope = dfly.get("rope") or {}
+        result = cls(
+            layers=len(kv_layers),
+            block_size=int(dfly["block_size"]),
+            noise_token=int(dfly["mask_token_id"]),
+            target_kv_layers=kv_layers,
+            target_index_layers=index_layers,
+            index_topk=int(dfly.get("index_topk", target_text["index_topk"])),
+            experts=128,
+            top_k=3,
+            correction_intermediate=int(hc.get("intermediate_size", target_text["hidden_size"])),
+            mtp_fusion=str(dfly.get("mtp_fusion", "slot0")),
+            max_block_slots=int(ac.get("max_block_slots", 16)),
+        )
+        if (result.layers != 3 or result.block_size != 6 or kv_layers != index_layers
+                or result.index_topk != target_text["index_topk"]
+                or not 0 <= result.noise_token < target_text["vocab_size"]
+                or result.mtp_fusion != "slot0"
+                or ac.get("source_layer") != -1 or not ac.get("block_keys")
+                or ac.get("block_mode") != "gated" or ac.get("block_kv_in") != "hidden_embed"
+                or bool(dfly.get("causal_block", False))
+                or float(rope.get("theta", 0.0)) != float(target_text["compress_rope_theta"])
+                or any(not 0 <= i < target_config.layers or target_text["compress_ratios"][i] != 1
+                       or i not in target_text["index_source_layer_ids"] for i in kv_layers)
+                or int(text.get("hidden_size", 0)) != target_text["hidden_size"]):
+            raise ValueError("unsupported DeepSeek V4.1 Flash DFly2 geometry")
+        return result
+
+
 @dataclass(frozen=True)
 class ModelConfig:
     text: dict
     quantization: dict
     vision: dict | None = None
+    draft_override: object | None = None
 
     @classmethod
     def load(cls, snapshot):
@@ -186,7 +250,7 @@ class ModelConfig:
 
     @property
     def draft(self):
-        return DSparkConfig.from_text(self.text)
+        return self.draft_override if self.draft_override is not None else DSparkConfig.from_text(self.text)
 
     @property
     def sources(self):
