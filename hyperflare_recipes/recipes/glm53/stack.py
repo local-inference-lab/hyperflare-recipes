@@ -10,7 +10,7 @@ import torch
 from b12x.comm import pcie
 from flashinfer.triton.norm import rms_norm
 
-from ignition.components.collectives import PreparedAllReduce, PreparedGatherShards, PreparedReduceScatter, row_shard_surfaces
+from ignition.components.collectives import PreparedAllReduce, PreparedGatherShards, PreparedReduceScatter, _roce, row_shard_surfaces
 from ignition.preparation.persistent import persistent_copy
 from ignition.preparation.scratch import ScratchArena
 from hyperflare_recipes.components.embedding import PreparedEmbedding
@@ -60,16 +60,18 @@ class RowShardExchangeScratch:
 
     @classmethod
     def allocate(cls, max_prefill_tokens, shard: TensorParallelShard, device, *,
-                 blocks=0, context=None, shared_slab=None):
+                 blocks=0, context=None, shared_slab=None, single_segment=False):
         half = max(max_prefill_tokens // 2, 1)
         rows = max(half // shard.world_size, 1)
         seg_tokens = rows * 2
+        mla_rows = seg_tokens if single_segment else rows
+        cache_full_rows = max_prefill_tokens if single_segment else half
         def zeros(*shape, dtype=torch.bfloat16):
             return torch.zeros(shape, dtype=dtype, device=device)
         mla_scratch = None
         if blocks > 0 and context is not None and context.records is not None:
             mla_scratch = MLAScratch.allocate_row_shard(
-                max_prefill_tokens, rows, blocks, device,
+                max_prefill_tokens, mla_rows, blocks, device,
                 context_ranks=context.shards.world, remote=context.remote,
                 gather_context=True, shared_slab=shared_slab)
         return cls(
@@ -79,8 +81,8 @@ class RowShardExchangeScratch:
             halo_full=zeros(ROW_SHARD_HALO_SHAPE[0] * 4, ROW_SHARD_HALO_SHAPE[1]),
             scan_sh=zeros(*ROW_SHARD_SCAN_SHAPE),
             scan_full=zeros(ROW_SHARD_SCAN_SHAPE[0] * 4, ROW_SHARD_SCAN_SHAPE[1]),
-            cache_sh=zeros(rows, 768),
-            cache_full=zeros(half, 768),
+            cache_sh=zeros(mla_rows, 768),
+            cache_full=zeros(cache_full_rows, 768),
             kda_scratch=KDAScratch.allocate(seg_tokens, 64, device),
             kda_seg_qkv=zeros(seg_tokens, 24768),
             kda_seg_beta=zeros(seg_tokens, 64),
@@ -153,7 +155,8 @@ def _prefill_shard_rows(enabled, mode, shard, runtime, scratch):
     tokens = scratch.embedding.shape[0]
     # Shard rows stay 128-aligned for the mHC and RMSNorm row tiles.
     if (not enabled or mode != "prefill" or shard.world_size != 4 or tokens < DMA_PREFILL_TOKENS
-            or tokens % (128 * shard.world_size) or not isinstance(runtime, pcie.DmaAllReduce)
+            or tokens % (128 * shard.world_size)
+            or not (isinstance(runtime, pcie.DmaAllReduce) or _roce(runtime))
             or not row_shard_surfaces(runtime)):
         return None
     rows = tokens // shard.world_size
@@ -348,8 +351,40 @@ class PreparedDecoder:
                 rows = self.shard_rows.numel()
                 # After embedding selection, all serial gathers can reuse its full-row declaration buffer.
                 gathered_input = scratch.embedding
+                replicated = getattr(weights, "replicated_attention", None)
+                use_row_shard_mla = (
+                    row_shard_attention and replicated is not None
+                    and context is not None and context.records is not None
+                    and any(idx % 4 == 3 for idx in replicated)
+                )
+                exchange = row_shard_exchange
+                if exchange is None and row_shard_attention and replicated is not None:
+                    exchange = RowShardExchangeScratch.allocate(
+                        self.tokens, weights.shard, self.device, single_segment=True)
+                use_row_shard_kda = (
+                    row_shard_attention and replicated is not None and exchange is not None
+                    and any(idx % 4 != 3 for idx in replicated)
+                    and PreparedGatherShards.fits(runtime, exchange.scan_sh, exchange.scan_full)
+                )
+                self.contiguous_shards = bool(use_row_shard_kda)
+                if use_row_shard_mla:
+                    if exchange is not None and exchange.mla_scratch is not None:
+                        mla_row_shard_scratch = exchange.mla_scratch.rows_row_shard(self.tokens, rows)
+                    else:
+                        mla_row_shard_scratch = MLAScratch.allocate_row_shard(
+                            self.tokens, rows, self.blocks, self.device,
+                            context_ranks=context.shards.world, remote=context.remote, gather_context=True,
+                            shared_slab=scratch.mla.slab)
+                if use_row_shard_kda:
+                    kda_row_shard_scratch = exchange.kda_scratch.rows(rows)
+                    kda_rank_index = exchange.kda_rank_index
+                    kda_segment_eye = exchange.kda_segment_eye
+                    kda_segment_pool = exchange.kda_segment_pool
+                    kda_local_conv = exchange.kda_local_conv
                 scratch = replace(scratch, residual=scratch.residual[:rows],
                     attention_hc=scratch.attention_hc.rows(rows), mlp_hc=scratch.mlp_hc.rows(rows),
+                    kda=kda_row_shard_scratch if use_row_shard_kda else scratch.kda,
+                    mla=mla_row_shard_scratch if use_row_shard_mla else scratch.mla,
                     attention_output=scratch.attention_output[:rows], mlp_output=scratch.mlp_output[:rows])
 
         replicated_map = getattr(weights, "replicated_attention", None) or {}
@@ -384,7 +419,7 @@ class PreparedDecoder:
             if progress is not None:
                 progress(f"declared {mode} layer {index + 1}/45")
 
-        if (self.pipelined and self.contiguous_shards and self.scoring is None
+        if ((self.pipelined or self.shard_rows is not None) and self.contiguous_shards and self.scoring is None
                 and self.sample_rows == 1 and boundary_runtime is not None
                 and kda_rank_index is not None and (not self.full_feedback or sharded_feedback)):
             self.sharded_final_norm = True
@@ -438,13 +473,20 @@ class PreparedDecoder:
             self.vision.inject(metadata, embedded)
         if self.pipelined:
             return self._call_pipelined(language, embedded, metadata, records=records)
+        pos_sh = None
         if self.shard_rows is not None:
             embedded = torch.index_select(embedded, 0, self.shard_rows)
+            if metadata.indexed is not None:
+                pos_sh = torch.index_select(metadata.indexed.positions, 0, self.shard_rows)
         value, carry = embedded[:, None, :].expand(-1, 4, -1).contiguous(), None
         for index, layer in enumerate(self.layers):
             layer_records = None if records is None or index not in records.layers else records.layer(index)
-            attention_metadata = metadata.indexed if layer.module.block_type == "indexed_attention" else metadata.recurrent
-            value, carry = layer(value, attention_metadata, carry, records=layer_records)
+            indexed = layer.module.block_type == "indexed_attention"
+            attention_metadata = metadata.indexed if indexed else metadata.recurrent
+            value, carry = layer(value, attention_metadata, carry, records=layer_records,
+                                 pos_sh=pos_sh if indexed else None)
+        if self.sharded_final_norm:
+            return self._finish_sharded_final_norm(language, value, metadata, records)
         auxiliary = None
         if self.final_gather is None and not self.full_feedback and self.scoring is None:
             selected = value[metadata.sample_indices]
@@ -499,27 +541,7 @@ class PreparedDecoder:
                 records=layer_records,
             )
         if self.sharded_final_norm:
-            out_sh = torch.cat(incoming, dim=0)
-            collapsed = language.hc_head(out_sh[:, None]).squeeze(1)
-            norm_sh = torch.empty_like(collapsed)
-            rms_norm(collapsed, language.norm.weight, norm_sh, language.norm.variance_epsilon,
-                round_before_weight=True)
-            shard_rows = norm_sh.shape[0]
-            idx = metadata.sample_indices[:1]
-            base = self.rank_index * shard_rows
-            in_shard = (idx >= base) & (idx < base + shard_rows)
-            local_idx = (idx - base).clamp(0, shard_rows - 1)
-            selected = torch.index_select(norm_sh, 0, local_idx)
-            local_sample = torch.where(in_shard.view(1, 1), selected, torch.zeros_like(selected))
-            boundary = torch.zeros((5, 4096), dtype=norm_sh.dtype, device=norm_sh.device)
-            boundary.index_copy_(0, self.rank_index, norm_sh[-1:])
-            boundary[4:5].copy_(local_sample)
-            reduced = self.final_boundary_reduce(boundary)
-            rank_tails = reduced[:4]
-            hidden = reduced[4:5]
-            auxiliary = (norm_sh, rank_tails) if self.full_feedback else None
-            logits = self.lm_head(hidden)
-            return hidden, logits, auxiliary, records
+            return self._finish_sharded_final_norm(language, torch.cat(incoming, dim=0), metadata, records)
         if self.mlp_quarters:
             out_0, out_1, out_2, out_3 = incoming
             out_a = torch.cat((out_0, out_1), dim=0)
@@ -548,5 +570,27 @@ class PreparedDecoder:
         hidden = normalized[metadata.sample_indices]
         if self.scoring is not None:
             self.scoring(auxiliary)
+        logits = self.lm_head(hidden)
+        return hidden, logits, auxiliary, records
+
+    def _finish_sharded_final_norm(self, language, out_sh, metadata, records):
+        collapsed = language.hc_head(out_sh[:, None]).squeeze(1)
+        norm_sh = torch.empty_like(collapsed)
+        rms_norm(collapsed, language.norm.weight, norm_sh, language.norm.variance_epsilon,
+            round_before_weight=True)
+        shard_rows = norm_sh.shape[0]
+        idx = metadata.sample_indices[:1]
+        base = self.rank_index * shard_rows
+        in_shard = (idx >= base) & (idx < base + shard_rows)
+        local_idx = (idx - base).clamp(0, shard_rows - 1)
+        selected = torch.index_select(norm_sh, 0, local_idx)
+        local_sample = torch.where(in_shard.view(1, 1), selected, torch.zeros_like(selected))
+        boundary = torch.zeros((5, 4096), dtype=norm_sh.dtype, device=norm_sh.device)
+        boundary.index_copy_(0, self.rank_index, norm_sh[-1:])
+        boundary[4:5].copy_(local_sample)
+        reduced = self.final_boundary_reduce(boundary)
+        rank_tails = reduced[:4]
+        hidden = reduced[4:5]
+        auxiliary = (norm_sh, rank_tails) if self.full_feedback else None
         logits = self.lm_head(hidden)
         return hidden, logits, auxiliary, records

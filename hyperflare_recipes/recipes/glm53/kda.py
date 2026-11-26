@@ -89,7 +89,7 @@ class PreparedGlmKDA:
                  metadata: DeltaMetadata, *, mode, session, name, workspace, checkpoint_export=False,
                  records=None, overlap_gate=True, row_shard=False, rank_index=None, segment_eye=None,
                  half_tokens=None, segment_pool=None, local_conv=None, seg_qkv=None, seg_beta=None,
-                 output_tokens=None):
+                 output_tokens=None, single_segment=False):
         if (source.ndim != 2 or source.shape[1] != 4096 or source.dtype != torch.bfloat16
                 or source.device.type != "cuda"):
             raise ValueError("GLM KDA requires BF16 [token_capacity, 4096] CUDA input")
@@ -99,6 +99,7 @@ class PreparedGlmKDA:
                 or module.o_norm.activation != "sigmoid" or module.forget_gate.safe_gate_lower_bound != -5.0):
             raise ValueError("canonical KDA geometry differs from GLM 5.3 Flash")
         self.row_shard = bool(row_shard)
+        self.single_segment = bool(single_segment) if self.row_shard else False
         self.tokens, self.device = source.shape[0], source.device
         self.output_tokens = self.tokens if output_tokens is None else int(output_tokens)
         self.sequences = metadata.query_start_loc.numel() - 1
@@ -118,7 +119,7 @@ class PreparedGlmKDA:
                 raise ValueError("row-owned KDA requires declaration segment buffers")
             self.heads = 64
             self.width = 8192
-            self.seg_tokens = self.tokens * 2
+            self.seg_tokens = self.tokens if self.single_segment else self.tokens * 2
             self.half_tokens = half_tokens
             self.rank_index = rank_index
             self.segment_eye = segment_eye
@@ -434,6 +435,10 @@ class PreparedGlmKDA:
             qkv = seg_projected[:, :24576]
             raw_g = seg_raw_g
             raw_beta = seg_projected[:, 24576:24640].contiguous()
+        elif qkv_b is None:
+            qkv = qkv_a
+            raw_g = raw_g_a
+            raw_beta = raw_beta_a.contiguous()
         else:
             qkv = torch.cat((qkv_a, qkv_b), dim=0)
             raw_g = torch.cat((raw_g_a, raw_g_b), dim=0)
@@ -531,6 +536,8 @@ class PreparedGlmKDA:
             checkpoint_offsets=zero_ckpt_off, num_seqs=ns_one, num_tokens=live_r,
             scratch=seg_scratch, pool=pool, output=rec_out,
         )
+        if self.single_segment:
+            return rec_out.contiguous(), live_r, s4, conv_all
         rec_a, rec_b = rec_out.split(self.tokens, dim=0)
         live_a = live_r.clamp(0, self.tokens).to(torch.int32)
         live_b = (live_r - self.tokens).clamp(0, self.tokens).to(torch.int32)

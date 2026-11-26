@@ -512,7 +512,8 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
                             if config.mtp else None)
         row_shard_exchange = (RowShardExchangeScratch.allocate(
                                   config.prefill_chunk_size, shard, device,
-                                  blocks=blocks, context=context, shared_slab=prefill_storage.mla.slab)
+                                  blocks=blocks, context=context, shared_slab=prefill_storage.mla.slab,
+                                  single_segment=remote)
                               if config.row_shard_attention and shard.world_size > 1 else None)
         for enabled in graph_modes:
             suffix = "-no-mtp" if config.mtp and not enabled else ""

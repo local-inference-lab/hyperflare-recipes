@@ -254,7 +254,12 @@ class PreparedGlmLayer:
                               mode=mode, collective=collective, session=session, name=name, workspace=workspace,
                               mlp_mhc=mlp_mhc, options=options, output=output, defer_post=defer_post,
                               gathered_input=gathered_input, max_cache_pages=max_cache_pages,
-                              context=context, kda_records=kda_records)
+                              context=context, kda_records=kda_records,
+                              row_shard_attention=row_shard_attention,
+                              replicated_attention=replicated_attention,
+                              rank_index=rank_index, segment_eye=segment_eye,
+                              kda_segment_pool=kda_segment_pool, kda_local_conv=kda_local_conv,
+                              row_shard_buffers=row_shard_buffers)
             return
 
         if gathered_input is None:
@@ -473,26 +478,97 @@ class PreparedGlmLayer:
 
     def _init_serial(self, module, attention_weights, mlp_weights, scratch, state, metadata, *,
                      mode, collective, session, name, workspace, mlp_mhc, options, output, defer_post,
-                     gathered_input, max_cache_pages, context, kda_records):
+                     gathered_input, max_cache_pages, context, kda_records,
+                     row_shard_attention=False, replicated_attention=None, rank_index=None,
+                     segment_eye=None, kda_segment_pool=None, kda_local_conv=None, row_shard_buffers=None):
         reduce, suffix = (PreparedAllReduce, "reduce") if gathered_input is None else (PreparedReduceScatter, "scatter")
         self.attention_gather = self.mlp_gather = None
+        self.sinit_gather = self.halo_gather = self.scan_gather = self.cache_gather = None
+        self.attention_reduce = None
         attention_input = scratch.attention_hc.normalized
-        if gathered_input is not None:
-            self.attention_gather = PreparedGatherShards(attention_input, gathered_input,
-                name=f"{name}.attention_gather", **collective)
-            attention_input = gathered_input
-        attention_args = (module.self_attn, attention_weights, attention_input,
-                          scratch.attention, state, metadata)
-        if module.block_type == "linear_attention":
-            self.attention = PreparedGlmKDA(*attention_args, mode=mode, session=session, name=f"{name}.kda",
-                                            workspace=workspace, checkpoint_export=mode == "prefill",
-                                            records=kda_records)
+        rows = attention_input.shape[0]
+        tokens = gathered_input.shape[0] if gathered_input is not None else rows
+        self.row_shard_mla = (
+            gathered_input is not None
+            and module.block_type == "indexed_attention"
+            and row_shard_attention
+            and replicated_attention is not None
+            and context is not None
+            and context.records is not None
+        )
+        self.row_shard_kda = (
+            gathered_input is not None
+            and module.block_type == "linear_attention"
+            and row_shard_attention
+            and replicated_attention is not None
+            and rank_index is not None
+            and segment_eye is not None
+            and kda_segment_pool is not None
+            and kda_local_conv is not None
+        )
+        if self.row_shard_kda:
+            device = attention_input.device
+            if row_shard_buffers is not None:
+                sinit_sh, sinit_full = row_shard_buffers.sinit_sh, row_shard_buffers.sinit_full
+                halo_sh, halo_full = row_shard_buffers.halo_sh, row_shard_buffers.halo_full
+                scan_sh, scan_full = row_shard_buffers.scan_sh, row_shard_buffers.scan_full
+                seg_qkv = row_shard_buffers.kda_seg_qkv[:rows]
+                seg_beta = row_shard_buffers.kda_seg_beta[:rows]
+            else:
+                sinit_sh = torch.zeros(ROW_SHARD_SINIT_SHAPE, dtype=torch.bfloat16, device=device)
+                sinit_full = torch.zeros((ROW_SHARD_SINIT_SHAPE[0] * 4, ROW_SHARD_SINIT_SHAPE[1]),
+                                         dtype=torch.bfloat16, device=device)
+                halo_sh = torch.zeros(ROW_SHARD_HALO_SHAPE, dtype=torch.bfloat16, device=device)
+                halo_full = torch.zeros((ROW_SHARD_HALO_SHAPE[0] * 4, ROW_SHARD_HALO_SHAPE[1]),
+                                        dtype=torch.bfloat16, device=device)
+                scan_sh = torch.zeros(ROW_SHARD_SCAN_SHAPE, dtype=torch.bfloat16, device=device)
+                scan_full = torch.zeros((ROW_SHARD_SCAN_SHAPE[0] * 4, ROW_SHARD_SCAN_SHAPE[1]),
+                                        dtype=torch.bfloat16, device=device)
+                seg_qkv = torch.zeros((rows, 24768), dtype=torch.bfloat16, device=device)
+                seg_beta = torch.zeros((rows, 64), dtype=torch.bfloat16, device=device)
+            self.sinit_gather = PreparedGatherShards(sinit_sh, sinit_full,
+                name=f"{name}.kda_sinit", **collective)
+            self.halo_gather = PreparedGatherShards(halo_sh, halo_full,
+                name=f"{name}.kda_halo", **collective)
+            self.scan_gather = PreparedGatherShards(scan_sh, scan_full,
+                name=f"{name}.kda_scan", **collective)
+            self.attention = PreparedGlmKDA(module.self_attn, {**attention_weights, **replicated_attention},
+                attention_input, scratch.attention, state, metadata, mode=mode, session=session,
+                name=f"{name}.kda", workspace=workspace, checkpoint_export=False, records=None,
+                overlap_gate=False, row_shard=True, single_segment=True, rank_index=rank_index,
+                segment_eye=segment_eye, half_tokens=tokens, segment_pool=kda_segment_pool,
+                local_conv=kda_local_conv, seg_qkv=seg_qkv, seg_beta=seg_beta)
+        elif self.row_shard_mla:
+            device = attention_input.device
+            if row_shard_buffers is not None:
+                cache_sh = row_shard_buffers.cache_sh[:rows]
+                cache_full = row_shard_buffers.cache_full[:tokens]
+            else:
+                cache_sh = torch.zeros((rows, 768), dtype=torch.bfloat16, device=device)
+                cache_full = torch.zeros((tokens, 768), dtype=torch.bfloat16, device=device)
+            self.cache_gather = PreparedGatherShards(cache_sh, cache_full,
+                name=f"{name}.cache_gather", **collective)
+            self.attention = PreparedGlmMLA(module.self_attn, attention_weights, attention_input,
+                scratch.attention, state, metadata, mode=mode, session=session, name=f"{name}.mla",
+                workspace=workspace, max_cache_pages=max_cache_pages, context=context,
+                row_shard_rows=rows, replicated_weights=replicated_attention)
         else:
-            self.attention = PreparedGlmMLA(*attention_args, mode=mode, session=session, name=f"{name}.mla",
-                                            workspace=workspace, max_cache_pages=max_cache_pages,
-                                            context=context)
-        self.attention_reduce = reduce(scratch.attention.output, scratch.attention_output,
-            name=f"{name}.attention_{suffix}", **collective)
+            if gathered_input is not None:
+                self.attention_gather = PreparedGatherShards(attention_input, gathered_input,
+                    name=f"{name}.attention_gather", **collective)
+                attention_input = gathered_input
+            attention_args = (module.self_attn, attention_weights, attention_input,
+                              scratch.attention, state, metadata)
+            if module.block_type == "linear_attention":
+                self.attention = PreparedGlmKDA(*attention_args, mode=mode, session=session, name=f"{name}.kda",
+                                                workspace=workspace, checkpoint_export=mode == "prefill",
+                                                records=kda_records)
+            else:
+                self.attention = PreparedGlmMLA(*attention_args, mode=mode, session=session, name=f"{name}.mla",
+                                                workspace=workspace, max_cache_pages=max_cache_pages,
+                                                context=context)
+            self.attention_reduce = reduce(scratch.attention.output, scratch.attention_output,
+                name=f"{name}.attention_{suffix}", **collective)
         self.mlp_hc = PreparedMHC((scratch.attention_output, scratch.attention_hc.residual,
                                   scratch.attention_hc.post, scratch.attention_hc.comb),
             mlp_mhc, scratch.mlp_hc, session=session, name=f"{name}.ffn_hc", workspace=workspace, **options)
@@ -541,10 +617,13 @@ class PreparedGlmLayer:
                 self.post.functional()
             self.scratch = self.output = None
             return self
-        if self.attention_gather is not None:
-            self.attention_gather.functional(session=session)
+        for attr in ("attention_gather", "sinit_gather", "halo_gather", "scan_gather", "cache_gather"):
+            op = getattr(self, attr, None)
+            if op is not None:
+                op.functional(session=session)
         self.attention.functional(session=session)
-        self.attention_reduce.functional(session=session)
+        if self.attention_reduce is not None:
+            self.attention_reduce.functional(session=session)
         self.mlp_hc.functional()
         if self.mlp_gather is not None:
             self.mlp_gather.functional(session=session)
@@ -555,7 +634,7 @@ class PreparedGlmLayer:
         self.scratch = self.output = None
         return self
 
-    def __call__(self, source, metadata, carry=None, *, records=None):
+    def __call__(self, source, metadata, carry=None, *, records=None, pos_sh=None):
         if self.has_carry:
             if carry is None:
                 raise ValueError("GLM post/pre layer requires runtime residual and mixing carry")
@@ -563,13 +642,35 @@ class PreparedGlmLayer:
         else:
             inputs = (source,)
         attention_residual, attention_post, attention_comb, attention_input = self.attention_hc(*inputs)
-        if self.attention_gather is not None:
-            attention_input = self.attention_gather(attention_input)
-        if self.module.block_type == "indexed_attention":
-            attended = self.attention(attention_input, metadata)
+        if self.row_shard_kda:
+            sinit_sh = self.attention.pack_initial_state(metadata)
+            s_init_full = self.sinit_gather(sinit_sh)
+            qkv, raw_beta, forget_in = self.attention.project_input_shard(attention_input)
+            halo_sh = self.attention.pack_conv_halo(qkv, metadata)
+            halo_full = self.halo_gather(halo_sh)
+            raw_g = self.attention.project_forget_shard(forget_in)
+            summary, scan_sh = self.attention.summarize_segment(
+                qkv, None, raw_g, None, raw_beta, None, halo_full, metadata)
+            scan_full = self.scan_gather(scan_sh)
+            z_sh = self.attention.project_gate_shard(attention_input)
+            rec_sh, live_sh, s4, conv_all = self.attention.finalize_segment(
+                summary, s_init_full, scan_full, metadata)
+            attention = self.attention.output_shard(rec_sh, z_sh, live_sh)
+            self.attention.commit_state(s4, conv_all, metadata)
+        elif self.row_shard_mla:
+            cache_sh, query_res, idx_query, weight_in = self.attention.project_shard(attention_input)
+            cache_full = self.cache_gather(cache_sh)
+            global_index_cache, slab = self.attention.write_and_gather_context(cache_full, metadata)
+            attention = self.attention.attend_shard(
+                query_res, idx_query, weight_in, pos_sh, global_index_cache, slab)
         else:
-            attended = self.attention(attention_input, metadata, records=records)
-        attention = self.attention_reduce(attended)
+            if self.attention_gather is not None:
+                attention_input = self.attention_gather(attention_input)
+            if self.module.block_type == "indexed_attention":
+                attended = self.attention(attention_input, metadata)
+            else:
+                attended = self.attention(attention_input, metadata, records=records)
+            attention = self.attention_reduce(attended)
         mlp_residual, mlp_post, mlp_comb, mlp_input = self.mlp_hc(
             attention, attention_residual, attention_post, attention_comb)
         if self.mlp_gather is not None:

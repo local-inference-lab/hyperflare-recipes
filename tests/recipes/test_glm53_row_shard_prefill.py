@@ -355,3 +355,33 @@ def test_glm53_parameters_gate_row_shard_prefill_and_attention():
         attn_only.validate(ctx_tp4)
     with pytest.raises(ValueError, match="row_shard_attention requires row_shard_prefill"):
         PreparationConfig(parameters=attn_only, devices=(0, 1, 2, 3))
+
+
+def test_roce_serial_row_shard_eligibility_and_reconstruction(monkeypatch):
+    class FakeRoceRuntime:
+        def __init__(self, *, pipe_bytes=64 << 20):
+            self.world_size = 4
+            self.pipe_bytes = pipe_bytes
+            self.rank = 0
+            self.should_reduce_scatter = lambda source: True
+            self.should_gather_shards = lambda source: True
+
+    monkeypatch.setattr(stack, "_roce", lambda rt: isinstance(rt, FakeRoceRuntime))
+    monkeypatch.setattr(stack, "row_shard_surfaces", lambda rt: isinstance(rt, FakeRoceRuntime))
+    monkeypatch.setattr(stack.PreparedReduceScatter, "fits",
+                        staticmethod(lambda rt, src, dst: isinstance(rt, FakeRoceRuntime)))
+    monkeypatch.setattr(stack.PreparedGatherShards, "fits",
+                        staticmethod(lambda rt, src, dst: isinstance(rt, FakeRoceRuntime)))
+
+    class DummyGather(stack.PreparedGatherShards):
+        def __init__(self, source, destination, *, runtime, name, **kwargs):
+            assert name == "text.final_gather"
+            assert source.shape[0] * 4 == destination.shape[0]
+            self.name = name
+
+    monkeypatch.setattr(stack, "PreparedGatherShards", DummyGather)
+    decoder = prepare(monkeypatch, 4096, FakeRoceRuntime(), workspace=FakeArena(overlap=True))
+    assert not decoder.pipelined
+    assert decoder.shard_rows is not None and decoder.shard_rows.numel() == 1024
+    assert decoder.final_gather is not None
+    assert all(not layer.pipelined and layer.gathered_input is not None for layer in decoder.layers)
