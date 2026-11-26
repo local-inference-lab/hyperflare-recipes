@@ -21,7 +21,7 @@ def test_mini_directory_resolves_loop_architecture(tmp_path):
         "metadata": {"total_size": MINI_RECIPE.checkpoints[0].stored_bytes}}))
     model = resolve(str(tmp_path))
     assert model.recipe is MINI_RECIPE
-    assert model.recipe.tensor_parallel == (1,)
+    assert model.recipe.tensor_parallel == (1, 2, 4)
     assert model.recipe.speculation.draft_tokens == 7
     assert model.recipe.max_images == 4
     assert (model.recipe.max_concurrency, model.recipe.prefill_chunk,
@@ -130,3 +130,29 @@ def test_mini_rejects_undeclared_proposal_head_quantization():
         PreparationConfig(devices=(0,), drafting=False, draft_head_quantization="nvfp4")
     with pytest.raises(ValueError, match="requires drafting"):
         PreparationConfig(devices=(0,), drafting=False, markov_head_quantization="nvfp4")
+
+
+@pytest.mark.parametrize("world_size,gib", [(2, 16), (4, 12)])
+def test_mini_plans_and_dispatches_tensor_parallel_groups(monkeypatch, tmp_path, world_size, gib):
+    from types import SimpleNamespace
+    from ignition.preparation import rank_group
+    from hyperflare_recipes.recipes.inkling2 import bootstrap
+
+    devices = tuple(gpu(i, gib) for i in range(world_size))
+    plan = derive(model=MINI_RECIPE, gpus=devices, concurrency=8, reserve=0)
+    assert plan.fits and plan.world_size == world_size
+    calls = []
+    monkeypatch.setattr(rank_group, "prepare_group",
+                        lambda *args, **kwargs: calls.append((args, kwargs)) or "group")
+    assert MINI_RECIPE.prepare(tmp_path, plan, compile_forwards=True, kernel_cache=None, progress=None) == "group"
+    (snapshot, config, forward), kwargs = calls.pop()
+    assert snapshot == tmp_path and forward is bootstrap.prepare_rank
+    assert config.devices == tuple(range(world_size)) and config.hosts is None
+    assert kwargs["ranks"] is None and kwargs["checkpoint"] is plan.checkpoint
+
+    hosts = tuple(f"host-{i}" for i in range(world_size))
+    rendezvous = SimpleNamespace(hosts=hosts)
+    MINI_RECIPE.prepare(tmp_path, plan, compile_forwards=True, kernel_cache=None, progress=None, ranks=rendezvous)
+    (_, remote_config, _), remote_kwargs = calls.pop()
+    assert remote_config.devices == (0,) * world_size and remote_config.hosts == hosts
+    assert remote_kwargs["ranks"] is rendezvous

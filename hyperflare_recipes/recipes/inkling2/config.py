@@ -15,6 +15,7 @@ TEXT_PREFIX = "model.language_model"
 VISION_PREFIX = "model.vision_tower"
 DRAFT_FILE = "mtp.safetensors"
 WORLD_SIZE = 4
+MINI_WORLD_SIZES = (1, 2, 4)
 VOCABULARY_ALIGNMENT = 64
 # Activation blocks of both expert formats (NVFP4 16, MXFP8 32) must stay inside one rank's slice.
 EXPERT_ALIGNMENT = 32
@@ -406,11 +407,15 @@ class ModelConfig:
                    DraftConfig.from_dict(config.get("mtp_config"), text), quantization)
 
     def validate_shard(self, shard):
-        required = 1 if self.text.loop is not None else WORLD_SIZE
-        if shard.world_size != required:
-            raise ValueError(f"this Inkling 2 checkpoint requires tensor parallelism of {required}")
+        if self.text.loop is not None:
+            if shard.world_size not in MINI_WORLD_SIZES:
+                raise ValueError("Inkling 2 Mini requires tensor parallelism of 1, 2, or 4")
+            shard.partition(self.text.experts)
+        elif shard.world_size != WORLD_SIZE:
+            raise ValueError(f"this Inkling 2 checkpoint requires tensor parallelism of {WORLD_SIZE}")
         for width in (self.text.heads, self.text.kv_heads, self.draft.heads, self.draft.kv_heads):
             shard.partition(width)
-        shard.partition(self.text.intermediate, alignment=EXPERT_ALIGNMENT)
+        if self.text.loop is None:
+            shard.partition(self.text.intermediate, alignment=EXPERT_ALIGNMENT)
         shard.partition(self.draft.intermediate, alignment=EXPERT_ALIGNMENT)
         shard.padded_partition(self.text.vocabulary, alignment=VOCABULARY_ALIGNMENT)

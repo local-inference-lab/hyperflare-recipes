@@ -19,6 +19,8 @@ GEOMETRY = dict(hidden=HIDDEN, local_vocabulary=LOCAL_VOCABULARY, draft_block=DR
 def test_four_hosts_may_each_use_their_own_gpu_zero():
     config = bootstrap.PreparationConfig(devices=(0,) * 4, hosts=HOSTS)
     assert config.devices == (0,) * 4
+    pair = bootstrap.PreparationConfig(devices=(0, 0), hosts=HOSTS[:2])
+    assert pair.devices == (0, 0) and pair.hosts == HOSTS[:2]
     with pytest.raises(ValueError, match="distinct GPUs"):
         bootstrap.PreparationConfig(devices=(0,) * 4)
     with pytest.raises(ValueError, match="distinct GPUs"):
@@ -26,7 +28,7 @@ def test_four_hosts_may_each_use_their_own_gpu_zero():
     with pytest.raises(ValueError, match="distinct GPUs"):
         bootstrap.PreparationConfig(devices=(0,) * 4, hosts=HOSTS[:3])
     with pytest.raises(ValueError, match="distinct GPUs"):
-        bootstrap.PreparationConfig(devices=(0, 1), hosts=HOSTS[:2])
+        bootstrap.PreparationConfig(devices=(0, 1, 2), hosts=HOSTS[:3])
 
 
 def test_ring_and_chain_need_hosts_in_rank_order():

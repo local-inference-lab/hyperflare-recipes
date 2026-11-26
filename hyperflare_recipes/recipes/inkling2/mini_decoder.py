@@ -42,7 +42,9 @@ class PreparedLoopLayer(PreparedLayer):
 
     def _build_experts(self, source, weights, routes, *, tokens, mode, session, workspace, name, example):
         del source, routes, mode, session, workspace, name, example
-        return PreparedSiTUExperts(weights.experts, tokens=tokens, top_k=self.text.experts_per_token)
+        output_dtype = self.reduction_dtype if weights.experts.expert_offset is not None else torch.bfloat16
+        return PreparedSiTUExperts(weights.experts, tokens=tokens, top_k=self.text.experts_per_token,
+                                   output_dtype=output_dtype)
 
     def forward(self, state, metadata, cross_pass=None):
         t, m = self.text, metadata
