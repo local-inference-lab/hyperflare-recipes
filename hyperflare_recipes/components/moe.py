@@ -212,7 +212,7 @@ class PreparedRoutedExperts:
     def __init__(self, source, experts, ids, weights, output, *, session: PreparationSession, name: str,
                  workspace: ScratchArena | torch.Tensor | None = None, router_plan=None,
                  a4_prefill=False, routing=None, router=None, route_output=None, activation_mode=None,
-                 a_scales=None):
+                 a_scales=None, reserve_sms: int = 0):
         from b12x.moe.fused_moe._binding_ops import materialize_scale_templates
 
         materialize_scale_templates(experts)
@@ -285,7 +285,8 @@ class PreparedRoutedExperts:
                 max_tokens=source.shape[0], top_k=ids.shape[1],
                 route_num_experts=experts.num_experts if self.route_inputs else 0,
                 output_layout="routes" if output.ndim == 3 else "token",
-                input_format="mxfp8" if self.prequantized_input else "bf16"),
+                input_format="mxfp8" if self.prequantized_input else "bf16",
+                reserve_sms=reserve_sms),
             scale_expansion=self.scale_plan, invocation=invocation, routing=routing,
             activation_mode=activation_mode,
         )

@@ -11,11 +11,15 @@ from pathlib import Path
 from types import MappingProxyType
 
 from ignition.declaration import Checkpoint, RankCosts, RankUsage, Recipe, SamplingDefaults, SamplingRange
+from ignition.errors import UsageError
 from ignition.parameters import (
+    ParameterContext,
+    ParameterScope,
     PromptLogprobsParameters,
     RecipeParameters,
     SpeculationParameters,
     VisionParameters,
+    param,
 )
 from ignition.preparation.bootstrap import common_preparation_kwargs
 
@@ -40,6 +44,43 @@ class Kimi3Parameters(RecipeParameters):
         default_scope="all",
         supported_scopes=("all", "kda-input"),
     )
+    row_shard_prefill: bool = param(
+        False,
+        flag="--row-shard-prefill",
+        group="advanced options",
+        scope=ParameterScope.DEPLOYMENT,
+        default_label="full-row all-reduce",
+        help="reduce eligible prefill branch outputs into one contiguous row shard per rank,"
+             " run row-local residual mixing on that shard, and gather normalized branch inputs back to full rows",
+        status_label=lambda v: "row-sharded prefill" if v else None,
+    )
+    # Recipe capability constraint (never a CLI flag or manifest entry).
+    row_shard_prefill_world_sizes: tuple[int, ...] = (16,)
+
+    def __post_init__(self):
+        if type(self.row_shard_prefill) is not bool:
+            raise TypeError("row_shard_prefill must be a boolean")
+
+    def filter_world_sizes(self, world_sizes: tuple[int, ...], context: ParameterContext) -> tuple[int, ...]:
+        sizes = super().filter_world_sizes(world_sizes, context)
+        if self.row_shard_prefill:
+            sizes = tuple(size for size in sizes if size in self.row_shard_prefill_world_sizes)
+        return sizes
+
+    def validate(self, context: ParameterContext) -> None:
+        super().validate(context)
+        if self.row_shard_prefill:
+            if context.world_size is not None:
+                if context.world_size < 2:
+                    raise UsageError("--row-shard-prefill requires tensor parallelism")
+                if context.world_size not in self.row_shard_prefill_world_sizes:
+                    supported = ", ".join(map(str, self.row_shard_prefill_world_sizes))
+                    raise UsageError(
+                        f"--row-shard-prefill is not supported at TP{context.world_size} for {context.alias};"
+                        f" supported tensor-parallel sizes: {supported}"
+                    )
+            if any(gpu.capability == (10, 3) for gpu in context.gpus):
+                raise UsageError("--row-shard-prefill is not qualified on SM103; select SM120 or SM121 GPUs")
 
 
 def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False,

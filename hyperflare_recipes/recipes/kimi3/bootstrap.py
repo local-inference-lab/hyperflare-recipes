@@ -34,7 +34,12 @@ from hyperflare_recipes.components.paged_maintenance import PreparedMaintenance
 from hyperflare_recipes.components.paged_resume import PreparedResume
 from ignition.components.sampling import AdmissionBuffers, DeviceRequestState
 from ignition.components.state_transfer import StateCommands
-from ignition.preparation.collectives import (CollectivePreparation, create_all_gather_runtime, create_all_reduce_runtime)
+from ignition.preparation.collectives import (
+    CollectivePreparation,
+    create_all_gather_runtime,
+    create_all_reduce_runtime,
+    create_dma_all_reduce_runtime,
+)
 from hyperflare_recipes.components.head_exchange import create_head_exchange
 from .routing import create_route_runtime
 from ignition.preparation.rank_group import minimum_across_ranks
@@ -157,6 +162,10 @@ class PreparationConfig(BasePreparationConfig):
     @property
     def stream_overlap(self) -> bool:
         return self.parameters.stream_overlap.enabled
+
+    @property
+    def row_shard_prefill(self) -> bool:
+        return self.parameters.row_shard_prefill
 
     @property
     def context_parallel(self) -> bool:
@@ -368,10 +377,14 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
         completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + config.completion_token_capacity), device=device)
         coordinator = CollectivePreparation(group)
         # Prefill activations reduce in chunks of the rows decode and verification already need a channel for: a
-        # channel sized for whole prefill chunks would stage 448 MiB per rank for 4096 rows.
+        # channel sized for whole prefill chunks would stage 448 MiB per rank for 4096 rows. With row-sharded
+        # prefill at TP16, the 2048-row island channel serves hidden RS/AG, expert RS/A2A, and paired route gathers.
         channel_rows = max(min(max_tokens, REDUCE_ROWS), config.decode_tokens)
-        collective = create_all_reduce_runtime(group, device, max_tokens=channel_rows,
+        reduce_rows = max(min(max_tokens, 2 * REDUCE_ROWS if config.row_shard_prefill else REDUCE_ROWS),
+                          config.decode_tokens)
+        collective = create_all_reduce_runtime(group, device, max_tokens=reduce_rows,
             hidden_size=weights.config.hidden, ipc=core_storage.peer_storage)
+        prefill_collective = None
         vocabulary_collective = create_all_gather_runtime(group, device,
             max_rows=max(config.decode_samples, slots * (config.draft_tokens or 1)),
             columns=weights.config.vocabulary, ipc=core_storage.peer_storage)
@@ -398,10 +411,15 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
             ipc=core_storage.peer_storage)
         route_collective = (create_route_runtime(group, device, ipc=core_storage.peer_storage)
                             if shard.world_size > 1 else None)
-        prefill_route_collective = (create_head_exchange(group, device, max_rows=channel_rows,
-            heads=shard.world_size,
-            head_dim=(weights.config.text["routed_expert_hidden_size"] + 2 * weights.config.text["num_experts"]) // shard.world_size,
-            ipc=core_storage.peer_storage) if shard.world_size > 1 else None)
+        prefill_route_collective = (
+            collective
+            if (config.row_shard_prefill and shard.world_size == 16 and max_tokens >= 2048
+                and getattr(collective, "_island_rs", None) is not None)
+            else (create_head_exchange(group, device, max_rows=channel_rows,
+                heads=shard.world_size,
+                head_dim=(weights.config.text["routed_expert_hidden_size"] + 2 * weights.config.text["num_experts"]) // shard.world_size,
+                ipc=core_storage.peer_storage) if shard.world_size > 1 else None)
+        )
         dcp_group, dcp_rank, dcp_reduction, dcp_groups = group, rank, collective, ()
         dcp_ipc = core_storage.peer_storage
         if config.context_parallel and config.context_parallel_size < shard.world_size:
@@ -584,7 +602,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
                         scratch = (prefill_storage if mode == "prefill" else decode_storage).rows(capacity, rows)
                         decoder = PreparedDecoder(mode_weights, scratch, m, pool, mode=mode,
                             scoring=scoring if kind == "scored_prefill" else None,
-                            session=session, name=name, workspace=arena, buffers=decoder_buffers, examples=examples, **collectives)
+                            session=session, name=name, workspace=arena, buffers=decoder_buffers, examples=examples,
+                            row_shard_prefill=config.row_shard_prefill,
+                            prefill_runtime=prefill_collective if mode == "prefill" else None, **collectives)
                         batch = PreparedBatch(inputs, requests, m, mode=mode, shard=weights.shard, pool=pool,
                             validate_prefill=vision_state.validate_prefill if mode == "prefill" and patches else None,
                             page_tokens=config.page_tokens)
@@ -755,6 +775,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
         benchmark_rounds=None if state is None else {name: forward for name, forward in forwards.items()
             if signatures[name].kind == "speculative"},
         close_resources=(() if scoring is None else (scoring,)) +
+                        (() if prefill_collective is None else (prefill_collective,)) +
                         (() if context is None or getattr(context, "candidate_owners", None) is None
                          else (context.candidate_owners,)) +
                         (() if context is None or getattr(context, "published_candidates", None) is None
@@ -769,7 +790,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
                                  else (context.published_candidates.pages.tensor,)),
                                *(() if not patches else (vision_state.arena,))]), *completion.zero_ranges()),
         resources=(scoring, weights, pool, requests, inputs, admission, commands, forwards, context,
-                   compiled, stream, graph_pool, session, coordinator, collective,
+                   compiled, stream, graph_pool, session, coordinator, collective, prefill_collective,
                    vocabulary_collective, embedding_collective, router_collective, route_collective,
                    prefill_route_collective,
                    vision_inputs, vision_prefill, vision_state, deferred_pool,
