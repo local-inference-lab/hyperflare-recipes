@@ -17,6 +17,24 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                               reason="requires an explicitly assigned CUDA device")
 
 
+@torch.no_grad()
+def test_nvfp4_head_calibration_uses_less_scratch_than_the_source_matrix():
+    from b12x.gemm.blockscaled._a16 import _weight_parts
+
+    target = torch.zeros((32768, 512), device="cuda", dtype=torch.bfloat16)
+    target[0, 0] = 3
+    target[-1, -1] = -12
+    torch.cuda.synchronize()
+    allocated = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    packed = nvfp4_draft_head(target, rows_per_chunk=256)
+    torch.cuda.synchronize()
+    assert torch.cuda.max_memory_allocated() - allocated < target.nbytes
+
+    _, _, gain, _ = _weight_parts(packed)
+    assert gain.item() == torch.tensor(6.0 * 448.0 / 12.0).reciprocal().item()
+
+
 @pytest.mark.parametrize("rows", [1, 5, 20, 40, 160])
 @pytest.mark.parametrize("hidden", [5120, 6144])
 @torch.no_grad()

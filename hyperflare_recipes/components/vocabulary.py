@@ -132,7 +132,9 @@ def nvfp4_draft_head(weight: torch.Tensor, *, rows_per_chunk: int = 8192):
     # Swizzled scales pad rows to 128; a TP4 vocabulary shard holds 38,720.
     if weight.dtype != torch.bfloat16 or columns % 128 or rows % 64 or not weight.is_contiguous():
         raise ValueError("NVFP4 draft head requires a contiguous BF16 head of 64-aligned rows and 128-aligned columns")
-    global_scale = (6.0 * 448.0) / weight.abs().amax().float().clamp_min(1e-8)
+    minimum, maximum = torch.aminmax(weight)
+    abs_max = torch.maximum(-minimum, maximum)
+    global_scale = (6.0 * 448.0) / abs_max.float().clamp_min(1e-8)
     values = persistent_empty((rows, columns // 2), dtype=torch.uint8, device=weight.device)
     scales = torch.empty((rows, columns // 16), dtype=torch.float8_e4m3fn, device=weight.device)
     bounds = torch.tensor(_E2M1_BOUNDS, device=weight.device)
