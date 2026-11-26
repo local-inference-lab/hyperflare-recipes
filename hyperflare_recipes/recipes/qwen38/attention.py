@@ -217,7 +217,7 @@ class PreparedAttention:
                  projection_workspace: ScratchArena | torch.Tensor | None = None,
                  max_cache_pages: int | None = None, cache_only: bool = False,
                  shard=None, qsa_gather_runtime=None, qsa_shard_mode: str | None = None,
-                 coordinator=None) -> None:
+                 coordinator=None, input_encoded=None) -> None:
         self.q_heads, self.kv_heads = scratch.query.shape[1], scratch.key.shape[1]
         self.cache_only = cache_only
         self.module, self.scratch, self.state = module, scratch, state
@@ -277,16 +277,28 @@ class PreparedAttention:
                         score_workspace_bytes=score_workspace)
         if rotary.cos.shape[0] < context:
             raise ValueError("rotary table capacity must cover the admitted context")
+        if input_encoded is not None:
+            from b12x.gemm.blockscaled._linear import MXFP8LinearWeight
+            from b12x.quantization import mxfp8
+
+            if (sm103.is_sm103(source.device) or not isinstance(input_encoded, mxfp8.MXFP8Rows)
+                    or any(not isinstance(weights[k], MXFP8LinearWeight)
+                           or weights[k].padded_in_features != source.shape[1]
+                           for k in ("qkv_proj", "indexer.index_qk_proj"))):
+                raise ValueError(
+                    "preencoded QSA inputs require non-SM103 matching MXFP8 QKV and index projections"
+                )
         self.projections = {}
-        def projection(source, weight, output, key):
+        def projection(source, weight, output, key, *, encoded=None):
             if isinstance(weight, torch.Tensor):
                 return UnquantizedProjection(source, weight, output, session=session, name=f"{name}.{key}")
             return QuantizedProjection(source, weight, output, session=session,
-                                       name=f"{name}.{key}", activation_mode="auto", workspace=projection_workspace)
+                                       name=f"{name}.{key}", activation_mode="auto",
+                                       workspace=projection_workspace, encoded=encoded)
 
         for key, output in (("qkv_proj", scratch.projected_qkv),
                             ("indexer.index_qk_proj", scratch.projected_index)):
-            self.projections[key] = projection(source, weights[key], output, key)
+            self.projections[key] = projection(source, weights[key], output, key, encoded=input_encoded)
         if not cache_only:
             self.projections["o_proj"] = projection(scratch.gated, weights["o_proj"], scratch.output, "o_proj")
         self.index_query = scratch.projected_index[:, :512].view(self.tokens, 4, 128)
@@ -334,7 +346,8 @@ class PreparedAttention:
                              "v_scale": self.binding_kwargs["v_descale"]}
         declare(session, (self.writer.request(name=f"{name}.kv_write", prepare_call=lambda materialized:
             PreparedCall(run=lambda: materialized.run(**self.write_kwargs))),))
-        concurrent = (not cache_only and self.tokens <= 16 and source.is_cuda and isinstance(workspace, ScratchArena)
+        concurrent = (not cache_only and input_encoded is None and self.tokens <= 16 and source.is_cuda
+                      and isinstance(workspace, ScratchArena)
                       and workspace is projection_workspace
                       and all(isinstance(self.projections[key], QuantizedProjection)
                               for key in ("qkv_proj", "indexer.index_qk_proj")))
@@ -362,7 +375,8 @@ class PreparedAttention:
                 self.projections["qkv_proj"], self.projections["indexer.index_qk_proj"],
                 session=session, workspace=workspace,
             )
-            if (use_sharded and isinstance(workspace, ScratchArena) and workspace.overlap
+            if (self.sharded is not None and self.sharded.overlap
+                and isinstance(workspace, ScratchArena)
                 and workspace is projection_workspace and qsa_shard_mode == "group"
                 and ParallelProjections.supports(
                     self.projections["qkv_proj"], self.projections["indexer.index_qk_proj"]
@@ -446,17 +460,18 @@ class PreparedAttention:
         )
         return query, gate, key, value
 
-    def pre_gather_runtime(self, source: torch.Tensor, metadata) -> RowGatherStage:
+    def pre_gather_runtime(self, source: torch.Tensor, metadata, *, input_encoded_bases=None) -> RowGatherStage:
         """Run local QKV/index projections, KV/compressed cache updates, and row-split selection."""
         if self.cache_only or self.sharded is None or self.sharded.mode != "row":
             raise ValueError("pre_gather_runtime requires non-cache-only row-split QSA")
-        projected_index = self.projections["indexer.index_qk_proj"](source)
-        projected_qkv = self.projections["qkv_proj"](source)
+        enc_kw = {} if input_encoded_bases is None else {"encoded_bases": input_encoded_bases}
+        projected_index = self.projections["indexer.index_qk_proj"](source, **enc_kw)
+        projected_qkv = self.projections["qkv_proj"](source, **enc_kw)
         query, gate, key, value = self._prepare_qkv_runtime(projected_qkv, metadata)
         paged_kv_write.run(self.writer, key=key, value=value, k_cache=self.state.main_k_cache,
             v_cache=self.state.main_v_cache, slot_mapping=metadata.slot_mapping,
             k_scale=self.constants["k_descale"], v_scale=self.constants["v_descale"])
-        attended = torch.empty((self.tokens, self.q_heads, 256), dtype=source.dtype, device=source.device)
+        attended = torch.empty((self.tokens, self.q_heads, 256), dtype=projected_qkv.dtype, device=source.device)
         selected = torch.empty((self.tokens, 2051), dtype=torch.int32, device=source.device)
         bindings = {**self.constants, "main_block_table": metadata.main_block_table,
             "compressed_block_table": metadata.compressed_block_table,
@@ -485,11 +500,15 @@ class PreparedAttention:
         output.masked_fill_((stage.metadata.request_ids < 0)[:, None], 0)
         return output
 
-    def __call__(self, source: torch.Tensor, metadata) -> torch.Tensor | None:
+    def __call__(self, source: torch.Tensor, metadata, *, input_encoded_bases=None) -> torch.Tensor | None:
         if not self.cache_only and self.sharded is not None and self.sharded.mode == "row":
-            return self.post_gather_runtime(self.pre_gather_runtime(source, metadata))
+            return self.post_gather_runtime(
+                self.pre_gather_runtime(source, metadata, input_encoded_bases=input_encoded_bases)
+            )
         pending_sharded = None
         if self.sharded is not None and self.sharded.overlap:
+            if input_encoded_bases is not None:
+                raise ValueError("preencoded QSA inputs require serial non-overlapping projections")
             if self.parallel_projections is not None:
                 projected_qkv, pending_sharded = self.sharded.start_group_selection(
                     source, None, metadata, self.constants, self.workspace_bytes,
@@ -503,10 +522,13 @@ class PreparedAttention:
                 projected_qkv = self.projections["qkv_proj"](source)
             projection_workspaces = None
         elif self.concurrent is None:
-            projected_index = self.projections["indexer.index_qk_proj"](source)
-            projected_qkv = self.projections["qkv_proj"](source)
+            enc_kw = {} if input_encoded_bases is None else {"encoded_bases": input_encoded_bases}
+            projected_index = self.projections["indexer.index_qk_proj"](source, **enc_kw)
+            projected_qkv = self.projections["qkv_proj"](source, **enc_kw)
             projection_workspaces = None
         else:
+            if input_encoded_bases is not None:
+                raise ValueError("preencoded QSA inputs require serial non-overlapping projections")
             (projected_qkv, projected_index), projection_workspaces = self.concurrent.project_runtime(source)
         query, gate, key, value = self._prepare_qkv_runtime(projected_qkv, metadata)
         paged_kv_write.run(self.writer, key=key, value=value, k_cache=self.state.main_k_cache,
@@ -517,7 +539,7 @@ class PreparedAttention:
                 pending_sharded, query, metadata, self.workspace_bytes,
             )
         else:
-            attended = torch.empty((self.tokens, self.q_heads, 256), dtype=source.dtype, device=source.device)
+            attended = torch.empty((self.tokens, self.q_heads, 256), dtype=projected_qkv.dtype, device=source.device)
             selected = torch.empty((self.tokens, 2051), dtype=torch.int32, device=source.device)
             bindings = {**self.constants, "main_block_table": metadata.main_block_table,
                 "compressed_block_table": metadata.compressed_block_table,

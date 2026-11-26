@@ -183,6 +183,7 @@ class PreparedGDN:
         partitions=None,
         prepare_projections: bool = True,
         gdn_buffers=None,
+        input_encoded=None,
     ) -> None:
         self.world_size = 48 // module.num_v_heads
         self.key_heads, self.value_heads = module.num_k_heads, module.num_v_heads
@@ -282,6 +283,19 @@ class PreparedGDN:
 
         from b12x.gemm.blockscaled._linear import MXFP8LinearWeight
 
+        if input_encoded is not None:
+            from b12x.quantization import mxfp8
+
+            if (not prepare_projections or sm103.is_sm103(self.device)
+                    or self.fused_qkvzba or not isinstance(input_encoded, mxfp8.MXFP8Rows)):
+                raise ValueError("preencoded GDN inputs require non-SM103 prepared unfused MXFP8 projections")
+            input_keys = (("in_proj_qkvz", "in_proj_ba") if self.fused_qkvz
+                          else ("in_proj_qkv", "in_proj_z", "in_proj_ba"))
+            if any(not isinstance(projections[k], MXFP8LinearWeight)
+                   or projections[k].padded_in_features != source.shape[1]
+                   for k in input_keys):
+                raise ValueError("preencoded GDN inputs require matching MXFP8 input projections")
+
         self.output_encoding = None
         if (prepare_projections and mode == "prefill" and partitions is None
                 and not sm103.is_sm103(self.device) and isinstance(projections["out_proj"], MXFP8LinearWeight)):
@@ -295,9 +309,10 @@ class PreparedGDN:
                 return TensorFP8Projection(inputs, weight, output, staging=projection_staging, **options)
             if isinstance(weight, torch.Tensor):
                 return UnquantizedProjection(inputs, weight, output, **options)
+            encoded = self.output_encoding if key == "out_proj" else input_encoded
             return QuantizedProjection(inputs, weight, output, activation_mode="auto",
                                        allow_bf16_atomic_reduction=False if key == "in_proj_qkvzba" else None,
-                                       workspace=projection_workspace, encoded=self.output_encoding if key == "out_proj" else None, **options)
+                                       workspace=projection_workspace, encoded=encoded, **options)
 
         if prepare_projections:
             if self.fused_qkvzba:
@@ -314,7 +329,7 @@ class PreparedGDN:
             self.projections = {key: projection(key, source, output) for key, output in inputs}
             self.projections["out_proj"] = projection("out_proj", scratch.gated, scratch.output)
             self.parallel_projections = None
-            if (self.fused_qkvz and mode == "decode" and self.tokens <= 16
+            if (self.fused_qkvz and input_encoded is None and mode == "decode" and self.tokens <= 16
                     and isinstance(projection_workspace, ScratchArena) and projection_workspace.overlap
                     and all(isinstance(self.projections[key], QuantizedProjection)
                             for key in ("in_proj_qkvz", "in_proj_ba"))):
@@ -592,20 +607,25 @@ class PreparedGDN:
                                  live=metadata.num_tokens)
         return (recurrence if gated is None else gated).view(self.tokens, -1), encoded
 
-    def _functional(self, source, *, records=None, metadata=None, partitions=None):
+    def _functional(self, source, *, records=None, metadata=None, partitions=None, input_encoded_bases=None):
         if not self._functional_ready:
             raise RuntimeError("functional GDN requires completed sequence binding finalization")
         if self.fused_qkvzba:
+            if input_encoded_bases is not None:
+                raise ValueError("preencoded GDN inputs require unfused input projections")
             packed = self.projections["in_proj_qkvzba"](source)
             qkvz, ba = packed.split((16384 // self.world_size, 96 // self.world_size), dim=-1)
         elif self.parallel_projections is not None:
+            if input_encoded_bases is not None:
+                raise ValueError("preencoded GDN inputs require serial non-overlapping projections")
             qkvz, ba = self.parallel_projections(source)
         else:
-            qkvz = self.projections["in_proj_qkvz"](source) if self.fused_qkvz else None
+            enc_kw = {} if input_encoded_bases is None else {"encoded_bases": input_encoded_bases}
+            qkvz = self.projections["in_proj_qkvz"](source, **enc_kw) if self.fused_qkvz else None
             if qkvz is None:
-                projected = self.projections["in_proj_qkv"](source)
-                z = self.projections["in_proj_z"](source)
-            ba = self.projections["in_proj_ba"](source)
+                projected = self.projections["in_proj_qkv"](source, **enc_kw)
+                z = self.projections["in_proj_z"](source, **enc_kw)
+            ba = self.projections["in_proj_ba"](source, **enc_kw)
         if qkvz is not None:
             projected, z = qkvz.split((10240 // self.world_size, 6144 // self.world_size), dim=-1)
         b, a = ba.chunk(2, dim=-1)
@@ -632,10 +652,12 @@ class PreparedGDN:
             return self.projections["out_proj"](gated)
         return self.projections["out_proj"](gated, encoded_bases=encoded)
 
-    def __call__(self, source: torch.Tensor, *, records=None, metadata=None, partitions=None) -> torch.Tensor:
+    def __call__(self, source: torch.Tensor, *, records=None, metadata=None, partitions=None,
+                 input_encoded_bases=None) -> torch.Tensor:
         if getattr(self, "_functional_requested", False):
-            return self._functional(source, records=records, metadata=metadata, partitions=partitions)
-        if records is not None or metadata is not None or partitions is not None:
+            return self._functional(source, records=records, metadata=metadata, partitions=partitions,
+                                    input_encoded_bases=input_encoded_bases)
+        if records is not None or metadata is not None or partitions is not None or input_encoded_bases is not None:
             raise ValueError("runtime GDN operands require functional execution")
         scratch = self.scratch
         if self.fused_qkvzba:
