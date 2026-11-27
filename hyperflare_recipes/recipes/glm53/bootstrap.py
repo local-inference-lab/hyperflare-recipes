@@ -317,8 +317,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
         transient.enter_context(core_storage.transient())
     weights = ModelWeights.load(manifest, device, shard=shard, progress=progress, mtp=config.mtp,
                                 expert_activation=expert_activation,
-                                expand_expert_scales=config.expand_expert_scales, language_model_only=config.language_model_only,
-                                row_shard_attention=config.row_shard_attention)
+                                expand_expert_scales=config.expand_expert_scales, language_model_only=config.language_model_only)
     if torch.cuda.get_device_properties(device).is_integrated:
         from ignition.preparation.host_memory import release_page_cache
 
@@ -750,8 +749,6 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
         'mtp': 'mtp',
         'vision': 'vision',
     }
-    if weights.replicated_attention is not None:
-        rebuild_components['replicated_attention'] = 'replicated_attention'
     return PreparedModel(rebuild_weights=declare_weights(weights, components=rebuild_components), device=config.devices[rank], graphs=graphs, buffers=buffers, signatures=signatures,
         max_active=config.max_active, resources=resources, session=session,
         forwards={name: compiled.get(name, forward) for name, forward in forwards.items()},

@@ -225,7 +225,7 @@ class PreparedGlmLayer:
                  scratch: LayerScratch, state, metadata, *, mode, runtime, coordinator, session, name, workspace,
                  carry: MHCScratch | None = None, defer_post=False, gathered_input=None, max_cache_pages=None,
                  context=None, kda_records=None, pipelined=False, row_shard_attention=False,
-                 replicated_attention=None, full_attention_input=None,
+                 replicated_attention=None, runtime_weights=False, full_attention_input=None,
                  rank_index=None, segment_eye=None, kda_segment_pool=None, kda_local_conv=None,
                  row_shard_buffers=None, contiguous_shards=False, mlp_quarters=False, gathered_mlp=None):
         if module.block_type not in ("linear_attention", "indexed_attention"):
@@ -257,6 +257,7 @@ class PreparedGlmLayer:
                               context=context, kda_records=kda_records,
                               row_shard_attention=row_shard_attention,
                               replicated_attention=replicated_attention,
+                              runtime_weights=runtime_weights,
                               rank_index=rank_index, segment_eye=segment_eye,
                               kda_segment_pool=kda_segment_pool, kda_local_conv=kda_local_conv,
                               row_shard_buffers=row_shard_buffers)
@@ -333,7 +334,8 @@ class PreparedGlmLayer:
                 row_shard=True, rank_index=rank_index, segment_eye=segment_eye,
                 half_tokens=self.half_tokens, segment_pool=kda_segment_pool, local_conv=kda_local_conv,
                 seg_qkv=seg_qkv, seg_beta=seg_beta,
-                output_tokens=self.q_shard_tokens if self.mlp_quarters else None)
+                output_tokens=self.q_shard_tokens if self.mlp_quarters else None,
+                runtime_weights=runtime_weights)
         elif module.block_type == "linear_attention":
             self.attention_gather_a = PreparedGatherShards(scratch.attention_hc.normalized, gathered_input,
                 name=f"{name}.attention_gather.0", **collective)
@@ -362,7 +364,8 @@ class PreparedGlmLayer:
             self.attention = PreparedGlmMLA(module.self_attn, attention_weights, attn_norm_source,
                 scratch.attention, state, metadata, mode=mode, session=session, name=f"{name}.mla",
                 workspace=workspace, max_cache_pages=max_cache_pages, context=context,
-                row_shard_rows=self.shard_tokens, replicated_weights=replicated_attention)
+                row_shard_rows=self.shard_tokens, replicated_weights=replicated_attention,
+                runtime_weights=runtime_weights)
         else:
             if full_attention_input is None:
                 raise ValueError("head-parallel pipelined MLA requires full_attention_input")
@@ -481,7 +484,7 @@ class PreparedGlmLayer:
     def _init_serial(self, module, attention_weights, mlp_weights, scratch, state, metadata, *,
                      mode, collective, session, name, workspace, mlp_mhc, options, output, defer_post,
                      gathered_input, max_cache_pages, context, kda_records,
-                     row_shard_attention=False, replicated_attention=None, rank_index=None,
+                     row_shard_attention=False, replicated_attention=None, runtime_weights=False, rank_index=None,
                      segment_eye=None, kda_segment_pool=None, kda_local_conv=None, row_shard_buffers=None):
         reduce, suffix = (PreparedAllReduce, "reduce") if gathered_input is None else (PreparedReduceScatter, "scatter")
         self.attention_gather = self.mlp_gather = None
@@ -541,7 +544,8 @@ class PreparedGlmLayer:
                 name=f"{name}.kda", workspace=workspace, checkpoint_export=False, records=None,
                 overlap_gate=False, row_shard=True, single_segment=True, rank_index=rank_index,
                 segment_eye=segment_eye, half_tokens=tokens, segment_pool=kda_segment_pool,
-                local_conv=kda_local_conv, seg_qkv=seg_qkv, seg_beta=seg_beta)
+                local_conv=kda_local_conv, seg_qkv=seg_qkv, seg_beta=seg_beta,
+                runtime_weights=runtime_weights)
         elif self.row_shard_mla:
             device = attention_input.device
             if row_shard_buffers is not None:
@@ -555,7 +559,8 @@ class PreparedGlmLayer:
             self.attention = PreparedGlmMLA(module.self_attn, attention_weights, attention_input,
                 scratch.attention, state, metadata, mode=mode, session=session, name=f"{name}.mla",
                 workspace=workspace, max_cache_pages=max_cache_pages, context=context,
-                row_shard_rows=rows, replicated_weights=replicated_attention)
+                row_shard_rows=rows, replicated_weights=replicated_attention,
+                runtime_weights=runtime_weights)
         else:
             if gathered_input is not None:
                 self.attention_gather = PreparedGatherShards(attention_input, gathered_input,
@@ -638,7 +643,7 @@ class PreparedGlmLayer:
         self.scratch = self.output = None
         return self
 
-    def __call__(self, source, metadata, carry=None, *, records=None, pos_sh=None):
+    def __call__(self, source, metadata, carry=None, *, records=None, pos_sh=None, attn_weights=None):
         if self.has_carry:
             if carry is None:
                 raise ValueError("GLM post/pre layer requires runtime residual and mixing carry")
@@ -649,24 +654,24 @@ class PreparedGlmLayer:
         if self.row_shard_kda:
             sinit_sh = self.attention.pack_initial_state(metadata)
             s_init_full = self.sinit_gather(sinit_sh)
-            qkv, raw_beta, forget_in = self.attention.project_input_shard(attention_input)
+            qkv, raw_beta, forget_in = self.attention.project_input_shard(attention_input, weights=attn_weights)
             halo_sh = self.attention.pack_conv_halo(qkv, metadata)
             halo_full = self.halo_gather(halo_sh)
-            raw_g = self.attention.project_forget_shard(forget_in)
+            raw_g = self.attention.project_forget_shard(forget_in, weights=attn_weights)
             summary, scan_sh = self.attention.summarize_segment(
-                qkv, None, raw_g, None, raw_beta, None, halo_full, metadata)
+                qkv, None, raw_g, None, raw_beta, None, halo_full, metadata, weights=attn_weights)
             scan_full = self.scan_gather(scan_sh)
-            z_sh = self.attention.project_gate_shard(attention_input)
+            z_sh = self.attention.project_gate_shard(attention_input, weights=attn_weights)
             rec_sh, live_sh, s4, conv_all = self.attention.finalize_segment(
-                summary, s_init_full, scan_full, metadata)
-            attention = self.attention.output_shard(rec_sh, z_sh, live_sh)
+                summary, s_init_full, scan_full, metadata, weights=attn_weights)
+            attention = self.attention.output_shard(rec_sh, z_sh, live_sh, weights=attn_weights)
             self.attention.commit_state(s4, conv_all, metadata)
         elif self.row_shard_mla:
             query_res, idx_query, weight_in, cache_sh = self.attention.project_shard(attention_input)
             cache_full = self.cache_gather(cache_sh)
             global_index_cache, slab = self.attention.write_and_gather_context(cache_full, metadata)
             attention = self.attention.attend_shard(
-                query_res, idx_query, weight_in, pos_sh, global_index_cache, slab)
+                query_res, idx_query, weight_in, pos_sh, global_index_cache, slab, weights=attn_weights)
         else:
             if self.attention_gather is not None:
                 attention_input = self.attention_gather(attention_input)
@@ -685,14 +690,17 @@ class PreparedGlmLayer:
         return self.post(mlp, mlp_residual, mlp_post, mlp_comb), None
 
     def forward_pipelined(self, incoming, metadata, *, meta_a=None, meta_b=None,
-                          pos_a=None, pos_b=None, pending_mlp_b=None, records=None):
+                          pos_a=None, pos_b=None, pending_mlp_b=None, records=None,
+                          attn_weights=None, weight_gather=None, next_layer_index=None):
         """Execute one layer over two row-sharded microbatches with a single ordered DMA channel."""
         if self.row_shard_kda:
             return self._forward_pipelined_row_shard_kda(
-                incoming, metadata, pending_mlp_b=pending_mlp_b)
+                incoming, metadata, pending_mlp_b=pending_mlp_b,
+                attn_weights=attn_weights, weight_gather=weight_gather, next_layer_index=next_layer_index)
         if self.row_shard_mla:
             return self._forward_pipelined_row_shard_mla(
-                incoming, metadata, pos_a=pos_a, pos_b=pos_b, pending_mlp_b=pending_mlp_b)
+                incoming, metadata, pos_a=pos_a, pos_b=pos_b, pending_mlp_b=pending_mlp_b,
+                attn_weights=attn_weights, weight_gather=weight_gather, next_layer_index=next_layer_index)
         if self.has_carry:
             mlp_a, prev_res_a, prev_post_a, prev_comb_a, prev_res_b, prev_post_b, prev_comb_b = incoming
             res_a, post_a, comb_a, norm_a_sh = self.attention_hc(mlp_a, prev_res_a, prev_post_a, prev_comb_a)
@@ -744,9 +752,12 @@ class PreparedGlmLayer:
             ffn_a, ffn_b_sh, (mres_a, mpost_a, mcomb_a), (mres_b, mpost_b, mcomb_b))
 
 
-    def _forward_pipelined_row_shard_kda(self, incoming, metadata, *, pending_mlp_b):
+    def _forward_pipelined_row_shard_kda(self, incoming, metadata, *, pending_mlp_b,
+                                         attn_weights=None, weight_gather=None, next_layer_index=None):
         if self.mlp_quarters:
-            return self._forward_pipelined_row_shard_kda_quarters(incoming, metadata, pending_mlp_b=pending_mlp_b)
+            return self._forward_pipelined_row_shard_kda_quarters(
+                incoming, metadata, pending_mlp_b=pending_mlp_b,
+                attn_weights=attn_weights, weight_gather=weight_gather, next_layer_index=next_layer_index)
         zero_copy = self.attention.supports_zero_copy_segment
         half = self.shard_tokens
         seg_proj = seg_raw_g = None
@@ -757,9 +768,9 @@ class PreparedGlmLayer:
                 seg_raw_g = torch.empty((half * 2, 8192), dtype=torch.bfloat16, device=mlp_a.device)
             res_a, post_a, comb_a, norm_a_sh = self.attention_hc(mlp_a, prev_res_a, prev_post_a, prev_comb_a)
             qkv_a, beta_a, fin_a = self.attention.project_input_shard(
-                norm_a_sh, out=seg_proj[:half] if zero_copy else None)
+                norm_a_sh, out=seg_proj[:half] if zero_copy else None, weights=attn_weights)
             raw_g_a = self.attention.project_forget_shard(
-                fin_a, out=seg_raw_g[:half] if zero_copy else None)
+                fin_a, out=seg_raw_g[:half] if zero_copy else None, weights=attn_weights)
             prev_cr, p_prev_b = pending_mlp_b
             mlp_b = prev_cr.finish(p_prev_b, raw_g_a)
             sinit_sh = self.attention.pack_initial_state(metadata)
@@ -772,47 +783,56 @@ class PreparedGlmLayer:
                 seg_raw_g = torch.empty((half * 2, 8192), dtype=torch.bfloat16, device=src_a.device)
             res_a, post_a, comb_a, norm_a_sh = self.attention_hc(src_a)
             qkv_a, beta_a, fin_a = self.attention.project_input_shard(
-                norm_a_sh, out=seg_proj[:half] if zero_copy else None)
+                norm_a_sh, out=seg_proj[:half] if zero_copy else None, weights=attn_weights)
             raw_g_a = self.attention.project_forget_shard(
-                fin_a, out=seg_raw_g[:half] if zero_copy else None)
+                fin_a, out=seg_raw_g[:half] if zero_copy else None, weights=attn_weights)
             sinit_sh = self.attention.pack_initial_state(metadata)
             p_sinit = self.cr_sinit_gather.start(sinit_sh, dependencies=(raw_g_a,))
             res_b, post_b, comb_b, norm_b_sh = self.attention_hc(src_b)
 
         qkv_b, beta_b, fin_b = self.attention.project_input_shard(
-            norm_b_sh, out=seg_proj[half:] if zero_copy else None)
+            norm_b_sh, out=seg_proj[half:] if zero_copy else None, weights=attn_weights)
         sinit_full = self.cr_sinit_gather.finish(p_sinit, qkv_b)
 
         halo_sh = self.attention.pack_conv_halo(qkv_b, metadata)
         p_halo = self.cr_halo_gather.start(halo_sh, dependencies=(sinit_full,))
         raw_g_b = self.attention.project_forget_shard(
-            fin_b, out=seg_raw_g[half:] if zero_copy else None)
+            fin_b, out=seg_raw_g[half:] if zero_copy else None, weights=attn_weights)
         halo_full = self.cr_halo_gather.finish(p_halo, raw_g_b)
 
+        p_w1 = (
+            weight_gather.start_phase1(next_layer_index, [halo_full])
+            if weight_gather is not None and next_layer_index is not None else None
+        )
         summary, scan_sh = self.attention.summarize_segment(
             qkv_a, qkv_b, raw_g_a, raw_g_b, beta_a, beta_b, halo_full, metadata,
-            seg_projected=seg_proj, seg_raw_g=seg_raw_g)
+            seg_projected=seg_proj, seg_raw_g=seg_raw_g, weights=attn_weights)
 
-        p_scan = self.cr_scan_gather.start(scan_sh, dependencies=(halo_full,))
-        z_a = self.attention.project_gate_shard(norm_a_sh)
-        z_b = self.attention.project_gate_shard(norm_b_sh)
+        scan_deps = (halo_full, *p_w1.buffers) if p_w1 is not None else (halo_full,)
+        p_scan = self.cr_scan_gather.start(scan_sh, dependencies=scan_deps)
+        z_a = self.attention.project_gate_shard(norm_a_sh, weights=attn_weights)
+        z_b = self.attention.project_gate_shard(norm_b_sh, weights=attn_weights)
         scan_full = self.cr_scan_gather.finish(p_scan, z_b)
 
+        pending_next_w = weight_gather.start_phase2(p_w1, [scan_full]) if p_w1 is not None else None
         rec_a, rec_b, live_a, live_b, s4, conv_all = self.attention.finalize_segment(
-            summary, sinit_full, scan_full, metadata)
-        att_a = self.attention.output_shard(rec_a, z_a, live_a)
+            summary, sinit_full, scan_full, metadata, weights=attn_weights)
+        att_a = self.attention.output_shard(rec_a, z_a, live_a, weights=attn_weights)
         mres_a, mpost_a, mcomb_a, ffn_a_sh = self.mlp_hc(att_a, res_a, post_a, comb_a)
 
-        p_ffn_a = self.cr_mlp_gather_a.start(ffn_a_sh, dependencies=(scan_full,))
-        att_b = self.attention.output_shard(rec_b, z_b, live_b)
+        ffn_deps = (scan_full, *pending_next_w.buffers) if pending_next_w is not None else (scan_full,)
+        p_ffn_a = self.cr_mlp_gather_a.start(ffn_a_sh, dependencies=ffn_deps)
+        att_b = self.attention.output_shard(rec_b, z_b, live_b, weights=attn_weights)
         self.attention.commit_state(s4, conv_all, metadata)
         mres_b, mpost_b, mcomb_b, ffn_b_sh = self.mlp_hc(att_b, res_b, post_b, comb_b)
         ffn_a = self.cr_mlp_gather_a.finish(p_ffn_a, ffn_b_sh)
 
-        return self._finish_pipelined_ffn(
+        out, pend_b = self._finish_pipelined_ffn(
             ffn_a, ffn_b_sh, (mres_a, mpost_a, mcomb_a), (mres_b, mpost_b, mcomb_b))
+        return (out, pend_b, pending_next_w) if weight_gather is not None else (out, pend_b)
 
-    def _forward_pipelined_row_shard_kda_quarters(self, incoming, metadata, *, pending_mlp_b):
+    def _forward_pipelined_row_shard_kda_quarters(self, incoming, metadata, *, pending_mlp_b,
+                                                  attn_weights=None, weight_gather=None, next_layer_index=None):
         zero_copy = self.attention.supports_zero_copy_segment
         half = self.shard_tokens
         seg_proj = seg_raw_g = None
@@ -826,9 +846,9 @@ class PreparedGlmLayer:
             r1, p1, k1, n1 = self.attention_hc(mlp_1, *c1)
             norm_a_sh = torch.cat((n0, n1), dim=0)
             qkv_a, beta_a, fin_a = self.attention.project_input_shard(
-                norm_a_sh, out=seg_proj[:half] if zero_copy else None)
+                norm_a_sh, out=seg_proj[:half] if zero_copy else None, weights=attn_weights)
             raw_g_a = self.attention.project_forget_shard(
-                fin_a, out=seg_raw_g[:half] if zero_copy else None)
+                fin_a, out=seg_raw_g[:half] if zero_copy else None, weights=attn_weights)
             r2, p2, k2, n2 = self.attention_hc(mlp_2, *c2)
             prev_ev_r3, mlp_3, prev_mlp_out_3 = pending_mlp_b
             _stream_event_wait(mlp_3, [prev_mlp_out_3, raw_g_a, n2], prev_ev_r3.handle)
@@ -846,9 +866,9 @@ class PreparedGlmLayer:
             r1, p1, k1, n1 = self.attention_hc(src_1)
             norm_a_sh = torch.cat((n0, n1), dim=0)
             qkv_a, beta_a, fin_a = self.attention.project_input_shard(
-                norm_a_sh, out=seg_proj[:half] if zero_copy else None)
+                norm_a_sh, out=seg_proj[:half] if zero_copy else None, weights=attn_weights)
             raw_g_a = self.attention.project_forget_shard(
-                fin_a, out=seg_raw_g[:half] if zero_copy else None)
+                fin_a, out=seg_raw_g[:half] if zero_copy else None, weights=attn_weights)
             sinit_sh = self.attention.pack_initial_state(metadata)
             p_sinit = self.cr_sinit_gather.start(sinit_sh, dependencies=(raw_g_a,))
             r2, p2, k2, n2 = self.attention_hc(src_2)
@@ -856,26 +876,34 @@ class PreparedGlmLayer:
             norm_b_sh = torch.cat((n2, n3), dim=0)
 
         qkv_b, beta_b, fin_b = self.attention.project_input_shard(
-            norm_b_sh, out=seg_proj[half:] if zero_copy else None)
+            norm_b_sh, out=seg_proj[half:] if zero_copy else None, weights=attn_weights)
         sinit_full = self.cr_sinit_gather.finish(p_sinit, qkv_b)
 
         halo_sh = self.attention.pack_conv_halo(qkv_b, metadata)
         p_halo = self.cr_halo_gather.start(halo_sh, dependencies=(sinit_full,))
         raw_g_b = self.attention.project_forget_shard(
-            fin_b, out=seg_raw_g[half:] if zero_copy else None)
+            fin_b, out=seg_raw_g[half:] if zero_copy else None, weights=attn_weights)
         halo_full = self.cr_halo_gather.finish(p_halo, raw_g_b)
 
+        # Overlap next layer's Phase 1 weight prefetch behind summarize_segment (~4.5 ms idle DMA).
+        p_w1 = (
+            weight_gather.start_phase1(next_layer_index, [halo_full])
+            if weight_gather is not None and next_layer_index is not None else None
+        )
         summary, scan_sh = self.attention.summarize_segment(
             qkv_a, qkv_b, raw_g_a, raw_g_b, beta_a, beta_b, halo_full, metadata,
-            seg_projected=seg_proj, seg_raw_g=seg_raw_g)
+            seg_projected=seg_proj, seg_raw_g=seg_raw_g, weights=attn_weights)
 
-        p_scan = self.cr_scan_gather.start(scan_sh, dependencies=(halo_full,))
-        z_a = self.attention.project_gate_shard(norm_a_sh)
-        z_b = self.attention.project_gate_shard(norm_b_sh)
+        scan_deps = (halo_full, *p_w1.buffers) if p_w1 is not None else (halo_full,)
+        p_scan = self.cr_scan_gather.start(scan_sh, dependencies=scan_deps)
+        z_a = self.attention.project_gate_shard(norm_a_sh, weights=attn_weights)
+        z_b = self.attention.project_gate_shard(norm_b_sh, weights=attn_weights)
         scan_full = self.cr_scan_gather.finish(p_scan, z_b)
 
+        # Overlap next layer's Phase 2 weight prefetch behind finalize_segment (~3.5 ms idle DMA).
+        pending_next_w = weight_gather.start_phase2(p_w1, [scan_full]) if p_w1 is not None else None
         rec_a, rec_b, live_a, live_b, s4, conv_all = self.attention.finalize_segment(
-            summary, sinit_full, scan_full, metadata)
+            summary, sinit_full, scan_full, metadata, weights=attn_weights)
         q = self.q_shard_tokens
         rec_0, rec_1 = rec_a.split(q, dim=0)
         rec_2, rec_3 = rec_b.split(q, dim=0)
@@ -894,41 +922,45 @@ class PreparedGlmLayer:
         ffn_3 = torch.empty_strided(g_shape, g_stride, dtype=g_dtype, device=device)
 
         # Enqueue each quarter gather immediately as its shard becomes ready so g0..g3 run back-to-back during att_1..3.
-        att_0 = self.attention.output_shard(rec_0.contiguous(), z_0.contiguous(), live_0)
+        att_0 = self.attention.output_shard(rec_0.contiguous(), z_0.contiguous(), live_0, weights=attn_weights)
         mr0, mp0, mk0, ffn_0_sh = self.mlp_hc(att_0, r0, p0, k0)
+        ffn0_deps = [scan_full, *pending_next_w.buffers, ffn_0_sh] if pending_next_w is not None else [scan_full, ffn_0_sh]
         _stream_event_record(ffn_0_sh, [scan_full], self._ev_sh0.handle)
-        _dma_gather_enqueue(ffn_0_sh, ffn_0, [scan_full, ffn_0_sh], self._gather_q[0].handle, aux, self._ev_sh0.handle, self._ev_g0.handle)
+        _dma_gather_enqueue(ffn_0_sh, ffn_0, ffn0_deps, self._gather_q[0].handle, aux, self._ev_sh0.handle, self._ev_g0.handle)
 
-        att_1 = self.attention.output_shard(rec_1.contiguous(), z_1.contiguous(), live_1)
+        att_1 = self.attention.output_shard(rec_1.contiguous(), z_1.contiguous(), live_1, weights=attn_weights)
         mr1, mp1, mk1, ffn_1_sh = self.mlp_hc(att_1, r1, p1, k1)
         _stream_event_record(ffn_1_sh, [ffn_0], self._ev_sh1.handle)
         _dma_gather_enqueue(ffn_1_sh, ffn_1, [ffn_0, ffn_1_sh], self._gather_q[1].handle, aux, self._ev_sh1.handle, self._ev_g1.handle)
 
-        att_2 = self.attention.output_shard(rec_2.contiguous(), z_2.contiguous(), live_2)
+        att_2 = self.attention.output_shard(rec_2.contiguous(), z_2.contiguous(), live_2, weights=attn_weights)
         mr2, mp2, mk2, ffn_2_sh = self.mlp_hc(att_2, r2, p2, k2)
         _stream_event_record(ffn_2_sh, [ffn_1], self._ev_sh2.handle)
         _dma_gather_enqueue(ffn_2_sh, ffn_2, [ffn_1, ffn_2_sh], self._gather_q[2].handle, aux, self._ev_sh2.handle, self._ev_g2.handle)
 
-        att_3 = self.attention.output_shard(rec_3.contiguous(), z_3.contiguous(), live_3)
+        att_3 = self.attention.output_shard(rec_3.contiguous(), z_3.contiguous(), live_3, weights=attn_weights)
         self.attention.commit_state(s4, conv_all, metadata)
         mr3, mp3, mk3, ffn_3_sh = self.mlp_hc(att_3, r3, p3, k3)
         _stream_event_record(ffn_3_sh, [ffn_2], self._ev_sh3.handle)
         _dma_gather_enqueue(ffn_3_sh, ffn_3, [ffn_2, ffn_3_sh], self._gather_q[3].handle, aux, self._ev_sh3.handle, self._ev_g3.handle)
 
-        return self._finish_pipelined_ffn_quarters(
+        out, pend_b = self._finish_pipelined_ffn_quarters(
             (ffn_0, ffn_1, ffn_2, ffn_3), (ffn_0_sh, ffn_1_sh, ffn_2_sh, ffn_3_sh),
             ((mr0, mp0, mk0), (mr1, mp1, mk1), (mr2, mp2, mk2), (mr3, mp3, mk3)),
         )
+        return (out, pend_b, pending_next_w) if weight_gather is not None else (out, pend_b)
 
-    def _forward_pipelined_row_shard_mla(self, incoming, metadata, *, pos_a, pos_b, pending_mlp_b):
+    def _forward_pipelined_row_shard_mla(self, incoming, metadata, *, pos_a, pos_b, pending_mlp_b,
+                                         attn_weights=None, weight_gather=None, next_layer_index=None):
         if self.mlp_quarters:
             return self._forward_pipelined_row_shard_mla_quarters(
-                incoming, metadata, pos_a=pos_a, pos_b=pos_b, pending_mlp_b=pending_mlp_b)
+                incoming, metadata, pos_a=pos_a, pos_b=pos_b, pending_mlp_b=pending_mlp_b,
+                attn_weights=attn_weights, weight_gather=weight_gather, next_layer_index=next_layer_index)
         if self.has_carry:
             mlp_a, prev_res_a, prev_post_a, prev_comb_a, prev_res_b, prev_post_b, prev_comb_b = incoming
             res_a, post_a, comb_a, norm_a_sh = self.attention_hc(mlp_a, prev_res_a, prev_post_a, prev_comb_a)
             qres_a, idxq_a, win_a, cache_a_sh = self.attention.project_shard(norm_a_sh)
-            absorbed_a = self.attention.prepare_query_shard(qres_a)
+            absorbed_a = self.attention.prepare_query_shard(qres_a, weights=attn_weights)
             prev_cr, p_prev_b = pending_mlp_b
             mlp_b = prev_cr.finish(p_prev_b, absorbed_a)
             p_cache_a = self.cr_cache_gather_a.start(cache_a_sh, dependencies=(mlp_b,))
@@ -937,7 +969,7 @@ class PreparedGlmLayer:
             src_a, src_b = incoming
             res_a, post_a, comb_a, norm_a_sh = self.attention_hc(src_a)
             qres_a, idxq_a, win_a, cache_a_sh = self.attention.project_shard(norm_a_sh)
-            absorbed_a = self.attention.prepare_query_shard(qres_a)
+            absorbed_a = self.attention.prepare_query_shard(qres_a, weights=attn_weights)
             p_cache_a = self.cr_cache_gather_a.start(cache_a_sh, dependencies=(absorbed_a,))
             res_b, post_b, comb_b, norm_b_sh = self.attention_hc(src_b)
         qres_b, idxq_b, win_b, cache_b_sh = self.attention.project_shard(norm_b_sh)
@@ -945,18 +977,19 @@ class PreparedGlmLayer:
         cache_b_full = self.cache_gather_b(cache_b_sh, dependencies=(cache_a_full,))
 
         if self.contiguous_shards:
+            w = self.attention.context_ranks
             cache_all = torch.stack(
-                (cache_a_full.view(4, self.shard_tokens, 768),
-                 cache_b_full.view(4, self.shard_tokens, 768)), dim=1
+                (cache_a_full.view(w, self.shard_tokens, 768),
+                 cache_b_full.view(w, self.shard_tokens, 768)), dim=1
             ).reshape(self.half_tokens * 2, 768)
         else:
             cache_all = torch.cat((cache_a_full, cache_b_full), dim=0)
 
         # Overlap QueryChain(B) behind cache writes + C4 pool gather, then overlap C4 selection(A+B)
         # on the auxiliary stream behind main-stream VarlenRing latent slab gather.
-        p_qb = self.attention.start_query_shard(qres_b, dependencies=(cache_b_full,))
+        p_qb = self.attention.start_query_shard(qres_b, dependencies=(cache_b_full,), weights=attn_weights)
         global_index_cache, end = self.attention.write_and_gather_pools(cache_all, metadata)
-        absorbed_b = self.attention.finish_query_shard(p_qb, qres_b, global_index_cache)
+        absorbed_b = self.attention.finish_query_shard(p_qb, qres_b, global_index_cache, weights=attn_weights)
 
         p_sel = self.attention.start_select_shards(
             idxq_a, win_a, pos_a, idxq_b, win_b, pos_b, global_index_cache, dependencies=(absorbed_b,))
@@ -966,17 +999,25 @@ class PreparedGlmLayer:
         (phys_a, sel_a), (phys_b, sel_b) = self.attention.finish_select_shards(
             p_sel, idxq_a, win_a, pos_a, idxq_b, win_b, pos_b, global_index_cache, slab)
 
-        att_a = self.attention.attend_prepared_shard(absorbed_a, phys_a, sel_a, pos_a, slab)
+        # Overlap next layer's full attention weight prefetch behind sparse MLA att_a (~10.5 ms idle DMA).
+        pending_next_w = (
+            weight_gather.start_full(next_layer_index, [phys_b, slab])
+            if weight_gather is not None and next_layer_index is not None else None
+        )
+        att_a = self.attention.attend_prepared_shard(absorbed_a, phys_a, sel_a, pos_a, slab, weights=attn_weights)
         mres_a, mpost_a, mcomb_a, ffn_a_sh = self.mlp_hc(att_a, res_a, post_a, comb_a)
-        p_ffn_a = self.cr_mlp_gather_a.start(ffn_a_sh, dependencies=(ffn_a_sh, absorbed_b))
-        att_b = self.attention.attend_prepared_shard(absorbed_b, phys_b, sel_b, pos_b, slab)
+        ffn_deps = (ffn_a_sh, absorbed_b, *pending_next_w.buffers) if pending_next_w is not None else (ffn_a_sh, absorbed_b)
+        p_ffn_a = self.cr_mlp_gather_a.start(ffn_a_sh, dependencies=ffn_deps)
+        att_b = self.attention.attend_prepared_shard(absorbed_b, phys_b, sel_b, pos_b, slab, weights=attn_weights)
         mres_b, mpost_b, mcomb_b, ffn_b_sh = self.mlp_hc(att_b, res_b, post_b, comb_b)
         ffn_a = self.cr_mlp_gather_a.finish(p_ffn_a, ffn_b_sh)
 
-        return self._finish_pipelined_ffn(
+        out, pend_b = self._finish_pipelined_ffn(
             ffn_a, ffn_b_sh, (mres_a, mpost_a, mcomb_a), (mres_b, mpost_b, mcomb_b))
+        return (out, pend_b, pending_next_w) if weight_gather is not None else (out, pend_b)
 
-    def _forward_pipelined_row_shard_mla_quarters(self, incoming, metadata, *, pos_a, pos_b, pending_mlp_b):
+    def _forward_pipelined_row_shard_mla_quarters(self, incoming, metadata, *, pos_a, pos_b, pending_mlp_b,
+                                                  attn_weights=None, weight_gather=None, next_layer_index=None):
         if self.has_carry:
             mlp_0, mlp_1, mlp_2, c0, c1, c2, c3 = incoming
             r0, p0, k0, n0 = self.attention_hc(mlp_0, *c0)
@@ -1004,20 +1045,21 @@ class PreparedGlmLayer:
 
         # Overlap cache_gather_b behind q_b_proj(A) + query_absorption(A).
         p_cache_b = self.cr_cache_gather_b.start(cache_b_sh, dependencies=(cache_a_full,))
-        absorbed_a = self.attention.prepare_query_shard(qres_a)
+        absorbed_a = self.attention.prepare_query_shard(qres_a, weights=attn_weights)
         cache_b_full = self.cr_cache_gather_b.finish(p_cache_b, absorbed_a)
 
         if self.contiguous_shards:
+            w = self.attention.context_ranks
             cache_all = torch.stack(
-                (cache_a_full.view(4, self.shard_tokens, 768),
-                 cache_b_full.view(4, self.shard_tokens, 768)), dim=1
+                (cache_a_full.view(w, self.shard_tokens, 768),
+                 cache_b_full.view(w, self.shard_tokens, 768)), dim=1
             ).reshape(self.half_tokens * 2, 768)
         else:
             cache_all = torch.cat((cache_a_full, cache_b_full), dim=0)
 
-        p_qb = self.attention.start_query_shard(qres_b, dependencies=(cache_b_full,))
+        p_qb = self.attention.start_query_shard(qres_b, dependencies=(cache_b_full,), weights=attn_weights)
         global_index_cache, end = self.attention.write_and_gather_pools(cache_all, metadata)
-        absorbed_b = self.attention.finish_query_shard(p_qb, qres_b, global_index_cache)
+        absorbed_b = self.attention.finish_query_shard(p_qb, qres_b, global_index_cache, weights=attn_weights)
 
         p_sel = self.attention.start_select_shards(
             idxq_a, win_a, pos_a, idxq_b, win_b, pos_b, global_index_cache, dependencies=(absorbed_b,))
@@ -1036,18 +1078,25 @@ class PreparedGlmLayer:
         ffn_2 = torch.empty_strided(g_shape, g_stride, dtype=g_dtype, device=device)
         ffn_3 = torch.empty_strided(g_shape, g_stride, dtype=g_dtype, device=device)
 
-        # Overlap both g0 and g1 completely inside att_b (~10.5 ms), then enqueue g2 and g3 as att_b finishes.
-        att_a = self.attention.attend_prepared_shard(absorbed_a, phys_a, sel_a, pos_a, slab)
+        # Overlap next layer's full attention weight prefetch inside att_a (~10.5 ms idle DMA),
+        # then overlap g0 and g1 inside att_b (~10.5 ms).
+        pending_next_w = (
+            weight_gather.start_full(next_layer_index, [phys_b, slab])
+            if weight_gather is not None and next_layer_index is not None else None
+        )
+        att_a = self.attention.attend_prepared_shard(absorbed_a, phys_a, sel_a, pos_a, slab, weights=attn_weights)
         att_0, att_1 = att_a.split(q, dim=0)
         mr0, mp0, mk0, ffn_0_sh = self.mlp_hc(att_0.contiguous(), r0, p0, k0)
+        ffn0_deps = ([phys_b, absorbed_b, *pending_next_w.buffers, ffn_0_sh]
+                     if pending_next_w is not None else [phys_b, absorbed_b, ffn_0_sh])
         _stream_event_record(ffn_0_sh, [phys_b, absorbed_b], self._ev_sh0.handle)
-        _dma_gather_enqueue(ffn_0_sh, ffn_0, [phys_b, absorbed_b, ffn_0_sh], self._gather_q[0].handle, aux, self._ev_sh0.handle, self._ev_g0.handle)
+        _dma_gather_enqueue(ffn_0_sh, ffn_0, ffn0_deps, self._gather_q[0].handle, aux, self._ev_sh0.handle, self._ev_g0.handle)
 
         mr1, mp1, mk1, ffn_1_sh = self.mlp_hc(att_1.contiguous(), r1, p1, k1)
         _stream_event_record(ffn_1_sh, [ffn_0], self._ev_sh1.handle)
         _dma_gather_enqueue(ffn_1_sh, ffn_1, [ffn_0, ffn_1_sh], self._gather_q[1].handle, aux, self._ev_sh1.handle, self._ev_g1.handle)
 
-        att_b = self.attention.attend_prepared_shard(absorbed_b, phys_b, sel_b, pos_b, slab)
+        att_b = self.attention.attend_prepared_shard(absorbed_b, phys_b, sel_b, pos_b, slab, weights=attn_weights)
         att_2, att_3 = att_b.split(q, dim=0)
         mr2, mp2, mk2, ffn_2_sh = self.mlp_hc(att_2.contiguous(), r2, p2, k2)
         _stream_event_record(ffn_2_sh, [ffn_1], self._ev_sh2.handle)
@@ -1057,10 +1106,11 @@ class PreparedGlmLayer:
         _stream_event_record(ffn_3_sh, [ffn_2], self._ev_sh3.handle)
         _dma_gather_enqueue(ffn_3_sh, ffn_3, [ffn_2, ffn_3_sh], self._gather_q[3].handle, aux, self._ev_sh3.handle, self._ev_g3.handle)
 
-        return self._finish_pipelined_ffn_quarters(
+        out, pend_b = self._finish_pipelined_ffn_quarters(
             (ffn_0, ffn_1, ffn_2, ffn_3), (ffn_0_sh, ffn_1_sh, ffn_2_sh, ffn_3_sh),
             ((mr0, mp0, mk0), (mr1, mp1, mk1), (mr2, mp2, mk2), (mr3, mp3, mk3)),
         )
+        return (out, pend_b, pending_next_w) if weight_gather is not None else (out, pend_b)
 
     def _finish_pipelined_ffn_quarters(self, ffns, ffn_shs, carries):
         ffn_0, ffn_1, ffn_2, ffn_3 = ffns

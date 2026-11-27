@@ -275,14 +275,9 @@ def test_split_recurrent_metadata(live, fresh, ckpt, exp_a, exp_b):
         assert half_meta.checkpoint_state_indices.item() == c_slot
 
 
-def test_replicated_attention_bytes_and_pool_gather_counts():
-    assert recipe.replicated_attention_bytes(1) == 0
-    expected_mla = 11 * (16384 * 1536 + 32768 * 512 + 4096 * 16384) * 2
-    expected_kda = 34 * (
-        (4 * 8192 * 4096 + 64 * 4096 + 128 * 4096 + 2 * 8192 * 128 + 3 * 8192 * 4) * 2
-        + (8192 + 64) * 4
-    )
-    assert recipe.replicated_attention_bytes(4) == expected_mla + expected_kda
+def test_zero_replicated_attention_and_pool_gather_counts():
+    assert not hasattr(recipe, "replicated_attention_bytes")
+    assert stack.ROW_SHARD_ATTENTION_MIN_TOKENS == 8192
     for end_val in (0, 1, 3, 4, 7, 16, 17, 1023, 131072):
         counts = dcp.pool_gather_counts(torch.tensor([end_val], dtype=torch.int64), 4, 8192)
         assert counts.shape == (4,) and counts.dtype == torch.int64
@@ -344,11 +339,11 @@ def test_glm53_parameters_gate_row_shard_prefill_and_attention():
     ctx_tp4 = ParameterContext(recipe=recipe.RECIPE, checkpoint=recipe.RECIPE.checkpoints[1], gpus=sm120, world_size=4)
     enabled.validate(ctx_tp4)
     assert enabled.filter_world_sizes((1, 2, 4), ctx_tp4) == (2, 4)
-    assert enabled.adjust_weights_bytes(1000, ctx_tp4) == 1000 + recipe.replicated_attention_bytes(4)
+    assert enabled.adjust_weights_bytes(1000, ctx_tp4) == 1000
 
     ctx_tp2 = ParameterContext(recipe=recipe.RECIPE, checkpoint=recipe.RECIPE.checkpoints[1], gpus=sm120[:2], world_size=2)
     enabled.validate(ctx_tp2)
-    assert enabled.adjust_weights_bytes(1000, ctx_tp2) == 1000 + recipe.replicated_attention_bytes(2)
+    assert enabled.adjust_weights_bytes(1000, ctx_tp2) == 1000
 
     ctx_tp1 = ParameterContext(recipe=recipe.RECIPE, checkpoint=recipe.RECIPE.checkpoints[1], gpus=sm120[:1], world_size=1)
     with pytest.raises(UsageError, match="requires tensor parallelism"):

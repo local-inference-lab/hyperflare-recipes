@@ -19,6 +19,9 @@ from hyperflare_recipes.components.mlp import MLPScratch
 from hyperflare_recipes.components.parallel import TensorParallelShard
 from hyperflare_recipes.components.recurrent import DeltaMetadata
 from hyperflare_recipes.components.vocabulary import PreparedVocabularyProjection
+from hyperflare_recipes.components.weight_gather import (
+    AttentionWeightGatherer, full_kda_template, full_mla_template,
+)
 
 from .decoder import LayerScratch, PreparedGlmLayer
 from .kda import (
@@ -32,6 +35,7 @@ from .weights import ModelWeights, MoEWeights
 
 DMA_PREFILL_TOKENS = 1024
 PIPELINED_PREFILL_TOKENS = 2048
+ROW_SHARD_ATTENTION_MIN_TOKENS = 8192
 QUARTER_MLP_PREFILL_TOKENS = 10240
 
 
@@ -279,23 +283,33 @@ class PreparedDecoder:
         gathered_mlp = None
         final_norm_source = None
 
+        has_attn_weights = (
+            weights.layers[0].attention is not None
+            and isinstance(weights.layers[0].attention, dict)
+            and "input_proj" in weights.layers[0].attention
+        )
+        attn_eligible = (
+            row_shard_attention
+            and has_attn_weights
+            and self.tokens >= ROW_SHARD_ATTENTION_MIN_TOKENS
+        )
+        self.weight_gather = None
         if self.pipelined:
             half = self.half_tokens
             rows = half // weights.shard.world_size
             gathered_input = scratch.embedding[:half]
             full_attention_input = scratch.embedding
-            replicated = getattr(weights, "replicated_attention", None)
             use_row_shard_mla = (
-                row_shard_attention and replicated is not None
+                attn_eligible
                 and context is not None and context.records is not None
-                and any(idx % 4 == 3 for idx in replicated)
+                and any(m.block_type == "indexed_attention" for m in language.layers)
             )
             exchange = row_shard_exchange
-            if exchange is None and row_shard_attention and replicated is not None:
+            if exchange is None and attn_eligible:
                 exchange = RowShardExchangeScratch.allocate(self.tokens, weights.shard, self.device)
             use_row_shard_kda = (
-                row_shard_attention and replicated is not None and exchange is not None
-                and any(idx % 4 != 3 for idx in replicated)
+                attn_eligible and exchange is not None
+                and any(m.block_type == "linear_attention" for m in language.layers)
                 and PreparedGatherShards.fits(runtime, exchange.scan_sh, exchange.scan_full)
             )
             self.contiguous_shards = bool(use_row_shard_kda)
@@ -354,19 +368,18 @@ class PreparedDecoder:
                 rows = self.shard_rows.numel()
                 # After embedding selection, all serial gathers can reuse its full-row declaration buffer.
                 gathered_input = scratch.embedding
-                replicated = getattr(weights, "replicated_attention", None)
                 use_row_shard_mla = (
-                    row_shard_attention and replicated is not None
+                    attn_eligible
                     and context is not None and context.records is not None
-                    and any(idx % 4 == 3 for idx in replicated)
+                    and any(m.block_type == "indexed_attention" for m in language.layers)
                 )
                 exchange = row_shard_exchange
-                if exchange is None and row_shard_attention and replicated is not None:
+                if exchange is None and attn_eligible:
                     exchange = RowShardExchangeScratch.allocate(
                         self.tokens, weights.shard, self.device, single_segment=True)
                 use_row_shard_kda = (
-                    row_shard_attention and replicated is not None and exchange is not None
-                    and any(idx % 4 != 3 for idx in replicated)
+                    attn_eligible and exchange is not None
+                    and any(m.block_type == "linear_attention" for m in language.layers)
                     and PreparedGatherShards.fits(runtime, exchange.scan_sh, exchange.scan_full)
                 )
                 self.contiguous_shards = bool(use_row_shard_kda)
@@ -390,11 +403,31 @@ class PreparedDecoder:
                     mla=mla_row_shard_scratch if use_row_shard_mla else scratch.mla,
                     attention_output=scratch.attention_output[:rows], mlp_output=scratch.mlp_output[:rows])
 
-        replicated_map = getattr(weights, "replicated_attention", None) or {}
+        kda_template = mla_template = None
+        if use_row_shard_kda or use_row_shard_mla:
+            # Share one transient full-head weight template per layer kind for tuning only;
+            # projections drop their references at finalization so zero replicated weights persist.
+            if use_row_shard_kda:
+                first_kda = next(lw.attention for m, lw in zip(language.layers, weights.layers, strict=True)
+                                 if m.block_type == "linear_attention")
+                kda_template = full_kda_template(first_kda, world_size=weights.shard.world_size, device=self.device)
+            if use_row_shard_mla:
+                first_mla = next(lw.attention for m, lw in zip(language.layers, weights.layers, strict=True)
+                                 if m.block_type == "indexed_attention")
+                mla_template = full_mla_template(first_mla, world_size=weights.shard.world_size, device=self.device)
+            self.weight_gather = AttentionWeightGatherer(
+                [lw.attention for lw in weights.layers],
+                [m.block_type for m in language.layers],
+                world_size=weights.shard.world_size,
+                runtime=runtime, coordinator=coordinator, session=session,
+                name=name, workspace=workspace, pipelined=self.pipelined, device=self.device,
+            )
         self.layers = []
         for index, (module, layer_weights, layer_state) in enumerate(zip(
                 language.layers, weights.layers, state.layers, strict=True)):
             indexed = module.block_type == "indexed_attention"
+            layer_rs_attn = (use_row_shard_mla and indexed) or (use_row_shard_kda and not indexed)
+            layer_template = (mla_template if indexed else kda_template) if layer_rs_attn else None
             layer = PreparedGlmLayer(module, layer_weights.attention, layer_weights.mlp, layer_weights.residual,
                 scratch.residual if index == 0 else scratch.mlp_output, scratch.residual,
                 scratch.layer(module.block_type, sparse=isinstance(layer_weights.mlp, MoEWeights)), layer_state,
@@ -405,22 +438,27 @@ class PreparedDecoder:
                 max_cache_pages=max_cache_pages, context=context,
                 kda_records=None if kda_records is None or indexed else kda_records.layer(index),
                 pipelined=self.pipelined,
-                row_shard_attention=(use_row_shard_mla and indexed) or (use_row_shard_kda and not indexed),
-                replicated_attention=(replicated_map.get(index)
-                                      if ((use_row_shard_mla and indexed) or (use_row_shard_kda and not indexed))
-                                      else None),
+                row_shard_attention=layer_rs_attn,
+                replicated_attention=layer_template,
+                runtime_weights=layer_rs_attn,
                 full_attention_input=full_attention_input if (self.pipelined and indexed and not use_row_shard_mla) else None,
                 rank_index=kda_rank_index if (use_row_shard_kda and not indexed) else None,
                 segment_eye=kda_segment_eye if (use_row_shard_kda and not indexed) else None,
                 kda_segment_pool=kda_segment_pool if (use_row_shard_kda and not indexed) else None,
                 kda_local_conv=kda_local_conv if (use_row_shard_kda and not indexed) else None,
-                row_shard_buffers=exchange if ((use_row_shard_mla and indexed) or (use_row_shard_kda and not indexed)) else None,
+                row_shard_buffers=exchange if layer_rs_attn else None,
                 contiguous_shards=self.contiguous_shards,
                 mlp_quarters=self.mlp_quarters,
                 gathered_mlp=gathered_mlp)
             self.layers.append(layer)
             if progress is not None:
                 progress(f"declared {mode} layer {index + 1}/45")
+        if self.weight_gather is not None and self.pipelined:
+            from .decoder import _collect_plans
+
+            for layer in self.layers:
+                self.weight_gather.register_parallel(
+                    workspace, _collect_plans(layer.attention, layer.mlp_hc, layer.mlp))
 
         if ((self.pipelined or self.shard_rows is not None) and self.contiguous_shards and self.scoring is None
                 and self.sample_rows == 1 and boundary_runtime is not None
@@ -449,6 +487,8 @@ class PreparedDecoder:
 
     def functional(self, *, session):
         self.embedding.functional(session=session, dynamic_inputs=True)
+        if self.weight_gather is not None:
+            self.weight_gather.functional(session=session)
         for layer in self.layers:
             layer.release_outputs(session=session)
         if self.final_gather is not None:
@@ -486,8 +526,11 @@ class PreparedDecoder:
             layer_records = None if records is None or index not in records.layers else records.layer(index)
             indexed = layer.module.block_type == "indexed_attention"
             attention_metadata = metadata.indexed if indexed else metadata.recurrent
+            attn_w = (self.weight_gather.gather_sync(index)
+                      if self.weight_gather is not None and (getattr(layer, "row_shard_kda", False) or getattr(layer, "row_shard_mla", False))
+                      else None)
             value, carry = layer(value, attention_metadata, carry, records=layer_records,
-                                 pos_sh=pos_sh if indexed else None)
+                                 pos_sh=pos_sh if indexed else None, attn_weights=attn_w)
         if self.sharded_final_norm:
             return self._finish_sharded_final_norm(language, value, metadata, records)
         auxiliary = None
@@ -530,10 +573,26 @@ class PreparedDecoder:
             pos_a = torch.index_select(metadata.indexed.positions, 0, self.shard_rows_a)
             pos_b = torch.index_select(metadata.indexed.positions, 0, self.shard_rows_b)
         pending_mlp_b = None
+        pending_weights = None
+        cur_weights = (
+            self.weight_gather.gather_sync(0)
+            if self.weight_gather is not None and (getattr(self.layers[0], "row_shard_kda", False) or getattr(self.layers[0], "row_shard_mla", False))
+            else None
+        )
+        n_layers = len(self.layers)
         for index, layer in enumerate(self.layers):
             layer_records = None if records is None or index not in records.layers else records.layer(index)
             indexed = layer.module.block_type == "indexed_attention"
-            incoming, pending_mlp_b = layer.forward_pipelined(
+            if pending_weights is not None:
+                cur_weights = self.weight_gather.finish(pending_weights, dependencies=(incoming[0],))
+                pending_weights = None
+            next_idx = (
+                index + 1
+                if (self.weight_gather is not None and index + 1 < n_layers
+                    and (getattr(self.layers[index + 1], "row_shard_kda", False) or getattr(self.layers[index + 1], "row_shard_mla", False)))
+                else None
+            )
+            result = layer.forward_pipelined(
                 incoming,
                 metadata.indexed if indexed else metadata.recurrent,
                 meta_a=None if indexed else meta_a,
@@ -542,7 +601,14 @@ class PreparedDecoder:
                 pos_b=pos_b if indexed else None,
                 pending_mlp_b=pending_mlp_b,
                 records=layer_records,
+                attn_weights=cur_weights if (getattr(layer, "row_shard_kda", False) or getattr(layer, "row_shard_mla", False)) else None,
+                weight_gather=self.weight_gather if next_idx is not None else None,
+                next_layer_index=next_idx,
             )
+            if len(result) == 3:
+                incoming, pending_mlp_b, pending_weights = result
+            else:
+                incoming, pending_mlp_b = result
         if self.sharded_final_norm:
             return self._finish_sharded_final_norm(language, torch.cat(incoming, dim=0), metadata, records)
         if self.mlp_quarters:

@@ -35,27 +35,6 @@ from hyperflare_recipes.parameters import (
 # add the draft layer's.
 _PAGE_LAYER_BYTES = 4 * 64 * 528 + 64 * 132
 _TARGET_PAGE_LAYERS = 11
-# Full 64-head BF16 MLA weights replicated per rank when --row-shard-attention is enabled:
-# q_b_proj (16384x1536), kv_b_proj (32768x512), o_proj (4096x16384) across 11 indexed layers.
-_REPLICATED_MLA_LAYER_BYTES = (16384 * 1536 + 32768 * 512 + 4096 * 16384) * 2
-# Full 64-head KDA weights replicated per rank across 34 linear layers (excluding already-replicated
-# g_a_proj and o_norm.weight): q/k/v/o_proj (4x8192x4096), b_proj (64x4096), f_a_proj (128x4096),
-# f_b_proj/g_b_proj (2x8192x128), q/k/v_conv1d (3x8192x4) in BF16, plus FP32 dt_bias (8192) and A_log (64).
-_TARGET_KDA_LAYERS = 34
-_REPLICATED_KDA_LAYER_BYTES = (
-    (4 * 8192 * 4096 + 64 * 4096 + 128 * 4096 + 2 * 8192 * 128 + 3 * 8192 * 4) * 2
-    + (8192 + 64) * 4
-)
-
-
-def replicated_attention_bytes(world_size, *, prompt_logprobs=False, mtp_only=False):
-    del prompt_logprobs, mtp_only
-    if world_size <= 1:
-        return 0
-    return (
-        _TARGET_PAGE_LAYERS * _REPLICATED_MLA_LAYER_BYTES
-        + _TARGET_KDA_LAYERS * _REPLICATED_KDA_LAYER_BYTES
-    )
 # Rough estimate of what a rank holds beyond stored weights, state rows, and
 # pages: operator scratch, graphs, collectives, and the CUDA context. It serves
 # every rank count and speculation setting.
@@ -92,8 +71,8 @@ class Glm53Parameters(RecipeParameters):
         group="advanced options",
         scope=ParameterScope.DEPLOYMENT,
         default_label="off",
-        help="also run eligible prefill attention layers on each rank's row shard using"
-             " replicated attention projections and sequence-parallel KDA/MLA; requires --row-shard-prefill",
+        help="also run eligible prefill attention layers on each rank's row shard by gathering"
+             " sharded attention weights on the fly with sequence-parallel KDA/MLA; requires --row-shard-prefill",
         status_label=lambda v: "row-sharded attention" if v else None,
     )
     # Recipe capability constraints (never CLI flags or manifest entries).
@@ -128,18 +107,6 @@ class Glm53Parameters(RecipeParameters):
             if any(gpu.capability == (10, 3) for gpu in context.gpus):
                 raise UsageError("--row-shard-prefill is not qualified on SM103; select SM120 or SM121 GPUs")
 
-    def adjust_weights_bytes(self, weights_bytes: int, context: ParameterContext) -> int:
-        weights_bytes = super().adjust_weights_bytes(weights_bytes, context)
-        if self.row_shard_attention and context.world_size is not None:
-            replicated = replicated_attention_bytes(
-                context.world_size,
-                prompt_logprobs=bool(self.prompt_logprobs and self.prompt_logprobs.enabled),
-                mtp_only=bool(self.speculation and self.speculation.mtp_only),
-            )
-            if type(replicated) is not int or replicated < 0:
-                raise ValueError("replicated_attention_bytes must return a non-negative integer")
-            return weights_bytes + replicated
-        return weights_bytes
 
 
 def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False,

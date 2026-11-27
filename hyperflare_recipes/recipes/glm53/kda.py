@@ -101,7 +101,7 @@ class PreparedGlmKDA:
                  metadata: DeltaMetadata, *, mode, session, name, workspace, checkpoint_export=False,
                  records=None, overlap_gate=True, row_shard=False, rank_index=None, segment_eye=None,
                  half_tokens=None, segment_pool=None, local_conv=None, seg_qkv=None, seg_beta=None,
-                 output_tokens=None, single_segment=False):
+                 output_tokens=None, single_segment=False, runtime_weights=False):
         if (source.ndim != 2 or source.shape[1] != 4096 or source.dtype != torch.bfloat16
                 or source.device.type != "cuda"):
             raise ValueError("GLM KDA requires BF16 [token_capacity, 4096] CUDA input")
@@ -112,6 +112,7 @@ class PreparedGlmKDA:
             raise ValueError("canonical KDA geometry differs from GLM 5.3 Flash")
         self.row_shard = bool(row_shard)
         self.single_segment = bool(single_segment) if self.row_shard else False
+        self.runtime_weights = bool(runtime_weights) if self.row_shard else False
         self.tokens, self.device = source.shape[0], source.device
         self.output_tokens = self.tokens if output_tokens is None else int(output_tokens)
         self.sequences = metadata.query_start_loc.numel() - 1
@@ -325,8 +326,9 @@ class PreparedGlmKDA:
     def functional(self, *, session):
         if self.gate_overlap is not None:
             self.gate_overlap.functional(session=session)
-        for projection in self.projections.values():
-            projection.functional(session=session)
+        for key, projection in self.projections.items():
+            release = self.runtime_weights and key != "g_a_proj"
+            projection.functional(session=session, release_weight=release)
         if self.verification is not None:
             self.verification.functional()
             self.output_norm.functional(session=session, dynamic_live=True)
@@ -338,6 +340,8 @@ class PreparedGlmKDA:
 
     def _release_bindings(self):
         self.conv_binding = self.recurrence = self.arena = None
+        if self.runtime_weights:
+            self.weights = None
 
     def __call__(self, source, metadata, *, records=None):
         if self.recording and records is None:
@@ -416,10 +420,11 @@ class PreparedGlmKDA:
         return (isinstance(self.projections["input_proj"], UnquantizedProjection)
                 and isinstance(self.projections["f_b_proj"], UnquantizedProjection))
 
-    def project_input_shard(self, source, *, out=None):
+    def project_input_shard(self, source, *, out=None, weights=None):
         """Run 64-head input projection on one half-segment of owned rows."""
         proj = self.projections["input_proj"]
-        projected = proj(source, output=out) if out is not None else proj(source)
+        w = None if weights is None else weights.input_proj
+        projected = proj(source, output=out, weight=w) if out is not None else proj(source, weight=w)
         qkv = projected[:, :24576]
         raw_beta = projected[:, 24576:24640]
         forget_in = projected[:, -128:].contiguous()
@@ -431,18 +436,20 @@ class PreparedGlmKDA:
         rank_conv = torch.index_select(self.state.convolution, 0, conv_slot).squeeze(0)[:, :3].transpose(0, 1)
         return torch.cat((rank_conv, qkv_b[-3:, :]), dim=-1).contiguous()
 
-    def project_forget_shard(self, forget_in, *, out=None):
+    def project_forget_shard(self, forget_in, *, out=None, weights=None):
         """Run 64-head forget projection on one half-segment (overlaps halo gather)."""
         proj = self.projections["f_b_proj"]
-        return proj(forget_in, output=out) if out is not None else proj(forget_in)
+        w = None if weights is None else weights.f_b_proj
+        return proj(forget_in, output=out, weight=w) if out is not None else proj(forget_in, weight=w)
 
-    def project_gate_shard(self, source):
+    def project_gate_shard(self, source, *, weights=None):
         """Run 64-head output gate chain on one half-segment (overlaps state scan gather)."""
         gate_in = self.projections["g_a_proj"](source)
-        return self.projections["g_b_proj"](gate_in).view(self.tokens, 64, 128)
+        w = None if weights is None else weights.g_b_proj
+        return self.projections["g_b_proj"](gate_in, weight=w).view(self.tokens, 64, 128)
 
     def summarize_segment(self, qkv_a, qkv_b, raw_g_a, raw_g_b, raw_beta_a, raw_beta_b, halo_full, metadata,
-                          *, seg_projected=None, seg_raw_g=None):
+                          *, seg_projected=None, seg_raw_g=None, weights=None):
         """Run one contiguous 2*tokens short_conv + segment_summarize and pack compressed scan payload."""
         if seg_projected is not None and seg_raw_g is not None:
             qkv = seg_projected[:, :24576]
@@ -480,8 +487,11 @@ class PreparedGlmKDA:
 
         convolved = torch.empty((self.seg_tokens, 24576), dtype=torch.bfloat16, device=device)
         conv_scratch = torch.empty(self.conv_plan.scratch_specs()[0].nbytes, dtype=torch.uint8, device=device)
+        conv_w = self.weights["conv1d.weight"] if weights is None else weights.conv1d
+        a_log = self.weights["A_log"] if weights is None else weights.A_log
+        dt_bias = (self.weights["dt_bias"] if weights is None else weights.dt_bias).view(64, 128)
         run_short_conv(
-            self.conv_plan, scratch=conv_scratch, x=qkv, conv_weight=self.weights["conv1d.weight"],
+            self.conv_plan, scratch=conv_scratch, x=qkv, conv_weight=conv_w,
             query_start_loc=qsl_r, state_slot_ids=slot0, state_is_fresh=conv_fresh,
             num_accepted_tokens=metadata.accepted_tokens[:1], num_seqs=num_seqs_conv, num_tokens=live_r,
             conv_state=local_conv, out=convolved,
@@ -499,7 +509,7 @@ class PreparedGlmKDA:
         zero_ckpt_off = torch.zeros_like(metadata.checkpoint_offsets[:1])
         kda_prefill.segment_summarize(
             self.recurrent_plan, q=q, k=k, v=v, raw_g=raw_g_h, raw_beta=raw_beta,
-            A_log=self.weights["A_log"], dt_bias=self.weights["dt_bias"].view(64, 128),
+            A_log=a_log, dt_bias=dt_bias,
             cu_seqlens=qsl_r, checkpoint_state_indices=zero_ckpt_idx,
             checkpoint_offsets=zero_ckpt_off, num_seqs=ns_one, num_tokens=live_r,
             scratch=seg_scratch, pool=pool, output=rec_out, lower_bound=-5.0, eps=1e-6,
@@ -522,7 +532,7 @@ class PreparedGlmKDA:
                    zero_ckpt_idx, zero_ckpt_off, seg_scratch, pool, rec_out)
         return summary, scan_sh
 
-    def finalize_segment(self, summary, s_init_full, scan_full, metadata):
+    def finalize_segment(self, summary, s_init_full, scan_full, metadata, *, weights=None):
         """Run 4-rank FP32 affine prefix scan and single contiguous segment_finalize."""
         (q, k, v, raw_g_h, raw_beta, qsl_r, ns_one, live_r,
          zero_ckpt_idx, zero_ckpt_off, seg_scratch, pool, rec_out) = summary
@@ -546,9 +556,11 @@ class PreparedGlmKDA:
         s_in = torch.index_select(torch.stack(tuple(states[:w]), dim=0), 0, self.rank_index).squeeze(0)
         pool[4].copy_(s_in)
 
+        a_log = self.weights["A_log"] if weights is None else weights.A_log
+        dt_bias = (self.weights["dt_bias"] if weights is None else weights.dt_bias).view(64, 128)
         kda_prefill.segment_finalize(
             self.recurrent_plan, q=q, k=k, v=v, raw_g=raw_g_h, raw_beta=raw_beta,
-            A_log=self.weights["A_log"], dt_bias=self.weights["dt_bias"].view(64, 128),
+            A_log=a_log, dt_bias=dt_bias,
             cu_seqlens=qsl_r, checkpoint_state_indices=zero_ckpt_idx,
             checkpoint_offsets=zero_ckpt_off, num_seqs=ns_one, num_tokens=live_r,
             scratch=seg_scratch, pool=pool, output=rec_out,
@@ -560,10 +572,11 @@ class PreparedGlmKDA:
         live_b = (live_r - self.tokens).clamp(0, self.tokens).to(torch.int32)
         return rec_a.contiguous(), rec_b.contiguous(), live_a, live_b, s4, conv_all
 
-    def output_shard(self, rec_sh, z_sh, live_sh):
+    def output_shard(self, rec_sh, z_sh, live_sh, *, weights=None):
         """Run fused gated RMSNorm and 64-head output projection on one shard segment."""
         gated = self.output_norm(rec_sh, z_sh, live=live_sh)
-        return self.projections["o_proj"](gated.reshape(self.output_tokens, 8192))
+        w = None if weights is None else weights.o_proj
+        return self.projections["o_proj"](gated.reshape(self.output_tokens, 8192), weight=w)
 
     def commit_state(self, s4, conv_all, metadata):
         """Write this rank's 16 decode heads of final recurrent and convolution state back to DeltaState."""

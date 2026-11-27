@@ -189,6 +189,35 @@ def _fake_join_query_chain(source, dependency, query, absorbed, gathered, worksp
     pass
 
 
+@torch.library.custom_op("flare::start_glm_query_chain_weighted", mutates_args=("query", "absorbed", "gathered", "workspace", "encoded"))
+def _start_query_chain_weighted(source: torch.Tensor, query: torch.Tensor, absorbed: torch.Tensor, gathered: torch.Tensor,
+                                workspace: torch.Tensor, encoded: list[torch.Tensor],
+                                extra_weights: list[torch.Tensor], dependencies: list[torch.Tensor],
+                                handle: int, stream: int) -> None:
+    auxiliary = torch.cuda.ExternalStream(stream, device=source.device)
+    auxiliary.wait_stream(torch.cuda.current_stream(source.device))
+    with torch.cuda.stream(auxiliary):
+        _CHAINS[handle].run(source, query, absorbed, gathered, workspace, encoded, extra_weights)
+
+
+@_start_query_chain_weighted.register_fake
+def _fake_start_query_chain_weighted(source, query, absorbed, gathered, workspace, encoded, extra_weights, dependencies, handle, stream):
+    pass
+
+
+@torch.library.custom_op("flare::join_glm_query_chain_weighted", mutates_args=("query", "absorbed", "gathered", "workspace", "encoded"))
+def _join_query_chain_weighted(source: torch.Tensor, dependency: torch.Tensor, query: torch.Tensor,
+                               absorbed: torch.Tensor, gathered: torch.Tensor, workspace: torch.Tensor,
+                               encoded: list[torch.Tensor], extra_weights: list[torch.Tensor],
+                               dependencies: list[torch.Tensor], stream: int) -> None:
+    torch.cuda.current_stream(query.device).wait_stream(torch.cuda.ExternalStream(stream, device=query.device))
+
+
+@_join_query_chain_weighted.register_fake
+def _fake_join_query_chain_weighted(source, dependency, query, absorbed, gathered, workspace, encoded, extra_weights, dependencies, stream):
+    pass
+
+
 @dataclass(frozen=True)
 class PendingQueryChain:
     source: torch.Tensor
@@ -197,6 +226,7 @@ class PendingQueryChain:
     gathered: torch.Tensor
     workspace: torch.Tensor
     encoded: list[torch.Tensor]
+    extra_weights: list[torch.Tensor]
     dependencies: list[torch.Tensor]
 
 
@@ -370,9 +400,10 @@ class QueryChain:
         side_bytes = self.projection.plan.memory_requirements().scratch_nbytes
         _, self.workspace = arena.views(((main_bytes,), torch.uint8), ((side_bytes,), torch.uint8))
 
-    def functional(self, *, session):
-        self.projection.functional(session=session)
-        self.absorb.functional(session=session)
+    def functional(self, *, session, release_weight=False):
+        self._release_weight = bool(release_weight)
+        self.projection.functional(session=session, release_weight=release_weight)
+        self.absorb.functional(session=session, release_weight=release_weight)
         if self.gather is not None:
             self.gather.functional(session=session)
         register_finalizer(session, self._finalize_functional, workspace=self.arena)
@@ -385,7 +416,7 @@ class QueryChain:
         self.workspace_nbytes = max(plan.memory_requirements().scratch_nbytes for plan in plans)
         self.encoded_layouts = ()
         if isinstance(self.projection, BlockFP8Projection):
-            rows, columns = self.query_layout[0][0], self.projection.weight.in_features
+            rows, columns = self.query_layout[0][0], self.projection.in_features
             self.encoded_layouts = (((rows, columns), torch.float8_e4m3fn),
                                    ((rows, columns // 128), torch.float32))
             if self.projection.sm103 and rows <= 32:
@@ -398,51 +429,100 @@ class QueryChain:
             self.workspace_nbytes = DEFAULT_WORKSPACE_SIZE
         self.source = self.query = self.absorbed = self.gathered = None
         self.arena = self.workspace = self.parallel_plans = None
+        if getattr(self, "_release_weight", False) and hasattr(self, "values"):
+            self.values = self.scales = None
 
-    def run(self, source, query, absorbed, gathered, workspace, encoded):
+    def _pack_extra_weights(self, runtime_weights):
+        if runtime_weights is None:
+            return []
+        qb = runtime_weights.q_b_proj
+        ab = runtime_weights.absorb
+        if isinstance(self.projection, BlockFP8Projection):
+            items = [qb.values, qb.scales]
+        elif isinstance(self.projection, QuantizedProjection):
+            items = [qb.weight.values, qb.weight.scale_mma.view(torch.uint8)]
+        else:
+            items = [qb]
+        if isinstance(ab, tuple):
+            items.extend(ab)
+        else:
+            items.append(ab)
+        return items
+
+    def run(self, source, query, absorbed, gathered, workspace, encoded, extra_weights=()):
         from hyperflare_recipes.components.sm103_projection import packed_out_workspace, _dense_out_workspace
 
         output = query.view(source.shape[0], -1)
+        idx = 0
         if isinstance(self.projection, BlockFP8Projection):
             from hyperflare_recipes.components.block_fp8 import _project_out, _quantize_out
 
             _quantize_out(source, encoded[0], encoded[1])
-            activation_scales, weight_scales = encoded[1], self.projection.weight.scales
+            if extra_weights:
+                w_vals, weight_scales = extra_weights[0], extra_weights[1]
+                idx = 2
+            else:
+                w_vals, weight_scales = self.projection.weight.values, self.projection.weight.scales
+            activation_scales = encoded[1]
             if len(encoded) == 4:
                 encoded[2].copy_(activation_scales.T)
                 encoded[3].copy_(weight_scales.T)
                 activation_scales, weight_scales = encoded[2:]
-            _project_out(encoded[0], activation_scales, self.projection.weight.values, weight_scales,
+            _project_out(encoded[0], activation_scales, w_vals, weight_scales,
                          output, workspace, self.projection.plan.handle)
         elif isinstance(self.projection, QuantizedProjection):
-            packed_out_workspace(source, self.values, self.scales, None, None, output, workspace, "none",
+            if extra_weights:
+                vals, sc = extra_weights[0], extra_weights[1]
+                idx = 2
+            else:
+                vals, sc = self.values, self.scales
+            packed_out_workspace(source, vals, sc, None, None, output, workspace, "none",
                                  None, self.projection.plan.handle, "any")
         elif self.projection.dense:
-            _dense_out_workspace(source, self.projection.weight, output, workspace, self.projection.plan.handle)
+            w = extra_weights[0] if extra_weights else self.projection.weight
+            idx = 1 if extra_weights else 0
+            _dense_out_workspace(source, w, output, workspace, self.projection.plan.handle)
         else:
             from b12x.gemm import bf16_gemv
 
-            bf16_gemv.mm(source, self.projection.weight, out=output, plan=self.projection.plan,
+            w = extra_weights[0] if extra_weights else self.projection.weight
+            idx = 1 if extra_weights else 0
+            bf16_gemv.mm(source, w, out=output, plan=self.projection.plan,
                          bias=self.projection.bias)
-        self.absorb(query.transpose(0, 1), output=absorbed.transpose(0, 1))
+        absorb_w = None
+        if extra_weights:
+            rem = extra_weights[idx:]
+            absorb_w = tuple(rem) if len(rem) > 1 else rem[0]
+        self.absorb(query.transpose(0, 1), output=absorbed.transpose(0, 1), weight=absorb_w)
         if self.gather is not None and not self.gather_on_main:
             self.gather(absorbed.view(absorbed.shape[0], -1), output=gathered.view(gathered.shape[0], -1))
 
-    def start(self, source, query, absorbed, gathered, *, dependencies=()):
+    def start(self, source, query, absorbed, gathered, *, dependencies=(), runtime_weights=None):
         if self.source is None:
             workspace = torch.empty(self.workspace_nbytes, dtype=torch.uint8, device=source.device)
         else:
             workspace = self.workspace
         encoded = [torch.empty(shape, dtype=dtype, device=source.device) for shape, dtype in self.encoded_layouts]
+        extra = self._pack_extra_weights(runtime_weights)
         deps = list(dependencies)
-        _start_query_chain(source, query, absorbed, gathered, workspace, encoded, deps, self.handle, self.stream_handle)
-        return PendingQueryChain(source, query, absorbed, gathered, workspace, encoded, deps)
+        if extra:
+            _start_query_chain_weighted(source, query, absorbed, gathered, workspace, encoded, extra, deps,
+                                        self.handle, self.stream_handle)
+        else:
+            _start_query_chain(source, query, absorbed, gathered, workspace, encoded, deps,
+                               self.handle, self.stream_handle)
+        return PendingQueryChain(source, query, absorbed, gathered, workspace, encoded, extra, deps)
 
     def finish(self, pending, dependency):
-        source, query, absorbed, gathered, workspace, encoded, deps = (
+        source, query, absorbed, gathered, workspace, encoded, extra, deps = (
             pending.source, pending.query, pending.absorbed, pending.gathered,
-            pending.workspace, pending.encoded, pending.dependencies)
-        _join_query_chain(source, dependency, query, absorbed, gathered, workspace, encoded, deps, self.stream_handle)
+            pending.workspace, pending.encoded, pending.extra_weights, pending.dependencies)
+        if extra:
+            _join_query_chain_weighted(source, dependency, query, absorbed, gathered, workspace, encoded, extra, deps,
+                                       self.stream_handle)
+        else:
+            _join_query_chain(source, dependency, query, absorbed, gathered, workspace, encoded, deps,
+                              self.stream_handle)
         if self.gather_on_main:
             self.gather(absorbed.view(absorbed.shape[0], -1), output=gathered.view(gathered.shape[0], -1))
         return gathered if self.gather is not None else absorbed
@@ -471,13 +551,14 @@ class PreparedGlmMLA:
 
     def __init__(self, module, weights, source, scratch: MLAScratch, state: MLAState,
                  metadata: IndexMetadata, *, mode, session, name, workspace, max_cache_pages=None, context=None,
-                 row_shard_rows=None, replicated_weights=None):
+                 row_shard_rows=None, replicated_weights=None, runtime_weights=False):
         rows, heads = scratch.query.shape[:2]
         self.row_shard = row_shard_rows is not None
+        self.runtime_weights = bool(runtime_weights) if self.row_shard else False
         if self.row_shard:
             if (mode != "prefill" or context is None or replicated_weights is None
                     or rows != row_shard_rows or heads != 64):
-                raise ValueError("row-sharded GLM MLA requires DCP prefill, full 64-head replicated weights, and matching shard rows")
+                raise ValueError("row-sharded GLM MLA requires DCP prefill, full 64-head weights/template, and matching shard rows")
         active_weights = (
             {**weights, **replicated_weights} if self.row_shard else weights
         )
@@ -688,12 +769,15 @@ class PreparedGlmMLA:
 
     def functional(self, *, session):
         if self.query_chain is not None:
-            self.query_chain.functional(session=session)
-        for projection in self.projections.values():
-            projection.functional(session=session)
+            self.query_chain.functional(session=session, release_weight=self.runtime_weights)
+        for key, projection in self.projections.items():
+            release = self.runtime_weights and key != "qkv_a_proj"
+            projection.functional(session=session, release_weight=release)
         if hasattr(self, "query_absorption"):
-            self.query_absorption.functional(session=session)
-            self.value_expansion.functional(session=session)
+            self.query_absorption.functional(session=session, release_weight=self.runtime_weights)
+            self.value_expansion.functional(session=session, release_weight=self.runtime_weights)
+        if self.runtime_weights:
+            register_finalizer(session, self._release_runtime_templates)
         self.indexer.functional(session=session)
         self.writer.functional(session=session)
         if hasattr(self, "attention"):
@@ -711,6 +795,9 @@ class PreparedGlmMLA:
 
     def _release_row_shard_cache(self):
         self.attention.inputs["kv_cache"] = None
+
+    def _release_runtime_templates(self):
+        self.absorb_weights = self.expand_weights = None
 
     def __call__(self, source, metadata):
         output, _ = self.forward(source, metadata)
@@ -792,13 +879,15 @@ class PreparedGlmMLA:
         cache_payload = torch.cat((latent, norm_key, gate), dim=-1)
         return query_res, idx_query, weight_in, cache_payload
 
-    def prepare_query_shard(self, query_res_sh):
+    def prepare_query_shard(self, query_res_sh, *, weights=None):
         """Project and absorb 64-head queries on owned rows (independent of cache/context gathers)."""
         rows = query_res_sh.shape[0]
-        query = self.projections["q_b_proj"](query_res_sh).view(rows, 64, 256)
-        return self.query_absorption(query.transpose(0, 1)).transpose(0, 1).contiguous()
+        qb_w = None if weights is None else weights.q_b_proj
+        ab_w = None if weights is None else weights.absorb
+        query = self.projections["q_b_proj"](query_res_sh, weight=qb_w).view(rows, 64, 256)
+        return self.query_absorption(query.transpose(0, 1), weight=ab_w).transpose(0, 1).contiguous()
 
-    def start_query_shard(self, query_res_sh, *, dependencies=()):
+    def start_query_shard(self, query_res_sh, *, dependencies=(), weights=None):
         """Launch 64-head query projection and absorption on the auxiliary stream."""
         if self.query_chain is None:
             return None
@@ -807,13 +896,14 @@ class PreparedGlmMLA:
         query = torch.empty((rows, 64, 256), dtype=torch.bfloat16, device=device)
         absorbed = torch.empty((rows, 64, 512), dtype=torch.bfloat16, device=device)
         gathered = torch.empty((1,), dtype=torch.bfloat16, device=device)
-        return self.query_chain.start(query_res_sh, query, absorbed, gathered, dependencies=dependencies)
+        return self.query_chain.start(
+            query_res_sh, query, absorbed, gathered, dependencies=dependencies, runtime_weights=weights)
 
-    def finish_query_shard(self, pending, query_res_sh, dependency):
+    def finish_query_shard(self, pending, query_res_sh, dependency, *, weights=None):
         """Join an in-flight auxiliary query chain or compute synchronously."""
         if pending is not None:
             return self.query_chain.finish(pending, dependency)
-        return self.prepare_query_shard(query_res_sh)
+        return self.prepare_query_shard(query_res_sh, weights=weights)
 
     def write_and_gather_pools(self, cache_payload_all, metadata):
         """Write full-chunk striped DCP caches and gather global C4 pools on main stream."""
@@ -863,22 +953,25 @@ class PreparedGlmMLA:
         """Select top-k global positions for owned rows."""
         return self.indexer.select_shard(idx_query_sh, weight_in_sh, positions_sh, global_index_cache)
 
-    def attend_prepared_shard(self, absorbed_sh, physical, selected_lengths, positions_sh, slab):
+    def attend_prepared_shard(self, absorbed_sh, physical, selected_lengths, positions_sh, slab, *, weights=None):
         """Run 64-head sparse MLA, value expansion, and output projection on owned rows."""
         rows = absorbed_sh.shape[0]
         visible = (positions_sh + 1).clamp_min(0).to(torch.int32)
         cache = slab.view(-1, 64, 528)
         if (isinstance(self.value_expansion, BatchedUnquantizedProjection)
                 and self.attention.output is None and not self.attention.return_lse):
+            expand_w = self.value_expansion.weight if weights is None else weights.expand.transpose(1, 2)
             expanded = self.attention.attend_and_expand(
-                absorbed_sh, physical, visible, selected_lengths, self.value_expansion.weight, cache=cache)
+                absorbed_sh, physical, visible, selected_lengths, expand_w, cache=cache)
         else:
             attended = self.attention(absorbed_sh, physical, visible, selected_lengths, cache=cache)
-            expanded = self.value_expansion(attended.transpose(0, 1)).transpose(0, 1)
-        return self.projections["o_proj"](expanded.reshape(rows, -1))
+            expand_w = None if weights is None else weights.expand
+            expanded = self.value_expansion(attended.transpose(0, 1), weight=expand_w).transpose(0, 1)
+        o_w = None if weights is None else weights.o_proj
+        return self.projections["o_proj"](expanded.reshape(rows, -1), weight=o_w)
 
-    def attend_shard(self, query_res_sh, idx_query_sh, weight_in_sh, positions_sh, global_index_cache, slab):
+    def attend_shard(self, query_res_sh, idx_query_sh, weight_in_sh, positions_sh, global_index_cache, slab, *, weights=None):
         """Run 64-head sparse MLA and output projection directly on this rank's owned rows."""
         physical, selected_lengths = self.select_shard(idx_query_sh, weight_in_sh, positions_sh, global_index_cache)
-        absorbed = self.prepare_query_shard(query_res_sh)
-        return self.attend_prepared_shard(absorbed, physical, selected_lengths, positions_sh, slab)
+        absorbed = self.prepare_query_shard(query_res_sh, weights=weights)
+        return self.attend_prepared_shard(absorbed, physical, selected_lengths, positions_sh, slab, weights=weights)
