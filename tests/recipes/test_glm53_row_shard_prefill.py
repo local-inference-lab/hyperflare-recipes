@@ -277,7 +277,9 @@ def test_split_recurrent_metadata(live, fresh, ckpt, exp_a, exp_b):
 
 def test_zero_replicated_attention_and_pool_gather_counts():
     assert not hasattr(recipe, "replicated_attention_bytes")
-    assert stack.ROW_SHARD_ATTENTION_MIN_TOKENS == 8192
+    assert stack.ROW_SHARD_ATTENTION_MIN_TOKENS == 4096
+    assert stack.ROW_SHARD_ATTENTION_MIN_TOKENS_ROCE_BF16 == 8192
+    assert stack.ROW_SHARD_ATTENTION_MIN_TOKENS_PCIE == 12288
     for end_val in (0, 1, 3, 4, 7, 16, 17, 1023, 131072):
         counts = dcp.pool_gather_counts(torch.tensor([end_val], dtype=torch.int64), 4, 8192)
         assert counts.shape == (4,) and counts.dtype == torch.int64

@@ -593,9 +593,13 @@ class PreparedGlmMLA:
         for key in ("q_a_layernorm", "kv_a_layernorm"):
             module.get_submodule(key).weight = torch.nn.Parameter(weights[f"{key}.weight"], requires_grad=False)
         self.projections = {}
-        # Slice large row-sharded MLA query/attention stages into 1024-row chunks to cut
+        # Slice large row-sharded MLA query/attention stages into <=1024-row chunks (largest
+        # power-of-two divisor <= 1024, e.g. 1024 for 4096/3072/2048, 512 for 3584/2560) to cut
         # transient graph-pool peak by ~480-700 MiB (query, absorbed, attended, expanded).
-        self.row_shard_slice = 1024 if (self.row_shard and rows > 1024 and rows % 1024 == 0) else rows
+        if self.row_shard and rows > 1024:
+            self.row_shard_slice = next((s for s in (1024, 512, 256, 128) if rows % s == 0), rows)
+        else:
+            self.row_shard_slice = rows
         rs_s = self.row_shard_slice
         for key, input, output in (
             ("qkv_a_proj", source, scratch.projected_input),
@@ -798,19 +802,23 @@ class PreparedGlmMLA:
         self.writer.functional(session=session)
         if hasattr(self, "attention"):
             self.attention.functional(session=session)
-            if getattr(self, "row_shard", False):
-                register_finalizer(session, self._release_row_shard_cache)
         for item in getattr(self, "slices", ()):
             for operator in item[2:]:
                 if hasattr(operator, "functional"):
                     operator.functional(session=session)
         if self.context_gather is not None:
             self.context_gather.functional(session=session)
+            register_finalizer(session, self._release_slab_cache)
         self.scratch = self.metadata = self.end = None
         return self
 
-    def _release_row_shard_cache(self):
-        self.attention.inputs["kv_cache"] = None
+    def _release_slab_cache(self):
+        if hasattr(self, "attention") and getattr(self, "row_shard", False):
+            self.attention.inputs["kv_cache"] = None
+        if self.mode == "prefill":
+            for item in getattr(self, "slices", ()):
+                if len(item) == 5:
+                    item[3].inputs["kv_cache"] = None
 
     def _release_runtime_templates(self):
         self.absorb_weights = self.expand_weights = None

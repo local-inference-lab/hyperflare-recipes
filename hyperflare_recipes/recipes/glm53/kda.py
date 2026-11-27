@@ -479,8 +479,8 @@ class PreparedGlmKDA:
         offset = (self.rank_index * self.seg_tokens).to(torch.int32)
         live_r = (metadata.num_tokens - offset).clamp(0, self.seg_tokens).to(torch.int32)
         has_r = (metadata.num_seqs > 0) & (live_r > 0)
-        zero_i32 = metadata.query_start_loc[:1]
-        qsl_r = torch.cat((zero_i32, live_r))
+        # Avoid torch.cat((zero, live_r)) so Inductor's ConcatKernel cannot alias live_r inside qsl_r.
+        qsl_r = torch.arange(2, dtype=torch.int32, device=device) * live_r
         slot0 = torch.where(has_r, torch.zeros_like(metadata.convolution_slots[:1]),
                             torch.full_like(metadata.convolution_slots[:1], -1))
         num_seqs_conv = has_r.to(torch.int32)

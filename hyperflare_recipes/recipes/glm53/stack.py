@@ -42,9 +42,9 @@ from .weights import ModelWeights, MoEWeights
 
 DMA_PREFILL_TOKENS = 1024
 PIPELINED_PREFILL_TOKENS = 2048
-ROW_SHARD_ATTENTION_MIN_TOKENS = 8192
+ROW_SHARD_ATTENTION_MIN_TOKENS = 4096
 ROW_SHARD_ATTENTION_MIN_TOKENS_PCIE = 12288
-ROW_SHARD_ATTENTION_MIN_TOKENS_ROCE_BF16 = 16384
+ROW_SHARD_ATTENTION_MIN_TOKENS_ROCE_BF16 = 8192
 QUARTER_MLP_PREFILL_TOKENS = 10240
 
 
@@ -215,13 +215,15 @@ def _split_recurrent_metadata(metadata: DeltaMetadata, half: int) -> tuple[Delta
     """Split single-sequence prefill DeltaMetadata across microbatches [0, half) and [half, 2*half)."""
     live = metadata.num_tokens
     active = metadata.num_seqs > 0
-    zero = metadata.query_start_loc[:1]
+    # Build [0, len] via pointwise scaling instead of torch.cat((zero, len)) so Inductor's
+    # ConcatKernel cannot alias len_a/len_b inside query_start_loc and prematurely reuse its pool slot.
+    qsl_scale = torch.arange(2, dtype=torch.int32, device=live.device)
 
     len_a = live.clamp(0, half).to(torch.int32)
     has_a = active & (len_a > 0)
     ckpt_a = (metadata.checkpoint_offsets > 0) & (metadata.checkpoint_offsets <= half)
     meta_a = DeltaMetadata(
-        query_start_loc=torch.cat((zero, len_a)),
+        query_start_loc=qsl_scale * len_a,
         convolution_slots=torch.where(has_a, metadata.convolution_slots, -1),
         fresh=metadata.fresh & has_a,
         accepted_tokens=metadata.accepted_tokens,
@@ -238,7 +240,7 @@ def _split_recurrent_metadata(metadata: DeltaMetadata, half: int) -> tuple[Delta
     has_b = active & (len_b > 0)
     ckpt_b = metadata.checkpoint_offsets > half
     meta_b = DeltaMetadata(
-        query_start_loc=torch.cat((zero, len_b)),
+        query_start_loc=qsl_scale * len_b,
         convolution_slots=torch.where(has_b, metadata.convolution_slots, -1),
         fresh=torch.zeros_like(metadata.fresh),
         accepted_tokens=metadata.accepted_tokens,
@@ -251,6 +253,23 @@ def _split_recurrent_metadata(metadata: DeltaMetadata, half: int) -> tuple[Delta
         num_tokens=len_b,
     )
     return meta_a, meta_b
+
+
+def _weight_format_key(value):
+    if isinstance(value, torch.Tensor):
+        return ("tensor", value.dtype, tuple(value.shape))
+    if hasattr(value, "parts") and hasattr(value, "widths"):
+        return ("grouped", tuple(_weight_format_key(p) for p in value.parts), tuple(value.widths))
+    if hasattr(value, "weight") and hasattr(value.weight, "values"):
+        return (type(value).__name__, value.weight.values.dtype, tuple(value.weight.values.shape))
+    if hasattr(value, "values") and hasattr(value, "scales"):
+        return (type(value).__name__, value.values.dtype, tuple(value.values.shape),
+                value.scales.dtype, tuple(value.scales.shape))
+    return (type(value).__name__,)
+
+
+def _attention_format_key(attn: dict[str, object], keys: tuple[str, ...]):
+    return tuple((k, _weight_format_key(attn[k])) for k in keys if k in attn)
 
 
 class PreparedDecoder:
@@ -295,11 +314,16 @@ class PreparedDecoder:
         )
         if _roce(runtime):
             # BF16 attention weights are 2x larger per layer than quantized FP8 weights, so on RoCE
-            # enable row-sharded attention at 16K for BF16 checkpoints and 8K for quantized attention.
-            first_inp = weights.layers[0].attention.get("input_proj") if has_attn_weights else None
+            # enable row-sharded attention at 8K for BF16 checkpoints and 4K for quantized attention
+            # (also avoiding non-row-shard tail-capacity Graph capture pool spikes).
+            has_bf16_attn = has_attn_weights and any(
+                isinstance(lw.attention.get("input_proj"), torch.Tensor)
+                for m, lw in zip(language.layers, weights.layers, strict=True)
+                if m.block_type == "linear_attention" and isinstance(lw.attention, dict)
+            )
             attn_min_tokens = (
                 ROW_SHARD_ATTENTION_MIN_TOKENS_ROCE_BF16
-                if isinstance(first_inp, torch.Tensor)
+                if has_bf16_attn
                 else ROW_SHARD_ATTENTION_MIN_TOKENS
             )
         else:
@@ -448,18 +472,12 @@ class PreparedDecoder:
                     mla=mla_row_shard_scratch if use_row_shard_mla else scratch.mla,
                     attention_output=scratch.attention_output[:rows], mlp_output=scratch.mlp_output[:rows])
 
-        kda_template = mla_template = None
+        kda_templates: dict[object, dict[str, object]] = {}
+        mla_templates: dict[object, dict[str, object]] = {}
         if use_row_shard_kda or use_row_shard_mla:
-            # Share one transient full-head weight template per layer kind for tuning only;
-            # projections drop their references at finalization so zero replicated weights persist.
-            if use_row_shard_kda:
-                first_kda = next(lw.attention for m, lw in zip(language.layers, weights.layers, strict=True)
-                                 if m.block_type == "linear_attention")
-                kda_template = full_kda_template(first_kda, world_size=weights.shard.world_size, device=self.device)
-            if use_row_shard_mla:
-                first_mla = next(lw.attention for m, lw in zip(language.layers, weights.layers, strict=True)
-                                 if m.block_type == "indexed_attention")
-                mla_template = full_mla_template(first_mla, world_size=weights.shard.world_size, device=self.device)
+            # Share one transient full-head weight template per distinct layer weight format for
+            # tuning only; projections drop their references at finalization so zero replicated
+            # weights persist, while mixed-precision checkpoints still match per-layer formats.
             self.weight_gather = AttentionWeightGatherer(
                 [lw.attention for lw in weights.layers],
                 [m.block_type for m in language.layers],
@@ -472,7 +490,22 @@ class PreparedDecoder:
                 language.layers, weights.layers, state.layers, strict=True)):
             indexed = module.block_type == "indexed_attention"
             layer_rs_attn = (use_row_shard_mla and indexed) or (use_row_shard_kda and not indexed)
-            layer_template = (mla_template if indexed else kda_template) if layer_rs_attn else None
+            layer_template = None
+            if layer_rs_attn:
+                if indexed:
+                    fmt = _attention_format_key(layer_weights.attention, ("q_b_proj", "kv_b_proj", "o_proj"))
+                    layer_template = mla_templates.get(fmt)
+                    if layer_template is None:
+                        layer_template = full_mla_template(
+                            layer_weights.attention, world_size=weights.shard.world_size, device=self.device)
+                        mla_templates[fmt] = layer_template
+                else:
+                    fmt = _attention_format_key(layer_weights.attention, ("input_proj", "o_proj"))
+                    layer_template = kda_templates.get(fmt)
+                    if layer_template is None:
+                        layer_template = full_kda_template(
+                            layer_weights.attention, world_size=weights.shard.world_size, device=self.device)
+                        kda_templates[fmt] = layer_template
             layer = PreparedGlmLayer(module, layer_weights.attention, layer_weights.mlp, layer_weights.residual,
                 scratch.residual if index == 0 else scratch.mlp_output, scratch.residual,
                 scratch.layer(module.block_type, sparse=isinstance(layer_weights.mlp, MoEWeights)), layer_state,

@@ -663,9 +663,18 @@ class PreparedGlmLayer:
                 name=f"{name}.mlp_gather", **collective)
             mlp_input = gathered_input
         if isinstance(mlp_weights, MoEWeights):
+            # Reserve 4 SMs for concurrent RoCE weight-gather kernels (gridX=4) during
+            # async RoCE row-sharded prefill so persistent MoE does not starve aux comms.
+            from ignition.components.collectives import _roce
+
+            moe_reserve_sms = (
+                4 if (mode == "prefill" and (self.row_shard_kda or self.row_shard_mla)
+                      and _roce(collective["runtime"]) and workspace.overlap)
+                else 0
+            )
             self.mlp = PreparedGlmMoe(module.mlp, mlp_input, mlp_weights, scratch.mlp,
                                       session=session, name=f"{name}.moe", workspace=workspace,
-                                      prefill=mode == "prefill")
+                                      prefill=mode == "prefill", reserve_sms=moe_reserve_sms)
         else:
             self.mlp = PreparedMLP(mlp_input, mlp_weights, scratch.mlp.gate_up,
                 scratch.mlp.intermediate, scratch.mlp.output, session=session, name=f"{name}.mlp", workspace=workspace,
@@ -777,24 +786,29 @@ class PreparedGlmLayer:
             qkv, raw_beta, forget_in = self.attention.project_input_shard(attention_input, weights=attn_weights)
             halo_sh = self.attention.pack_conv_halo(qkv, metadata)
             halo_full = self._sync_gather(self._halo_binding, self.halo_gather, halo_sh, channel_token)
-            raw_g = self.attention.project_forget_shard(forget_in, weights=attn_weights)
-            summary, scan_sh = self.attention.summarize_segment(
-                qkv, None, raw_g, None, raw_beta, None, halo_full, metadata, weights=attn_weights)
-            scan_full = self._sync_gather(self._scan_binding, self.scan_gather, scan_sh, channel_token)
+            # Launch o_proj weight gather on aux right after halo_gather so it overlaps the
+            # long project_forget_shard + short_conv + delta_prefill compute window (~7 ms),
+            # then join and release the RoCE channel before sync scan_gather.
             p_cur_o = (
-                weight_gather.start_o_only(layer_index, [scan_full], channel_token=channel_token)
+                weight_gather.start_o_only(layer_index, [halo_full], channel_token=channel_token)
                 if (use_async_roce and layer_index is not None
                     and attn_weights is not None and attn_weights.o_proj is None)
                 else None
             )
             if p_cur_o is not None and channel_token is not None:
-                _order_barrier(scan_full, [channel_token])
-                _order_barrier(attention_input, [channel_token])
+                _order_barrier(halo_full, [channel_token])
+                _order_barrier(forget_in, [channel_token])
+            raw_g = self.attention.project_forget_shard(forget_in, weights=attn_weights)
+            summary, scan_sh = self.attention.summarize_segment(
+                qkv, None, raw_g, None, raw_beta, None, halo_full, metadata, weights=attn_weights)
+            if p_cur_o is not None:
+                attn_weights = weight_gather.attach_o(attn_weights, p_cur_o, dependencies=(scan_sh,))
+                if channel_token is not None:
+                    _order_barrier(channel_token, list(p_cur_o.o_buffers))
+            scan_full = self._sync_gather(self._scan_binding, self.scan_gather, scan_sh, channel_token)
             z_sh = self.attention.project_gate_shard(attention_input, weights=attn_weights)
             rec_sh, live_sh, s4, conv_all = self.attention.finalize_segment(
                 summary, s_init_full, scan_full, metadata, weights=attn_weights)
-            if p_cur_o is not None:
-                attn_weights = weight_gather.attach_o(attn_weights, p_cur_o, dependencies=(rec_sh, z_sh))
             attention = self.attention.output_shard(rec_sh, z_sh, live_sh, weights=attn_weights)
             self.attention.commit_state(s4, conv_all, metadata)
         elif self.row_shard_mla:

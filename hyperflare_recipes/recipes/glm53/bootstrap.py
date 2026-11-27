@@ -361,11 +361,11 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
         ipc = None if core_storage is None else core_storage.peer_storage
         collective = prefill_collective = vocabulary_collective = None
         sample_rows = max(b * w for b, w in config.speculative_shapes) if config.mtp else config.request_capacity
+        decode_tokens = max(config.request_capacity, sample_rows)
         if coordinator is not None and coordinator.spans_hosts:
             # Ranks on separate Sparks reduce and gather through one RoCEnante runtime, which also
             # carries decode context parallelism's exchanges.
             # Decode rows reduce one-shot; prefill chunks through the pipelined two-shot path.
-            decode_tokens = max(config.request_capacity, sample_rows)
             gather_bytes = sample_rows * (154880 // shard.world_size) * 2
             if config.context_parallel:
                 from hyperflare_recipes.components.head_exchange import pack_width
@@ -384,17 +384,30 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
 
                 # Prefill gathers each rank's latent records one window at a time.
                 varlen_bytes = min(WINDOW_RECORDS, blocks * 256) * 528
+            roce_pipe_tokens = max(config.token_capacity, 8192) if config.row_shard_attention else config.token_capacity
             collective = prefill_collective = vocabulary_collective = create_roce_runtime(
-                group, device, max_tokens=decode_tokens, pipe_tokens=config.token_capacity, hidden_size=4096,
+                group, device, max_tokens=decode_tokens, pipe_tokens=roce_pipe_tokens, hidden_size=4096,
                 gather_bytes=gather_bytes, ring=config.roce_ring, ring_open=config.roce_chain, core_storage=core_storage, varlen_bytes=varlen_bytes)
         elif group is not None:
-            collective = create_all_reduce_runtime(group, device, max_tokens=config.token_capacity,
-                                                   hidden_size=4096, ipc=ipc)
             from .stack import (
+                DMA_PREFILL_TOKENS,
                 PIPELINED_PREFILL_TOKENS,
                 QUARTER_MLP_PREFILL_TOKENS,
                 ROW_SHARD_ATTENTION_MIN_TOKENS_PCIE,
             )
+
+            # Prefill chunks >= DMA_PREFILL_TOKENS route through prefill_collective (DmaAllReduce),
+            # so the oneshot/twoshot PCIe AllReduce runtime only needs decode, small-prefill, and
+            # (when enabled) prompt-scoring capacities — reclaiming ~6-7 GiB/GPU of PeerStorage at 32K.
+            ar_tokens = (
+                config.token_capacity if config.prompt_logprobs
+                else max(
+                    decode_tokens,
+                    max((c for c in config.prefill_capacities if c < DMA_PREFILL_TOKENS), default=1),
+                )
+            )
+            collective = create_all_reduce_runtime(group, device, max_tokens=ar_tokens,
+                                                   hidden_size=4096, ipc=ipc)
 
             if (config.row_shard_attention and config.context_parallel
                     and config.stream_overlap and not config.prompt_logprobs):
@@ -701,7 +714,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
         compile_decoder=config.compile_decoder, progress=progress, cache_root=config.kernel_cache,
         retain_graphs=config.retain_graphs, materialize=materialize_cache, warmup_storage=core_storage,
         compile_kinds=_COMPILED_KINDS, retain_forwards=True)
-    if core_storage is not None and config.stream_overlap:
+    if core_storage is not None and config.stream_overlap and config.retain_graphs:
         # Preserve per-node stream priority attributes (CU_LAUNCH_ATTRIBUTE_PRIORITY)
         # when Helios instantiates exported graphs: CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH (1)
         # | CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY (8).
