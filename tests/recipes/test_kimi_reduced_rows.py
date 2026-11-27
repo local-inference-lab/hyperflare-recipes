@@ -134,16 +134,31 @@ def test_row_reduction_tuning_batches_capture_forwards_and_defers_patterns(monke
         return graphs, compiled
 
     raced_ops = []
+    race_sessions_opened = []
+    race_sessions_seen = []
+    clock_locks_entered = 0
+    shared_race_session = object()
 
-    def fake_race(candidates, *, operation, geometry, resident_bytes, **kwargs):
+    def fake_race_session(sess, *, coordinator, cache_policy):
+        race_sessions_opened.append((sess, coordinator, cache_policy))
+        return nullcontext(shared_race_session)
+
+    def fake_clock_lock():
+        nonlocal clock_locks_entered
+        clock_locks_entered += 1
+        return nullcontext()
+
+    def fake_race(candidates, *, operation, geometry, resident_bytes, race_session=None, **kwargs):
         assert set(candidates) == {"separate", "fused"}
         assert resident_bytes > 0
         # Only the active group holds materialized patterns during its race.
         assert sum(1 for fixture in fixtures_seen if fixture.patterns) == 1
+        race_sessions_seen.append(race_session)
         raced_ops.append((operation, geometry["rows"], resident_bytes))
         return {"implementation": "fused", "source": "tuned", "rejected_candidates": 0}
 
     monkeypatch.setattr(row_reductions, "capture_forwards", fake_capture)
+    monkeypatch.setattr(row_reductions, "composition_race_session", fake_race_session)
     monkeypatch.setattr(row_reductions, "race_compositions", fake_race)
     monkeypatch.setattr(torch.cuda, "Stream", lambda device=None: None)
     monkeypatch.setattr(torch.cuda, "graph_pool_handle", lambda: None)
@@ -153,7 +168,7 @@ def test_row_reduction_tuning_batches_capture_forwards_and_defers_patterns(monke
     coordinator = SimpleNamespace(ranks=(0, 1), barrier=lambda name, ranks: None)
     catalog = row_reductions.RowReductionTuning(coordinator, torch.device("cpu"), 1e-5, None)
     monkeypatch.setattr(catalog, "groups", lambda: grouped)
-    session = SimpleNamespace(autotune=True, autotune_effort="default", _tuning_clocks=nullcontext)
+    session = SimpleNamespace(autotune=True, autotune_effort="default", _tuning_clocks=fake_clock_lock)
 
     report = catalog.tune(session)
     assert len(capture_calls) == 1
@@ -161,6 +176,9 @@ def test_row_reduction_tuning_batches_capture_forwards_and_defers_patterns(monke
     assert list(capture_calls[0][1].values()) == [4, 4, 4, 4, 8, 8]
     assert len(report) == len(geometries)
     assert [entry["geometry"]["rows"] for entry in report] == [4, 4, 8]
+    assert race_sessions_opened == [(session, coordinator, "warm")]
+    assert race_sessions_seen == [shared_race_session] * len(geometries)
+    assert clock_locks_entered == 1
     assert all(choice.fused for choice in choices)
     assert all(g.reset_calls == 1 for g in all_graphs)
     assert all(c.retired == 1 for c in all_compiled)

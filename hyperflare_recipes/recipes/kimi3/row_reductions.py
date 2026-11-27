@@ -41,7 +41,12 @@ from b12x.preparation import PreparedCall
 
 from hyperflare_recipes.components.collectives import _all_reduce
 from ignition.preparation.capture import capture_forwards
-from ignition.preparation.composition_tuning import PreparedComposition, plan_identity, race_compositions
+from ignition.preparation.composition_tuning import (
+    PreparedComposition,
+    composition_race_session,
+    plan_identity,
+    race_compositions,
+)
 from ignition.preparation.execution import GraphSignature
 from .pointwise import _rms_norm, rms_norm_columns
 from .residual import ADD, REPLACE, _mix, ResidualStream, TILES
@@ -1180,51 +1185,56 @@ class RowReductionTuning:
                     cache_root=self.cache_root,
                     retain_forwards=True,
                 )
-                for geometry, targets_for_plan, representative, fixture, names in entries:
-                    fixture.prepare_patterns()
-                    try:
-                        for i in range(len(fixture.patterns)):
-                            fixture.produce(i)
-                            torch.cuda.synchronize(self.device)
-                            self.coordinator.barrier(f"Kimi row reference {i}", self.coordinator.ranks)
-                            compiled[names["separate"]]()
-                            fixture.reference()
-                        producers = tuple(partial(fixture.produce, i) for i in range(3))
-                        plan = representative.control_plan
-                        candidates = {}
-                        for kind, name in names.items():
-                            func = compiled[name]
-                            call = PreparedCall(
-                                run=func,
-                                output=fixture.out,
-                                produce=producers[0],
-                                benchmark_producers=producers,
-                                validate=fixture.validate,
-                                owners=(fixture,),
-                                capture_safe=True,
+                with (
+                    session._tuning_clocks(),
+                    composition_race_session(
+                        session, coordinator=self.coordinator, cache_policy="warm"
+                    ) as race_session,
+                ):
+                    for geometry, targets_for_plan, representative, fixture, names in entries:
+                        fixture.prepare_patterns()
+                        try:
+                            for i in range(len(fixture.patterns)):
+                                fixture.produce(i)
+                                torch.cuda.synchronize(self.device)
+                                self.coordinator.barrier(f"Kimi row reference {i}", self.coordinator.ranks)
+                                compiled[names["separate"]]()
+                                fixture.reference()
+                            producers = tuple(partial(fixture.produce, i) for i in range(3))
+                            plan = representative.control_plan
+                            candidates = {}
+                            for kind, name in names.items():
+                                func = compiled[name]
+                                call = PreparedCall(
+                                    run=func,
+                                    output=fixture.out,
+                                    produce=producers[0],
+                                    benchmark_producers=producers,
+                                    validate=fixture.validate,
+                                    owners=(fixture,),
+                                    capture_safe=True,
+                                )
+                                candidates[kind] = PreparedComposition(func, (("reduction", plan),), call)
+                            function = (
+                                _reduced_residual_norm
+                                if geometry.residual_norm
+                                else (_reduced_norm if geometry.width == 3584 else _reduced_mix)
                             )
-                            candidates[kind] = PreparedComposition(func, (("reduction", plan),), call)
-                        function = (
-                            _reduced_residual_norm
-                            if geometry.residual_norm
-                            else (_reduced_norm if geometry.width == 3584 else _reduced_mix)
-                        )
-                        op_name = (
-                            "kimi-row-residual-norm-7168"
-                            if geometry.residual_norm
-                            else f"kimi-row-normalization-{geometry.width}"
-                        )
-                        direct_fo_tag = (
-                            "tp8_ro_fused_v3"
-                            if getattr(representative.layout, "is_tp8_ro", False)
-                            else (
-                                "sw4_ro1_v19"
-                                if (geometry.residual_norm or geometry.width == 3584)
-                                else "sw4_ro1_mix_v19"
+                            op_name = (
+                                "kimi-row-residual-norm-7168"
+                                if geometry.residual_norm
+                                else f"kimi-row-normalization-{geometry.width}"
                             )
-                        )
-                        resident_bytes = sum(item[3].nbytes for item in entries)
-                        with session._tuning_clocks():
+                            direct_fo_tag = (
+                                "tp8_ro_fused_v3"
+                                if getattr(representative.layout, "is_tp8_ro", False)
+                                else (
+                                    "sw4_ro1_v19"
+                                    if (geometry.residual_norm or geometry.width == 3584)
+                                    else "sw4_ro1_mix_v19"
+                                )
+                            )
+                            resident_bytes = sum(item[3].nbytes for item in entries)
                             result = race_compositions(
                                 candidates,
                                 operation=op_name,
@@ -1242,18 +1252,19 @@ class RowReductionTuning:
                                 coordinator=self.coordinator,
                                 cache_policy="warm",
                                 resident_bytes=resident_bytes,
+                                race_session=race_session,
                             )
-                        fixture.produce(3)
-                        torch.cuda.synchronize(self.device)
-                        self.coordinator.barrier("Kimi row holdout", self.coordinator.ranks)
-                        compiled[names[result["implementation"]]]()
-                        torch.cuda.synchronize(self.device)
-                        fixture.validate()
-                        for target in targets_for_plan:
-                            target.fused = result["implementation"] == "fused"
-                        report.append(dict(geometry=vars(geometry), **result))
-                    finally:
-                        fixture.release_patterns()
+                            fixture.produce(3)
+                            torch.cuda.synchronize(self.device)
+                            self.coordinator.barrier("Kimi row holdout", self.coordinator.ranks)
+                            compiled[names[result["implementation"]]]()
+                            torch.cuda.synchronize(self.device)
+                            fixture.validate()
+                            for target in targets_for_plan:
+                                target.fused = result["implementation"] == "fused"
+                            report.append(dict(geometry=vars(geometry), **result))
+                        finally:
+                            fixture.release_patterns()
             finally:
                 for graph in graphs.values():
                     graph.reset()

@@ -14,6 +14,7 @@ from hyperflare_recipes.components.candidate_selection import PreparedCandidateS
 from ignition.preparation.capture import capture_forwards
 from ignition.preparation.composition_tuning import (
     PreparedComposition,
+    composition_race_session,
     plan_identity,
     race_compositions,
     trial_session,
@@ -191,44 +192,47 @@ def _measure_batch(fixtures, session, namespace):
         graphs, compiled = capture_forwards(forwards, signatures, session=session, device=device,
             stream=torch.cuda.Stream(device=device), pool=torch.cuda.graph_pool_handle(), coordinator=coordinator,
             report_catalog=False, cache_root=namespace, retain_forwards=True)
-        for trial, bindings, names in prepared:
-            trial.prepare_patterns()
-            try:
-                for index in range(len(trial.patterns)):
-                    trial.produce(index)
-                    torch.cuda.synchronize(device)
-                    coordinator.barrier(f"slot reference {index}", coordinator.ranks)
-                    compiled[names["global"]]()
-                    torch.cuda.synchronize(device)
-                    trial.expected.append(tuple(t.clone() for t in trial.output))
-                producers = tuple(partial(trial.produce, index) for index in range(len(_WORKLOAD) - 1))
-                candidates = {}
-                for kind, name in names.items():
-                    forward = compiled[name]
-                    call = PreparedCall(run=forward, output=trial.output[1], produce=producers[0],
-                        benchmark_producers=producers, reset=trial.reset, validate=trial.validate, owners=(trial,),
-                        capture_safe=True, benchmark_repetitions=8)
-                    candidates[kind] = PreparedComposition(forward, trial.plans(kind), call)
-                resident_bytes = sum(t.resident_bytes() for t, _, _ in prepared)
-                with session._tuning_clocks():
+        with (
+            session._tuning_clocks(),
+            composition_race_session(session, coordinator=coordinator, cache_policy="warm") as race_session,
+        ):
+            for trial, bindings, names in prepared:
+                trial.prepare_patterns()
+                try:
+                    for index in range(len(trial.patterns)):
+                        trial.produce(index)
+                        torch.cuda.synchronize(device)
+                        coordinator.barrier(f"slot reference {index}", coordinator.ranks)
+                        compiled[names["global"]]()
+                        torch.cuda.synchronize(device)
+                        trial.expected.append(tuple(t.clone() for t in trial.output))
+                    producers = tuple(partial(trial.produce, index) for index in range(len(_WORKLOAD) - 1))
+                    candidates = {}
+                    for kind, name in names.items():
+                        forward = compiled[name]
+                        call = PreparedCall(run=forward, output=trial.output[1], produce=producers[0],
+                            benchmark_producers=producers, reset=trial.reset, validate=trial.validate, owners=(trial,),
+                            capture_safe=True, benchmark_repetitions=8)
+                        candidates[kind] = PreparedComposition(forward, trial.plans(kind), call)
+                    resident_bytes = sum(t.resident_bytes() for t, _, _ in prepared)
                     result = race_compositions(candidates, operation="interleaved-sparse-selection-slots",
                         geometry=dict(**asdict(trial.geometry), world_size=trial.context.shards.world, topk=TOPK),
                         numerics="ordered-fp32-keys-rank-major-ties-physical-slots", workload=dict(version=2,
                             patterns=_WORKLOAD[:-1]), default="global", session=session, coordinator=coordinator,
-                        cache_policy="warm", resident_bytes=resident_bytes)
-                trial.produce(len(_WORKLOAD) - 1)
-                trial.reset()
-                torch.cuda.synchronize(device)
-                coordinator.barrier("slot selection holdout", coordinator.ranks)
-                compiled[names[result["implementation"]]]()
-                torch.cuda.synchronize(device)
-                trial.validate()
-                for local, _ in bindings:
-                    local.enabled = result["implementation"] == "local"
-                results.append(dict(operation="interleaved-sparse-selection-slots", geometry=asdict(trial.geometry),
-                                    global_merge=trial.control, **result))
-            finally:
-                trial.release_patterns()
+                        cache_policy="warm", resident_bytes=resident_bytes, race_session=race_session)
+                    trial.produce(len(_WORKLOAD) - 1)
+                    trial.reset()
+                    torch.cuda.synchronize(device)
+                    coordinator.barrier("slot selection holdout", coordinator.ranks)
+                    compiled[names[result["implementation"]]]()
+                    torch.cuda.synchronize(device)
+                    trial.validate()
+                    for local, _ in bindings:
+                        local.enabled = result["implementation"] == "local"
+                    results.append(dict(operation="interleaved-sparse-selection-slots", geometry=asdict(trial.geometry),
+                                        global_merge=trial.control, **result))
+                finally:
+                    trial.release_patterns()
         return results
     finally:
         for graph in graphs.values():

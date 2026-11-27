@@ -9,7 +9,13 @@ from b12x.preparation import PreparedCall
 
 from hyperflare_recipes.components.candidate_selection import PreparedCandidateSelection, CandidateSelectionForward
 from ignition.preparation.capture import capture_forwards
-from ignition.preparation.composition_tuning import PreparedComposition, plan_identity, race_compositions, trial_session
+from ignition.preparation.composition_tuning import (
+    PreparedComposition,
+    composition_race_session,
+    plan_identity,
+    race_compositions,
+    trial_session,
+)
 from ignition.preparation.execution import GraphSignature
 
 from .indexer import SharedBuffers
@@ -143,40 +149,43 @@ class CandidateSelectionTuning:
                 graphs, compiled = capture_forwards(forwards, signatures, session=trials, device=device,
                     stream=torch.cuda.Stream(device=device), pool=torch.cuda.graph_pool_handle(),
                     coordinator=coordinator, report_catalog=False, cache_root=self.cache_root, retain_forwards=True)
-                for rows, fixture in fixtures.items():
-                    for index in range(len(fixture.patterns)):
-                        fixture.produce(index)
-                        torch.cuda.synchronize(device)
-                        coordinator.barrier(f"selection reference {rows}.{index}", coordinator.ranks)
-                        compiled[f"replicated{rows}"]()
-                        torch.cuda.synchronize(device)
-                        fixture.expected.append(fixture.output.clone())
-                    candidates = {}
-                    for kind in fixture.forwards:
-                        forward = compiled[f"{kind}{rows}"]
-                        producers = tuple(partial(fixture.produce, index) for index in range(3))
-                        call = PreparedCall(run=forward, output=fixture.output,
-                            produce=producers[0], benchmark_producers=producers,
-                            reset=partial(fixture.output.fill_, -91), validate=fixture.validate,
-                            owners=(fixture,), capture_safe=True, benchmark_repetitions=8)
-                        candidates[kind] = PreparedComposition(forward, fixture.selection.plans(kind), call)
-                    with trials._tuning_clocks():
+                with (
+                    trials._tuning_clocks(),
+                    composition_race_session(trials, coordinator=coordinator, cache_policy="warm") as race_session,
+                ):
+                    for rows, fixture in fixtures.items():
+                        for index in range(len(fixture.patterns)):
+                            fixture.produce(index)
+                            torch.cuda.synchronize(device)
+                            coordinator.barrier(f"selection reference {rows}.{index}", coordinator.ranks)
+                            compiled[f"replicated{rows}"]()
+                            torch.cuda.synchronize(device)
+                            fixture.expected.append(fixture.output.clone())
+                        candidates = {}
+                        for kind in fixture.forwards:
+                            forward = compiled[f"{kind}{rows}"]
+                            producers = tuple(partial(fixture.produce, index) for index in range(3))
+                            call = PreparedCall(run=forward, output=fixture.output,
+                                produce=producers[0], benchmark_producers=producers,
+                                reset=partial(fixture.output.fill_, -91), validate=fixture.validate,
+                                owners=(fixture,), capture_safe=True, benchmark_repetitions=8)
+                            candidates[kind] = PreparedComposition(forward, fixture.selection.plans(kind), call)
                         chosen = race_compositions(candidates, operation="candidate-selection",
                             geometry=dict(rows=rows, world_size=self.context.shards.world, local_topk=2048, output_topk=2048),
                             numerics="exact-fp32-words-ordered-ties",
                             workload=dict(version=3, seeds=(101,102,103), counts=(256,8192,32768),
                                           partial_last=True, counted_owner=True),
                             default="replicated", session=trials, coordinator=coordinator,
-                            cache_policy="warm", resident_bytes=fixture.nbytes)
-                    fixture.produce(3)
-                    torch.cuda.synchronize(device)
-                    coordinator.barrier(f"selection holdout {rows}", coordinator.ranks)
-                    compiled[f"{chosen['implementation']}{rows}"]()
-                    torch.cuda.synchronize(device)
-                    fixture.validate()
-                    for selection in self.selections[rows]:
-                        selection.bind(chosen["implementation"])
-                    report.append(dict(rows=rows, **chosen))
+                            cache_policy="warm", resident_bytes=fixture.nbytes, race_session=race_session)
+                        fixture.produce(3)
+                        torch.cuda.synchronize(device)
+                        coordinator.barrier(f"selection holdout {rows}", coordinator.ranks)
+                        compiled[f"{chosen['implementation']}{rows}"]()
+                        torch.cuda.synchronize(device)
+                        fixture.validate()
+                        for selection in self.selections[rows]:
+                            selection.bind(chosen["implementation"])
+                        report.append(dict(rows=rows, **chosen))
             finally:
                 for graph in graphs.values():
                     graph.reset()

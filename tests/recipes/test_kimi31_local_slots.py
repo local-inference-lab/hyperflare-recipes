@@ -181,18 +181,30 @@ def test_tune_local_slots_batches_capture_forwards_with_unique_names(monkeypatch
             all_compiled.append(c)
         return graphs, compiled
 
-    def fake_race(candidates, **kwargs):
+    race_sessions_opened = []
+    race_sessions_seen = []
+    shared_race_session = object()
+
+    def fake_race_session(sess, *, coordinator, cache_policy):
+        race_sessions_opened.append((sess, coordinator, cache_policy))
+        return nullcontext(shared_race_session)
+
+    def fake_race(candidates, *, race_session=None, **kwargs):
         assert sum(1 for trial in trials_seen if trial.patterns) == 1
+        race_sessions_seen.append(race_session)
         return {"implementation": "local", "source": "tuned", "rejected_candidates": 0}
 
     monkeypatch.setattr(slot_tuning, "SlotTrial", RecordingFakeTrial)
     monkeypatch.setattr(slot_tuning, "capture_forwards", fake_capture)
     monkeypatch.setattr(slot_tuning, "plan_identity", lambda plan: plan)
+    monkeypatch.setattr(slot_tuning, "composition_race_session", fake_race_session)
     monkeypatch.setattr(slot_tuning, "race_compositions", fake_race)
     monkeypatch.setattr(torch.cuda, "Stream", lambda device=None: None)
     monkeypatch.setattr(torch.cuda, "graph_pool_handle", lambda: None)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device=None: None)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    clock_locks = []
 
     class FakeTrials:
         def __enter__(self):
@@ -205,9 +217,11 @@ def test_tune_local_slots_batches_capture_forwards_with_unique_names(monkeypatch
             pass
 
         def _tuning_clocks(self):
+            clock_locks.append(1)
             return nullcontext()
 
-    monkeypatch.setattr(slot_tuning, "trial_session", lambda *args, **kwargs: FakeTrials())
+    fake_trials = FakeTrials()
+    monkeypatch.setattr(slot_tuning, "trial_session", lambda *args, **kwargs: fake_trials)
 
     coordinator = SimpleNamespace(ranks=(0, 1), barrier=lambda name, ranks: None)
     context = SimpleNamespace(
@@ -222,6 +236,9 @@ def test_tune_local_slots_batches_capture_forwards_with_unique_names(monkeypatch
     assert len(capture_calls[0][0]) == 6
     assert list(capture_calls[0][1].values()) == [4, 4, 4, 4, 8, 8]
     assert len(results) == 3
+    assert race_sessions_opened == [(fake_trials, coordinator, "warm")]
+    assert race_sessions_seen == [shared_race_session] * 3
+    assert len(clock_locks) == 1
     assert all(local_obj.enabled for group in bindings.values() for local_obj, _ in group)
     assert all(g.reset_calls == 1 for g in all_graphs)
     assert all(c.retired == 1 for c in all_compiled)
