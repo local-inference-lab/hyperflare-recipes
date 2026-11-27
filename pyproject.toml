@@ -7,7 +7,12 @@ name = "hyperflare-recipes"
 version = "0.1.0"
 description = "Official model recipes and reusable b12x model components for Flare/Helios"
 license = "Apache-2.0"
-license-files = ["LICENSE", "NOTICE", "hyperflare_recipes/recipes/deepseek41/assets/LICENSE"]
+license-files = [
+    "LICENSE",
+    "NOTICE",
+    "hyperflare_recipes/components/megamoe_kernel/LICENSE.vllm",
+    "hyperflare_recipes/recipes/deepseek41/assets/LICENSE",
+]
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "ignition[prepare]",
@@ -35,6 +40,7 @@ flashinfer-python = { git = "https://github.com/local-inference-lab/flashinfer.g
 include = ["hyperflare_recipes*"]
 
 [tool.setuptools.package-data]
+"hyperflare_recipes.components.megamoe_kernel" = ["LICENSE.vllm"]
 "hyperflare_recipes.recipes.deepseek41" = ["assets/*"]
 "hyperflare_recipes.recipes.deepseek4" = ["assets/*"]
 "hyperflare_recipes.recipes.gemma4" = ["assets/*"]

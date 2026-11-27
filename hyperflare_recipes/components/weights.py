@@ -49,6 +49,8 @@ for _container, _fields in (
     ('b12x.gemm.blockscaled._a16.NVFP4LinearWeight',
      ('values', 'scale_mma', 'global_scale', 'activation_global_scale')),
     ('b12x.gemm.blockscaled._iq2_xs.BlockQuantLinearWeight', ('values', 'metadata')),
+    ('hyperflare_recipes.components.megamoe_tiers.MegaMoeLayerWeights', ('routed', 'shared', 'host_tier')),
+    ('hyperflare_recipes.components.megamoe_tiers.MegaMoeHostTier', ('weights',)),
 ):
     declare_container_fields(_container, _fields)
 

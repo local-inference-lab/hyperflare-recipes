@@ -54,6 +54,21 @@ Flare uses Blackwell hardware E2M1 conversion and binds persistent buffers and
 projections for prepared graph execution. The upstream copyright notices are
 retained in the adapted files.
 
+hyperflare_recipes/components/megamoe_kernel/inputs.py retains vLLM v0.32.0's
+Apache-2.0 Triton input-staging kernel (license text in
+hyperflare_recipes/components/megamoe_kernel/LICENSE.vllm), with a wrapper that
+selects MXFP8 and validates its buffers without importing vLLM.
+
+DeepGEMM (optional SM103 MegaMoE preparation dependency)
+--------------------------------------------------------
+The SM103 MegaMoE preparation components in
+hyperflare_recipes/components/megamoe*.py and
+hyperflare_recipes/components/delivered_fp8_projection.py invoke an externally
+installed DeepGEMM fork (https://github.com/local-inference-lab/DeepGEMM, MIT
+license with tiered MegaMoE extensions) during preparation. Exported CUDA graphs
+retain the compiled kernels; the native serving runtime has no Python or
+DeepGEMM dependency.
+
 PyTorch
 -------
 helios/src/frontend/images/resize.rs adapts the resize coefficient generator
