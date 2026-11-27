@@ -4,6 +4,7 @@
 
 """CPU and FX verification of lossless PromptOutputSAM copy-draft wiring in DeepSeek-V4.1."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +12,7 @@ import torch
 
 from ignition.components.completion import CompletionOutputs, VECTOR_TOKENS_FIELD
 from ignition.components.sampling import DeviceRequestState, RUNNING
+from ignition.parameters import SpeculationParameters
 from ignition.preparation import runtime_core_pb2 as pb2
 from ignition.preparation.execution import GraphSignature
 
@@ -246,7 +248,22 @@ def test_speculative_preparation_buffers_and_helios_contract_abi(monkeypatch):
     monkeypatch.setattr(parallel_draft, "PreparedParallelDraftRound", _DraftRound)
     monkeypatch.setattr(packed_speculation, "PreparedPackedSpeculativeRound", _Packed)
 
-    config = PreparationConfig(max_active=4, speculative_widths=(1, 8), speculative_token_capacity=16)
+    base_config = PreparationConfig()
+    config = replace(
+        base_config,
+        parameters=replace(
+            base_config.parameters,
+            max_concurrency=4,
+            speculation=SpeculationParameters(
+                draft_tokens=7,
+                max_draft_tokens=7,
+                token_capacity=16,
+                packed_verification=True,
+                draft_prefix_selection="gpu",
+                graph_budget=16,
+            ),
+        ),
+    )
     spec7 = SpeculativePreparation(
         weights, None, pool, requests, None, None, draft_tokens=config.draft_tokens,
         completion=None, frame=None, sequence=None, session=None, workspace=None,
