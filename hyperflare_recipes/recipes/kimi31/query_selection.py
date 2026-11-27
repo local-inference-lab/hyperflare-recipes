@@ -45,7 +45,7 @@ class PreparedQuerySelection:
         from .indexer import SharedBuffers
 
         rows = query.shape[0]
-        if (rows < 4096 or query.shape != (rows, 4096) or query.dtype != torch.bfloat16
+        if (rows < 2560 or query.shape != (rows, 4096) or query.dtype != torch.bfloat16
                 or weights.shape != (rows, 32) or weights.dtype != torch.bfloat16
                 or query.stride(1) != 1 or weights.stride(1) != 1
                 or metadata.starts.numel() != 1 or context is None

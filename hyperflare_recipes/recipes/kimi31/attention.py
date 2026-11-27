@@ -73,7 +73,7 @@ class PreparedDSA(PreparedMLAProjection):
         self.slots = self.buffer("cache_slots", dtype=torch.int64)
         self.mode = mode
         self.history = None
-        if mode == "prefill" and source.shape[0] >= 4096:
+        if mode == "prefill" and source.shape[0] >= 2560:
             if context.staging is None or context.staged_records is None or metadata.starts.numel() != 1:
                 raise ValueError("large sparse prefill requires fixed staging for one request's history")
             history_storage = SharedBuffers(buffers.setdefault("history", {}), source.device)

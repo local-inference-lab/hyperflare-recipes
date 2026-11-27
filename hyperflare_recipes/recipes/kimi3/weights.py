@@ -64,11 +64,10 @@ class ModelWeights:
             torch.cuda.empty_cache()
         if vision:
             from .vision import VisionWeights
-            is_exl3 = config.text.get("quantization_config", {}).get("quant_method") == "exl3"
             vision_mxfp8 = online_mxfp8 and online_mxfp8_scope in ("all", "kda-all")
             vision = VisionWeights.load(
                 manifest, device, shard=shard,
-                tp_enabled=(is_exl3 and shard.world_size == 8),
+                tp_enabled=(shard.world_size in (8, 16)),
                 online_mxfp8=vision_mxfp8, progress=progress,
             )
             release_unused()

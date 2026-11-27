@@ -155,3 +155,118 @@ def test_example_arena_disjoint_namespaces_validation_and_fallback():
 def test_vision_patch_capacities_include_full_65536():
     assert PATCH_CAPACITIES == (256, 1024, 4096, 16384, 65536)
 
+
+def test_vision_tp8_and_tp16_scratch_and_weight_sharding(monkeypatch):
+    from types import SimpleNamespace
+    from hyperflare_recipes.recipes.kimi3 import vision as vision_mod
+
+    for tp_size, expected_heads, expected_mlp in ((1, 12, 4096), (8, 2, 512), (16, 1, 256)):
+        scratch = vision_mod.VisionScratch.allocate(
+            256, "cpu", tp_size=tp_size, local_heads=expected_heads,
+        )
+        assert scratch.qkv.shape == (256, 3 * expected_heads * 128)
+        assert scratch.query.shape == (256, expected_heads, 128)
+        assert scratch.attended.shape == (256, expected_heads * 128)
+        assert scratch.mlp_up.shape == (256, expected_mlp)
+        assert scratch.activated.shape == (64, expected_mlp)
+
+    wqkv_full = torch.arange(3 * 12 * 128 * 1024, dtype=torch.bfloat16).reshape(3 * 12 * 128, 1024)
+    wo_full = torch.arange(1024 * 12 * 128, dtype=torch.bfloat16).reshape(1024, 12 * 128)
+    fc0_full = torch.arange(4096 * 1024, dtype=torch.bfloat16).reshape(4096, 1024)
+    fc1_full = torch.arange(1024 * 4096, dtype=torch.bfloat16).reshape(1024, 4096)
+    norm_w = torch.ones(1024, dtype=torch.bfloat16)
+    fake_tensors = {
+        "vision_tower.encoder.blocks.0.wqkv.weight": wqkv_full,
+        "vision_tower.encoder.blocks.0.wo.weight": wo_full,
+        "vision_tower.encoder.blocks.0.mlp.fc0.weight": fc0_full,
+        "vision_tower.encoder.blocks.0.mlp.fc1.weight": fc1_full,
+        "vision_tower.encoder.blocks.0.norm0.weight": norm_w,
+    }
+
+    class FakeLoader:
+        def __init__(self, manifest, device, *, prefixes=(), progress=None):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def _selected_names(self):
+            return list(fake_tensors)
+
+        def load_tensor(self, name, *, extent=None, temporary=False):
+            tensor = fake_tensors[name]
+            return tensor[extent].clone() if extent is not None else tensor.clone()
+
+    monkeypatch.setattr(vision_mod, "DirectWeightLoader", FakeLoader)
+    monkeypatch.setattr(vision_mod, "persistent_copy", lambda tensor: tensor.clone())
+
+    def make_shard(rank, world_size):
+        def partition(size, alignment=1):
+            width = size // world_size
+            return (rank * width, (rank + 1) * width)
+
+        return SimpleNamespace(rank=rank, world_size=world_size, partition=partition)
+
+    # TP16 active head rank (rank 0 owns head 0) vs zero-padded head rank (rank 12 owns padded head).
+    w0 = vision_mod.VisionWeights.load(None, "cpu", shard=make_shard(0, 16), tp_enabled=True, online_mxfp8=False)
+    w12 = vision_mod.VisionWeights.load(None, "cpu", shard=make_shard(12, 16), tp_enabled=True, online_mxfp8=False)
+    assert w0.tp_size == 16 and w0.local_heads == 1
+    assert w12.tp_size == 16 and w12.local_heads == 1
+    assert w0.tensors["vision_tower.encoder.blocks.0.wqkv.weight"].shape == (3 * 128, 1024)
+    assert w0.tensors["vision_tower.encoder.blocks.0.wo.weight"].shape == (1024, 128)
+    assert w0.tensors["vision_tower.encoder.blocks.0.mlp.fc0.weight"].shape == (256, 1024)
+    assert w0.tensors["vision_tower.encoder.blocks.0.mlp.fc1.weight"].shape == (1024, 256)
+    torch.testing.assert_close(
+        w0.tensors["vision_tower.encoder.blocks.0.wqkv.weight"],
+        wqkv_full.view(3, 12, 128, 1024)[:, 0:1, :, :].reshape(3 * 128, 1024),
+    )
+    assert torch.count_nonzero(w12.tensors["vision_tower.encoder.blocks.0.wqkv.weight"]) == 0
+    assert torch.count_nonzero(w12.tensors["vision_tower.encoder.blocks.0.wo.weight"]) == 0
+    torch.testing.assert_close(
+        w12.tensors["vision_tower.encoder.blocks.0.mlp.fc0.weight"],
+        fc0_full[12 * 256 : 13 * 256, :],
+    )
+
+
+def test_query_sharded_dsa_threshold_2560():
+    from types import SimpleNamespace
+    from hyperflare_recipes.recipes.kimi31.query_selection import PreparedQuerySelection
+
+    metadata = SimpleNamespace(starts=torch.zeros(1, dtype=torch.int64))
+    # Below 2560 rows is rejected by the row-count threshold guard.
+    with pytest.raises(ValueError, match="query-sharded indexing requires"):
+        PreparedQuerySelection(
+            torch.zeros((2048, 4096), dtype=torch.bfloat16),
+            torch.zeros((2048, 32), dtype=torch.bfloat16),
+            torch.zeros((2, 64 * 132), dtype=torch.uint8),
+            metadata,
+            SimpleNamespace(world=8, index=0),
+            None,
+            {},
+            session=None,
+            name="test",
+            workspace=None,
+        )
+    # At 2560 rows, the row-count threshold passes and reaches index column validation.
+    context = SimpleNamespace(
+        index_staging=SimpleNamespace(tensor=torch.zeros((64, 64 * 132), dtype=torch.uint8), addresses=torch.zeros(8, dtype=torch.int64)),
+        index_records=torch.zeros((4, 64 * 132), dtype=torch.uint8),
+        index_columns=torch.zeros((2,), dtype=torch.int32),  # deliberate mismatch to stop before CUDA ops
+        selections=object(),
+    )
+    with pytest.raises(ValueError, match="one int32 column per global index page"):
+        PreparedQuerySelection(
+            torch.zeros((2560, 4096), dtype=torch.bfloat16),
+            torch.zeros((2560, 32), dtype=torch.bfloat16),
+            torch.zeros((2, 64 * 132), dtype=torch.uint8),
+            metadata,
+            SimpleNamespace(world=8, index=0),
+            context,
+            {},
+            session=None,
+            name="test",
+            workspace=None,
+        )

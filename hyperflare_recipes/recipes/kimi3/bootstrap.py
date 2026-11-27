@@ -478,7 +478,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
                                            heads=heads * config.context_parallel_size // shard.world_size,
                                            head_dim=512, query_head_dim=RECORD_BYTES, ipc=dcp_ipc),
                 coordinator=coordinator, peers=pool.share_pages(core_storage, dcp_group), slab=None, **extra)
-            if weights.config.dsa is not None and config.prefill_chunk_size >= 4096:
+            if weights.config.dsa is not None and config.prefill_chunk_size >= 2560:
                 from hyperflare_recipes.components.shared_pages import SharedPages
 
                 staging = SharedPages(dcp_group, device, config.context // config.context_parallel_size * RECORD_BYTES,

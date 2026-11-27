@@ -192,7 +192,7 @@ class PreparedDSAIndexer:
         selection_buffers = buffers.setdefault("selection", {})
         cache_pages = cache.view(-1, 64 * 132)
         self.cache, self.sharded = cache_pages, None
-        if mode == "prefill" and rows >= 4096:
+        if mode == "prefill" and rows >= 2560:
             from .query_selection import PreparedQuerySelection
 
             self.sharded = PreparedQuerySelection(self.query, self.head_weights, cache_pages,
