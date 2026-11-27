@@ -19,6 +19,14 @@ ignition = "hyperflare_recipes.cli:main"
 [project.optional-dependencies]
 test = ["pytest>=9,<10", "tiktoken>=0.12,<1"]
 api-test = ["pytest>=9,<10", "openai>=2,<3", "anthropic>=0.70,<1"]
+diffusion = [
+    "diffusers==0.43.0",
+    "beautifulsoup4==4.14.3",
+    "ftfy==6.3.1",
+    "sentencepiece==0.2.1",
+    "soupsieve==4.1.1",
+    "wcwidth==0.9.4",
+]
 
 [[tool.uv.index]]
 name = "pytorch-cu132"
@@ -28,7 +36,8 @@ explicit = true
 [tool.uv.sources]
 torch = { index = "pytorch-cu132" }
 torchvision = { index = "pytorch-cu132" }
-ignition = { git = "https://github.com/NVIDIA/hyperflare-inference.git", branch = "main" }
+ignition = { git = "https://github.com/schopde-nvidia/hyperflare-inference.git", rev = "80fb66a21709932a4de313f84b324a2c0b9b1ad7" }
+flare-heliopause = { git = "https://github.com/schopde-nvidia/hyperflare-inference.git", rev = "80fb66a21709932a4de313f84b324a2c0b9b1ad7", subdirectory = "heliopause" }
 flashinfer-python = { git = "https://github.com/local-inference-lab/flashinfer.git", branch = "main" }
 
 [tool.setuptools.packages.find]
