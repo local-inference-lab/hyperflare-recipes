@@ -662,7 +662,7 @@ class PreparedGlmLayer:
             attention = self.attention.output_shard(rec_sh, z_sh, live_sh)
             self.attention.commit_state(s4, conv_all, metadata)
         elif self.row_shard_mla:
-            cache_sh, query_res, idx_query, weight_in = self.attention.project_shard(attention_input)
+            query_res, idx_query, weight_in, cache_sh = self.attention.project_shard(attention_input)
             cache_full = self.cache_gather(cache_sh)
             global_index_cache, slab = self.attention.write_and_gather_context(cache_full, metadata)
             attention = self.attention.attend_shard(
