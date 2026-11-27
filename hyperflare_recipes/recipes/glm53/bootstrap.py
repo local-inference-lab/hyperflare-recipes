@@ -390,8 +390,30 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
         elif group is not None:
             collective = create_all_reduce_runtime(group, device, max_tokens=config.token_capacity,
                                                    hidden_size=4096, ipc=ipc)
-            dma_tokens = (max(config.prefill_chunk_size, 4096)
-                          if config.row_shard_attention else config.prefill_chunk_size)
+            from .stack import (
+                PIPELINED_PREFILL_TOKENS,
+                QUARTER_MLP_PREFILL_TOKENS,
+                ROW_SHARD_ATTENTION_MIN_TOKENS_PCIE,
+            )
+
+            if (config.row_shard_attention and config.context_parallel
+                    and config.stream_overlap and not config.prompt_logprobs):
+                q_min = max(QUARTER_MLP_PREFILL_TOKENS, ROW_SHARD_ATTENTION_MIN_TOKENS_PCIE)
+                q_align = 4 * 128 * shard.world_size
+                p_align = 2 * 128 * shard.world_size
+                max_dma = max(
+                    (c // 4 if (c >= q_min and c % q_align == 0)
+                     else (c // 2 if (c >= PIPELINED_PREFILL_TOKENS and c % p_align == 0) else c)
+                     for c in config.prefill_capacities),
+                    default=4096,
+                )
+                # Cap at 8192 tokens (64 MiB) when all large chunks use quarter-MLP mode:
+                # frees ~288 MiB/GPU of PeerStorage on 32K chunks and splits 128 MiB BF16 MLA o_proj
+                # into two 64 MiB halves for zero-stall overlap behind the next layer's qkv_a_proj.
+                dma_tokens = max(max_dma, 8192)
+            else:
+                dma_tokens = (max(config.prefill_chunk_size, 4096)
+                              if config.row_shard_attention else config.prefill_chunk_size)
             prefill_collective = create_dma_all_reduce_runtime(group, device, max_tokens=dma_tokens,
                                                                hidden_size=4096, ipc=ipc)
             vocabulary_collective = create_all_gather_runtime(group, device,

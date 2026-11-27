@@ -18,27 +18,11 @@ from hyperflare_recipes.components.weight_gather import (
 from hyperflare_recipes.components.weights import GroupedLinearWeights
 
 
-class _SimulatedGatherRuntime:
-    """In-process multi-rank gather runtime that simulates all_gather over per-rank tensors."""
-
-    def __init__(self, world_size: int, rank_sources: dict[int, list[torch.Tensor]] | None = None):
-        self.world_size = world_size
-        self.max_bytes = 256 << 20
-        self.rank_sources = rank_sources
-
-    def should_all_gather(self, source: torch.Tensor) -> bool:
-        return True
-
-    def should_gather_shards(self, source: torch.Tensor) -> bool:
-        return True
-
-
-
 class _StubGather:
     def __init__(self, source, output, *, runtime, session, coordinator, name):
         self.runtime, self.output, self.name = runtime, output, name
         self.single = False
-        self.dma = True
+        self.pcie = True
         self.plan = None
 
     def functional(self, *, session):
@@ -58,7 +42,7 @@ def _make_full_kda_bf16(device: torch.device, seed: int = 7) -> dict[str, torch.
         "f_b_proj": torch.randn((8192, 128), dtype=torch.bfloat16, device=device, generator=g),
         "g_b_proj": torch.randn((8192, 128), dtype=torch.bfloat16, device=device, generator=g),
         "o_proj": torch.randn((4096, 8192), dtype=torch.bfloat16, device=device, generator=g),
-        "o_norm.weight": torch.ones((128,), dtype=torch.bfloat16, device=device),
+        "o_norm.weight": torch.randn((128,), dtype=torch.bfloat16, device=device, generator=g),
         "q_conv": torch.randn((8192, 4), dtype=torch.bfloat16, device=device, generator=g),
         "k_conv": torch.randn((8192, 4), dtype=torch.bfloat16, device=device, generator=g),
         "v_conv": torch.randn((8192, 4), dtype=torch.bfloat16, device=device, generator=g),
@@ -92,22 +76,23 @@ def _pack_mxfp8(tensor_bf16: torch.Tensor):
 
     n, k = tensor_bf16.shape
     vals = tensor_bf16.to(torch.float8_e4m3fn).contiguous()
-    # Deterministic UE8M0 power-of-two byte scales in [124, 130].
     scales = (torch.arange(n * (k // 32), device=tensor_bf16.device) % 7 + 124).to(torch.uint8).reshape(n, k // 32)
     return pack_mxfp8_linear_weight(vals, scales.view(torch.float8_e8m0fnu))
 
 
-def _install_simulated_gather(monkeypatch, gatherer: AttentionWeightGatherer, rank_weights_list: list[dict[str, object]]):
-    """Simulate multi-rank weight gather in-process by gathering from all W rank dicts."""
+def _install_simulated_gather(
+    monkeypatch,
+    gatherer: AttentionWeightGatherer,
+    rank_weights_per_layer: list[list[dict[str, object]]],
+):
+    """Simulate multi-rank weight gather (both 1D and 2D col_row_bytes) in-process."""
     import hyperflare_recipes.components.weight_gather as wg
 
-    # Build a helper that runs gatherer on rank 0 while reading each rank\x27s slice on demand.
     world = gatherer.world
     rank_gatherers = []
     for r in range(world):
-        # Lightweight mirror holding rank r\x27s sharded weights.
         rg = object.__new__(AttentionWeightGatherer)
-        rg.layer_weights = (rank_weights_list[r],)
+        rg.layer_weights = tuple(layer_ranks[r] for layer_ranks in rank_weights_per_layer)
         rg.layer_types = gatherer.layer_types
         rg.world = world
         rg._kda_ch = gatherer._kda_ch
@@ -121,65 +106,96 @@ def _install_simulated_gather(monkeypatch, gatherer: AttentionWeightGatherer, ra
         rg._kda_small_rows = gatherer._kda_small_rows
         rank_gatherers.append(rg)
 
-    # Map rank 0 tensor data_ptr -> list of all W ranks\x27 corresponding tensors.
     ptr_map: dict[tuple[int, tuple[int, ...], int], list[torch.Tensor]] = {}
+
     def register(tensors_per_rank: list[torch.Tensor]):
         t0 = tensors_per_rank[0]
         ptr_map[(t0.data_ptr(), tuple(t0.shape), t0.storage_offset())] = tensors_per_rank
 
-    ltype = gatherer.layer_types[0]
-    if ltype == "linear_attention":
-        ch = gatherer._kda_ch
-        if isinstance(rank_weights_list[0]["input_proj"], torch.Tensor):
-            for s0, s1 in ((0, ch), (ch, 2 * ch), (2 * ch, 3 * ch)):
-                register([rw["input_proj"][s0:s1] for rw in rank_weights_list])
-            register([rw["o_proj"] for rw in rank_weights_list])
-        else:
-            mt = ch // 128
-            for s0, s1 in ((0, ch), (ch, 2 * ch), (2 * ch, 3 * ch)):
-                register([rw["input_proj"].parts[0].weight.values[s0:s1] for rw in rank_weights_list])
-            for s0, s1 in ((0, mt), (mt, 2 * mt), (2 * mt, 3 * mt)):
-                register([_mxfp8_scale_phys(rw["input_proj"].parts[0])[0][s0:s1] for rw in rank_weights_list])
-            register([rw["o_proj"].weight.values for rw in rank_weights_list])
-            register([_mxfp8_scale_phys(rw["o_proj"])[0] for rw in rank_weights_list])
-    else:
-        if isinstance(rank_weights_list[0]["q_b_proj"], torch.Tensor):
-            register([rw["q_b_proj"] for rw in rank_weights_list])
-        else:
-            register([rw["q_b_proj"].values for rw in rank_weights_list])
-            register([rw["q_b_proj"].scales for rw in rank_weights_list])
-        if isinstance(rank_weights_list[0]["kv_b_proj"], torch.Tensor):
-            register([rw["kv_b_proj"] for rw in rank_weights_list])
-        else:
-            register([rw["kv_b_proj"].weight.values for rw in rank_weights_list])
-            register([rw["kv_b_proj"].weight.scale_rows[0].view(torch.uint8) for rw in rank_weights_list])
-        if isinstance(rank_weights_list[0]["o_proj"], torch.Tensor):
-            if gatherer._mla_o_split:
-                register([rw["o_proj"][:2048] for rw in rank_weights_list])
-                register([rw["o_proj"][2048:] for rw in rank_weights_list])
-            else:
+    for layer_idx, (ltype, rank_weights_list) in enumerate(zip(gatherer.layer_types, rank_weights_per_layer, strict=True)):
+        spec = gatherer._layer_ops[layer_idx]
+        if ltype == "linear_attention":
+            ch = gatherer._kda_ch
+            if isinstance(rank_weights_list[0]["input_proj"], torch.Tensor):
+                for s0, s1 in ((0, ch), (ch, 2 * ch), (2 * ch, 3 * ch), (0, 2 * ch), (0, 3 * ch)):
+                    register([rw["input_proj"][s0:s1] for rw in rank_weights_list])
                 register([rw["o_proj"] for rw in rank_weights_list])
+            else:
+                mt = ch // 128
+                for s0, s1 in ((0, ch), (ch, 2 * ch), (2 * ch, 3 * ch), (0, 2 * ch), (0, 3 * ch)):
+                    register([rw["input_proj"].parts[0].weight.values[s0:s1] for rw in rank_weights_list])
+                for s0, s1 in ((0, mt), (mt, 2 * mt), (2 * mt, 3 * mt), (0, 3 * mt)):
+                    register([_mxfp8_scale_phys(rw["input_proj"].parts[0])[0][s0:s1] for rw in rank_weights_list])
+                register([rw["o_proj"].weight.values for rw in rank_weights_list])
+                register([_mxfp8_scale_phys(rw["o_proj"])[0] for rw in rank_weights_list])
         else:
-            register([rw["o_proj"].values for rw in rank_weights_list])
-            register([rw["o_proj"].scales for rw in rank_weights_list])
+            if isinstance(rank_weights_list[0]["q_b_proj"], torch.Tensor):
+                register([rw["q_b_proj"] for rw in rank_weights_list])
+            else:
+                register([rw["q_b_proj"].values for rw in rank_weights_list])
+                register([rw["q_b_proj"].scales for rw in rank_weights_list])
+            if isinstance(rank_weights_list[0]["kv_b_proj"], torch.Tensor):
+                register([rw["kv_b_proj"] for rw in rank_weights_list])
+            else:
+                register([rw["kv_b_proj"].weight.values for rw in rank_weights_list])
+                register([rw["kv_b_proj"].weight.scale_rows[0].view(torch.uint8) for rw in rank_weights_list])
+            if isinstance(rank_weights_list[0]["o_proj"], torch.Tensor):
+                if spec["mla_o_split"]:
+                    register([rw["o_proj"][:2048] for rw in rank_weights_list])
+                    register([rw["o_proj"][2048:] for rw in rank_weights_list])
+                else:
+                    register([rw["o_proj"] for rw in rank_weights_list])
+            else:
+                register([rw["o_proj"].values for rw in rank_weights_list])
+                register([rw["o_proj"].scales for rw in rank_weights_list])
 
-    def fake_gather(source, output, row_start, row_end, op_handle):
+    small_counter = [0]
+
+    def fake_gather(source, output, channel_token, row_start, row_end, op_handle, col_row_bytes):
+        del channel_token
         op = wg._WEIGHT_OPS[op_handle]
         key = (source.data_ptr(), tuple(source.shape), source.storage_offset())
         if key in ptr_map:
             shards = ptr_map[key]
         else:
-            # Dynamically packed KDA small tensor: pack on every rank.
-            shards = [rg._pack_kda_small(rg.layer_weights[0]) for rg in rank_gatherers]
-        gathered = torch.cat([s.view(torch.bfloat16).reshape(op.src_shape) for s in shards], dim=0)
-        output[row_start:row_end].view(torch.bfloat16).reshape(op.dst_shape).copy_(gathered)
+            li = small_counter[0] % len(rank_weights_per_layer)
+            small_counter[0] += 1
+            shards = [rg._pack_kda_small(rg.layer_weights[li]) for rg in rank_gatherers]
+        dst = output[row_start:row_end]
+        if col_row_bytes:
+            # Emulate _RoceScatterGatherLaunch._gather_dst_offset 2D column-concat gather.
+            shard_bytes = [s.contiguous().view(torch.uint8).reshape(-1, col_row_bytes) for s in shards]
+            gathered_u8 = torch.stack(shard_bytes, dim=1).reshape(-1)
+            dst.view(torch.uint8).reshape(-1).copy_(gathered_u8)
+        else:
+            gathered = torch.cat([s.view(torch.bfloat16).reshape(op.src_shape) for s in shards], dim=0)
+            dst.view(torch.bfloat16).reshape(op.dst_shape).copy_(gathered)
 
     monkeypatch.setattr(wg, "_weight_gather_slice", fake_gather)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_full_kda_template_preserves_per_layer_replicated_weights():
+    """Template must exclude per-layer replicated g_a_proj and o_norm.weight."""
+    device = torch.device("cuda:0")
+    layer0 = _shard_kda_bf16(_make_full_kda_bf16(device, seed=1), 0, 2)
+    layer1 = _shard_kda_bf16(_make_full_kda_bf16(device, seed=2), 0, 2)
+
+    tpl = full_kda_template(layer0, world_size=2, device=device)
+    assert "g_a_proj" not in tpl
+    assert "o_norm.weight" not in tpl
+
+    merged1 = {**layer1, **tpl}
+    assert torch.equal(merged1["g_a_proj"], layer1["g_a_proj"])
+    assert torch.equal(merged1["o_norm.weight"], layer1["o_norm.weight"])
+    assert not torch.equal(merged1["g_a_proj"], layer0["g_a_proj"])
+    assert not torch.equal(merged1["o_norm.weight"], layer0["o_norm.weight"])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("world", [2, 4])
-def test_kda_bf16_weight_gather_bit_exact(monkeypatch, world):
+@pytest.mark.parametrize("roce_2d,max_gb", [(False, 1 << 30), (True, 128 << 20), (True, 256 << 20)])
+def test_kda_bf16_weight_gather_bit_exact(monkeypatch, world, roce_2d, max_gb):
     device = torch.device("cuda:0")
     full = _make_full_kda_bf16(device)
     rank_weights = [_shard_kda_bf16(full, r, world) for r in range(world)]
@@ -190,12 +206,18 @@ def test_kda_bf16_weight_gather_bit_exact(monkeypatch, world):
 
     import hyperflare_recipes.components.weight_gather as _wg
     monkeypatch.setattr(_wg, "PreparedGatherShards", _StubGather)
+    monkeypatch.setattr(_wg, "_supports_roce_col_gather", lambda _rt: roce_2d)
     gatherer = AttentionWeightGatherer(
         [rank_weights[0]], ["linear_attention"], world_size=world,
         runtime=None, coordinator=None, session=None, name="test", device=device,
     )
-    # Force single-rank PreparedGatherShards bypassed by our multi-rank simulator.
-    _install_simulated_gather(monkeypatch, gatherer, rank_weights)
+    if roce_2d:
+        gatherer.use_roce_2d = True
+        gatherer.max_gather_bytes = max_gb
+        gatherer._layer_ops[0] = gatherer._declare_kda_shapes(
+            rank_weights[0], runtime=None, coordinator=None, session=None, name="test")
+        assert gatherer._layer_ops[0]["qkv_coalesce"] == (3 if max_gb >= (192 << 20) else 2)
+    _install_simulated_gather(monkeypatch, gatherer, [rank_weights])
     gathered = gatherer.gather_sync(0)
 
     expected_inp = torch.cat((full["q"], full["k"], full["v"], full["b"], full["f_a"]), dim=0)
@@ -211,7 +233,8 @@ def test_kda_bf16_weight_gather_bit_exact(monkeypatch, world):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("world", [2, 4])
-def test_kda_mxfp8_weight_gather_bit_exact(monkeypatch, world):
+@pytest.mark.parametrize("roce_2d,max_gb", [(False, 1 << 30), (True, 64 << 20), (True, 128 << 20)])
+def test_kda_mxfp8_weight_gather_bit_exact(monkeypatch, world, roce_2d, max_gb):
     device = torch.device("cuda:0")
     full = _make_full_kda_bf16(device, seed=19)
     full_qkv = _pack_mxfp8(torch.cat((full["q"], full["k"], full["v"]), dim=0))
@@ -222,8 +245,6 @@ def test_kda_mxfp8_weight_gather_bit_exact(monkeypatch, world):
     for r in range(world):
         c0, c1 = r * ch, (r + 1) * ch
         h0, h1 = r * lh, (r + 1) * lh
-        qkv_r = _pack_mxfp8(torch.cat((full["q"][c0:c1], full["k"][c0:c1], full["v"][c0:c1]), dim=0))
-        # Match full_qkv scales exactly per slice!
         qkv_r_vals = torch.cat((
             full_qkv.weight.values[c0:c1],
             full_qkv.weight.values[8192 + c0:8192 + c1],
@@ -265,7 +286,14 @@ def test_kda_mxfp8_weight_gather_bit_exact(monkeypatch, world):
         [rank_weights[0]], ["linear_attention"], world_size=world,
         runtime=None, coordinator=None, session=None, name="test", device=device,
     )
-    _install_simulated_gather(monkeypatch, gatherer, rank_weights)
+    if roce_2d:
+        gatherer.use_roce_2d = True
+        gatherer.max_gather_bytes = max_gb
+        gatherer._layer_ops[0] = gatherer._declare_kda_shapes(
+            rank_weights[0], runtime=None, coordinator=None, session=None, name="test")
+        assert gatherer._layer_ops[0]["qkv_coalesce"] == (3 if max_gb >= (96 << 20) else 2)
+        assert gatherer._layer_ops[0]["qkv_sc_bulk"] is not None
+    _install_simulated_gather(monkeypatch, gatherer, [rank_weights])
     gathered = gatherer.gather_sync(0)
 
     assert torch.equal(gathered.input_proj.parts[0].weight.values.view(torch.uint8),
@@ -279,7 +307,8 @@ def test_kda_mxfp8_weight_gather_bit_exact(monkeypatch, world):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("world", [2, 4])
 @pytest.mark.parametrize("split_o", [False, True])
-def test_mla_bf16_and_blockfp8_weight_gather_bit_exact(monkeypatch, world, split_o):
+@pytest.mark.parametrize("roce_2d", [False, True])
+def test_mla_bf16_and_blockfp8_weight_gather_bit_exact(monkeypatch, world, split_o, roce_2d):
     device = torch.device("cuda:0")
     g = torch.Generator(device=device).manual_seed(31)
 
@@ -302,13 +331,16 @@ def test_mla_bf16_and_blockfp8_weight_gather_bit_exact(monkeypatch, world, split
         [rank_bf16[0]], ["indexed_attention"], world_size=world,
         runtime=None, coordinator=None, session=None, name="test_bf16", device=device,
     )
-    if split_o:
-        gatherer.max_gather_bytes = 64 << 20
+    if split_o or roce_2d:
+        gatherer.use_roce_2d = roce_2d
+        if split_o:
+            gatherer.max_gather_bytes = 64 << 20
         gatherer._ops.clear()
         gatherer._gathers.clear()
-        gatherer._declare_mla_shapes(rank_bf16[0], runtime=None, coordinator=None, session=None, name="test_bf16")
-        assert gatherer._mla_o_split
-    _install_simulated_gather(monkeypatch, gatherer, rank_bf16)
+        gatherer._layer_ops[0] = gatherer._declare_mla_shapes(
+            rank_bf16[0], runtime=None, coordinator=None, session=None, name="test_bf16")
+        assert gatherer._layer_ops[0]["mla_o_split"] == split_o
+    _install_simulated_gather(monkeypatch, gatherer, [rank_bf16])
     got = gatherer.gather_sync(0)
     assert torch.equal(got.q_b_proj, qb_full)
     assert torch.equal(got.absorb, kvb_full.view(64, 512, 512)[:, :256])
@@ -338,7 +370,8 @@ def test_mla_bf16_and_blockfp8_weight_gather_bit_exact(monkeypatch, world, split
         [rank_fp8[0]], ["indexed_attention"], world_size=world,
         runtime=None, coordinator=None, session=None, name="test_fp8", device=device,
     )
-    _install_simulated_gather(monkeypatch, gatherer_fp8, rank_fp8)
+    gatherer_fp8.use_roce_2d = roce_2d
+    _install_simulated_gather(monkeypatch, gatherer_fp8, [rank_fp8])
     got_fp8 = gatherer_fp8.gather_sync(0)
     assert torch.equal(got_fp8.q_b_proj.values.view(torch.uint8), qb_v.view(torch.uint8))
     assert torch.equal(got_fp8.q_b_proj.scales, qb_s)

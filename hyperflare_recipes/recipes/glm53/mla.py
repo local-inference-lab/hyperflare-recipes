@@ -332,11 +332,15 @@ class SelectShardChain:
         pools_b = torch.empty((rows, 512), dtype=torch.int32, device=device)
         phys_b = torch.empty((rows, 2051), dtype=torch.int32, device=device)
         sel_b = torch.empty(rows, dtype=torch.int32, device=device)
-        scratches = [
-            torch.empty(shape, dtype=dtype, device=device)
-            for selector in self.indexer.selectors
-            for shape, dtype in selector.scratch_layout
-        ]
+        max_scratch_bytes = 0
+        for selector in self.indexer.selectors:
+            for shape, dtype in selector.scratch_layout:
+                nbytes = dtype.itemsize
+                for dim in shape:
+                    nbytes *= dim
+                if nbytes > max_scratch_bytes:
+                    max_scratch_bytes = nbytes
+        scratches = [torch.empty((max_scratch_bytes,), dtype=torch.uint8, device=device)]
         deps = list(dependencies)
         _start_select_shards(
             idxq_a, weights_a, plen_a, pos_a, idxq_b, weights_b, plen_b, pos_b, global_cache,
@@ -452,48 +456,54 @@ class QueryChain:
     def run(self, source, query, absorbed, gathered, workspace, encoded, extra_weights=()):
         from hyperflare_recipes.components.sm103_projection import packed_out_workspace, _dense_out_workspace
 
-        output = query.view(source.shape[0], -1)
-        idx = 0
-        if isinstance(self.projection, BlockFP8Projection):
-            from hyperflare_recipes.components.block_fp8 import _project_out, _quantize_out
+        step = query.shape[0]
+        total_rows = source.shape[0]
+        for start in range(0, total_rows, step):
+            end = start + step
+            src_slice = source if total_rows == step else source[start:end]
+            abs_slice = absorbed if total_rows == step else absorbed[start:end]
+            output = query.view(step, -1)
+            idx = 0
+            if isinstance(self.projection, BlockFP8Projection):
+                from hyperflare_recipes.components.block_fp8 import _project_out, _quantize_out
 
-            _quantize_out(source, encoded[0], encoded[1])
-            if extra_weights:
-                w_vals, weight_scales = extra_weights[0], extra_weights[1]
-                idx = 2
+                _quantize_out(src_slice, encoded[0], encoded[1])
+                if extra_weights:
+                    w_vals, weight_scales = extra_weights[0], extra_weights[1]
+                    idx = 2
+                else:
+                    w_vals, weight_scales = self.projection.weight.values, self.projection.weight.scales
+                activation_scales = encoded[1]
+                if len(encoded) == 4:
+                    encoded[2].copy_(activation_scales.T)
+                    encoded[3].copy_(weight_scales.T)
+                    activation_scales, weight_scales = encoded[2:]
+                _project_out(encoded[0], activation_scales, w_vals, weight_scales,
+                             output, workspace, self.projection.plan.handle)
+            elif isinstance(self.projection, QuantizedProjection):
+                if extra_weights:
+                    vals, sc = extra_weights[0], extra_weights[1]
+                    idx = 2
+                else:
+                    vals, sc = self.values, self.scales
+                packed_out_workspace(src_slice, vals, sc, None, None, output, workspace, "none",
+                                     None, self.projection.plan.handle, "any")
+            elif self.projection.dense:
+                w = extra_weights[0] if extra_weights else self.projection.weight
+                idx = 1 if extra_weights else 0
+                _dense_out_workspace(src_slice, w, output, workspace, self.projection.plan.handle)
             else:
-                w_vals, weight_scales = self.projection.weight.values, self.projection.weight.scales
-            activation_scales = encoded[1]
-            if len(encoded) == 4:
-                encoded[2].copy_(activation_scales.T)
-                encoded[3].copy_(weight_scales.T)
-                activation_scales, weight_scales = encoded[2:]
-            _project_out(encoded[0], activation_scales, w_vals, weight_scales,
-                         output, workspace, self.projection.plan.handle)
-        elif isinstance(self.projection, QuantizedProjection):
-            if extra_weights:
-                vals, sc = extra_weights[0], extra_weights[1]
-                idx = 2
-            else:
-                vals, sc = self.values, self.scales
-            packed_out_workspace(source, vals, sc, None, None, output, workspace, "none",
-                                 None, self.projection.plan.handle, "any")
-        elif self.projection.dense:
-            w = extra_weights[0] if extra_weights else self.projection.weight
-            idx = 1 if extra_weights else 0
-            _dense_out_workspace(source, w, output, workspace, self.projection.plan.handle)
-        else:
-            from b12x.gemm import bf16_gemv
+                from b12x.gemm import bf16_gemv
 
-            w = extra_weights[0] if extra_weights else self.projection.weight
-            idx = 1 if extra_weights else 0
-            bf16_gemv.mm(source, w, out=output, plan=self.projection.plan,
-                         bias=self.projection.bias)
-        absorb_w = None
-        if extra_weights:
-            rem = extra_weights[idx:]
-            absorb_w = tuple(rem) if len(rem) > 1 else rem[0]
-        self.absorb(query.transpose(0, 1), output=absorbed.transpose(0, 1), weight=absorb_w)
+                w = extra_weights[0] if extra_weights else self.projection.weight
+                idx = 1 if extra_weights else 0
+                bf16_gemv.mm(src_slice, w, out=output, plan=self.projection.plan,
+                             bias=self.projection.bias)
+            absorb_w = None
+            if extra_weights:
+                rem = extra_weights[idx:]
+                absorb_w = tuple(rem) if len(rem) > 1 else rem[0]
+            self.absorb(query.transpose(0, 1), output=abs_slice.transpose(0, 1), weight=absorb_w)
         if self.gather is not None and not self.gather_on_main:
             self.gather(absorbed.view(absorbed.shape[0], -1), output=gathered.view(gathered.shape[0], -1))
 
@@ -583,10 +593,14 @@ class PreparedGlmMLA:
         for key in ("q_a_layernorm", "kv_a_layernorm"):
             module.get_submodule(key).weight = torch.nn.Parameter(weights[f"{key}.weight"], requires_grad=False)
         self.projections = {}
+        # Slice large row-sharded MLA query/attention stages into 1024-row chunks to cut
+        # transient graph-pool peak by ~480-700 MiB (query, absorbed, attended, expanded).
+        self.row_shard_slice = 1024 if (self.row_shard and rows > 1024 and rows % 1024 == 0) else rows
+        rs_s = self.row_shard_slice
         for key, input, output in (
             ("qkv_a_proj", source, scratch.projected_input),
-            ("q_b_proj", scratch.query_residual, scratch.query.view(rows, -1)),
-            ("o_proj", scratch.expanded.view(rows, -1), scratch.output),
+            ("q_b_proj", scratch.query_residual[:rs_s], scratch.query[:rs_s].view(rs_s, -1)),
+            ("o_proj", scratch.expanded[:rs_s].view(rs_s, -1), scratch.output[:rs_s]),
         ):
             self.projections[key] = prepare_projection(input, active_weights[key], output,
                 session=session, name=f"{name}.{key}", workspace=workspace, activation_mode="auto")
@@ -605,11 +619,11 @@ class PreparedGlmMLA:
         self.remote = context is not None and context.remote
         self.sm103_prefill = context is None and mode == "prefill" and sm103.is_sm103(source.device)
         if context is None or self.row_shard:
-            self.query_absorption = batched_projection(scratch.query.transpose(0, 1),
-                self.absorb_weights, scratch.absorbed_query.transpose(0, 1), major="n",
+            self.query_absorption = batched_projection(scratch.query[:rs_s].transpose(0, 1),
+                self.absorb_weights, scratch.absorbed_query[:rs_s].transpose(0, 1), major="n",
                 session=session, name=f"{name}.absorb_query")
-            self.value_expansion = batched_projection(scratch.attended.transpose(0, 1),
-                self.expand_weights, scratch.expanded.transpose(0, 1), major="k",
+            self.value_expansion = batched_projection(scratch.attended[:rs_s].transpose(0, 1),
+                self.expand_weights, scratch.expanded[:rs_s].transpose(0, 1), major="k",
                 session=session, name=f"{name}.expand_value")
         self.indexer = PreparedGlmIndexer(module.indexer, weights, source, scratch.query_residual,
             scratch.projected_input[:, 2048:2176], scratch.projected_input[:, 2176:2208],
@@ -652,8 +666,8 @@ class PreparedGlmMLA:
             # directly on this rank's owned query rows (promoting b12x sparse MLA to mg_n_hg=2).
             from .dcp import PreparedContextGather
 
-            slab_caps = sparse_mla.Caps(device=source.device, num_q_heads=64, max_q_rows=rows, max_width=2051,
-                softmax_scale=module.scaling, max_batch=rows, max_kv_rows=scratch.slab.shape[0],
+            slab_caps = sparse_mla.Caps(device=source.device, num_q_heads=64, max_q_rows=rs_s, max_width=2051,
+                softmax_scale=module.scaling, max_batch=rs_s, max_kv_rows=scratch.slab.shape[0],
                 kv_dtype=torch.uint8, head_dim=512, v_head_dim=512, page_size=64,
                 model_type=sparse_mla.ModelType.GLM_NEXT, cache_record_bytes=528, mode="extend")
             if scratch.slab.shape[0] != metadata.block_table.shape[1] * context.shards.page_tokens:
@@ -667,13 +681,13 @@ class PreparedGlmMLA:
                     parallel_plans = (*parallel_plans, self.indexer.pool_gather.gather.plan)
                 self.query_chain = QueryChain(
                     self.projections["q_b_proj"], self.query_absorption,
-                    scratch.query_residual, scratch.query, scratch.absorbed_query,
+                    scratch.query_residual[:rs_s], scratch.query[:rs_s], scratch.absorbed_query[:rs_s],
                     session=session, workspace=workspace, parallel_plans=parallel_plans)
                 self.select_chain = SelectShardChain(
                     self.indexer, workspace=workspace, parallel_plans=cg_plans)
-            self.attention = PreparedSparseMLA(scratch.absorbed_query, scratch.slab.view(-1, 64, 528),
-                scratch.index.physical, scratch.visible, scratch.index.selected_lengths,
-                scratch.attended, caps=slab_caps, session=session, name=f"{name}.attention",
+            self.attention = PreparedSparseMLA(scratch.absorbed_query[:rs_s], scratch.slab.view(-1, 64, 528),
+                scratch.index.physical[:rs_s], scratch.visible[:rs_s], scratch.index.selected_lengths[:rs_s],
+                scratch.attended[:rs_s], caps=slab_caps, session=session, name=f"{name}.attention",
                 workspace=workspace)
             self.slab_shape = tuple(scratch.slab.shape)
             self.records_shape = tuple(scratch.records.shape)
@@ -771,6 +785,8 @@ class PreparedGlmMLA:
         if self.query_chain is not None:
             self.query_chain.functional(session=session, release_weight=self.runtime_weights)
         for key, projection in self.projections.items():
+            if key == "q_b_proj" and self.query_chain is not None:
+                continue
             release = self.runtime_weights and key != "qkv_a_proj"
             projection.functional(session=session, release_weight=release)
         if hasattr(self, "query_absorption"):
@@ -879,13 +895,24 @@ class PreparedGlmMLA:
         cache_payload = torch.cat((latent, norm_key, gate), dim=-1)
         return query_res, idx_query, weight_in, cache_payload
 
+    def _prepare_query_slice(self, query_res_s, *, weights=None):
+        rows = query_res_s.shape[0]
+        qb_w = None if weights is None else weights.q_b_proj
+        ab_w = None if weights is None else weights.absorb
+        query = self.projections["q_b_proj"](query_res_s, weight=qb_w).view(rows, 64, 256)
+        return self.query_absorption(query.transpose(0, 1), weight=ab_w).transpose(0, 1).contiguous()
+
     def prepare_query_shard(self, query_res_sh, *, weights=None):
         """Project and absorb 64-head queries on owned rows (independent of cache/context gathers)."""
         rows = query_res_sh.shape[0]
-        qb_w = None if weights is None else weights.q_b_proj
-        ab_w = None if weights is None else weights.absorb
-        query = self.projections["q_b_proj"](query_res_sh, weight=qb_w).view(rows, 64, 256)
-        return self.query_absorption(query.transpose(0, 1), weight=ab_w).transpose(0, 1).contiguous()
+        step = self.row_shard_slice
+        if rows == step:
+            return self._prepare_query_slice(query_res_sh, weights=weights)
+        absorbed = torch.empty((rows, 64, 512), dtype=torch.bfloat16, device=query_res_sh.device)
+        for start in range(0, rows, step):
+            end = start + step
+            absorbed[start:end].copy_(self._prepare_query_slice(query_res_sh[start:end], weights=weights))
+        return absorbed
 
     def start_query_shard(self, query_res_sh, *, dependencies=(), weights=None):
         """Launch 64-head query projection and absorption on the auxiliary stream."""
@@ -893,7 +920,7 @@ class PreparedGlmMLA:
             return None
         rows = query_res_sh.shape[0]
         device = query_res_sh.device
-        query = torch.empty((rows, 64, 256), dtype=torch.bfloat16, device=device)
+        query = torch.empty((self.row_shard_slice, 64, 256), dtype=torch.bfloat16, device=device)
         absorbed = torch.empty((rows, 64, 512), dtype=torch.bfloat16, device=device)
         gathered = torch.empty((1,), dtype=torch.bfloat16, device=device)
         return self.query_chain.start(
@@ -931,7 +958,10 @@ class PreparedGlmMLA:
 
     def write_and_gather_context(self, cache_payload_all, metadata):
         """Write full-chunk striped DCP caches and gather global C4 pools + latent slab on main stream."""
+        from .decoder import _order_barrier
+
         global_index_cache, end = self.write_and_gather_pools(cache_payload_all, metadata)
+        _order_barrier(end, [global_index_cache])
         slab = self.gather_slab(metadata, end)
         return global_index_cache, slab
 
@@ -953,25 +983,68 @@ class PreparedGlmMLA:
         """Select top-k global positions for owned rows."""
         return self.indexer.select_shard(idx_query_sh, weight_in_sh, positions_sh, global_index_cache)
 
-    def attend_prepared_shard(self, absorbed_sh, physical, selected_lengths, positions_sh, slab, *, weights=None):
-        """Run 64-head sparse MLA, value expansion, and output projection on owned rows."""
-        rows = absorbed_sh.shape[0]
-        visible = (positions_sh + 1).clamp_min(0).to(torch.int32)
-        cache = slab.view(-1, 64, 528)
+    def _attend_prepared_slice(self, absorbed_s, physical_s, selected_lengths_s, positions_s, cache, *,
+                               weights=None, attach_o=None):
+        rows = absorbed_s.shape[0]
+        visible = (positions_s + 1).clamp_min(0).to(torch.int32)
         if (isinstance(self.value_expansion, BatchedUnquantizedProjection)
                 and self.attention.output is None and not self.attention.return_lse):
             expand_w = self.value_expansion.weight if weights is None else weights.expand.transpose(1, 2)
             expanded = self.attention.attend_and_expand(
-                absorbed_sh, physical, visible, selected_lengths, expand_w, cache=cache)
+                absorbed_s, physical_s, visible, selected_lengths_s, expand_w, cache=cache)
         else:
-            attended = self.attention(absorbed_sh, physical, visible, selected_lengths, cache=cache)
+            attended = self.attention(absorbed_s, physical_s, visible, selected_lengths_s, cache=cache)
             expand_w = None if weights is None else weights.expand
             expanded = self.value_expansion(attended.transpose(0, 1), weight=expand_w).transpose(0, 1)
+        if attach_o is not None:
+            weights = attach_o(expanded)
         o_w = None if weights is None else weights.o_proj
-        return self.projections["o_proj"](expanded.reshape(rows, -1), weight=o_w)
+        return self.projections["o_proj"](expanded.reshape(rows, -1), weight=o_w), weights
+
+    def attend_prepared_shard(self, absorbed_sh, physical, selected_lengths, positions_sh, slab, *, weights=None):
+        """Run 64-head sparse MLA, value expansion, and output projection on owned rows."""
+        rows = absorbed_sh.shape[0]
+        step = self.row_shard_slice
+        cache = slab.view(-1, 64, 528)
+        if rows == step:
+            out, _ = self._attend_prepared_slice(
+                absorbed_sh, physical, selected_lengths, positions_sh, cache, weights=weights)
+            return out
+        output = torch.empty((rows, 4096), dtype=torch.bfloat16, device=absorbed_sh.device)
+        for start in range(0, rows, step):
+            end = start + step
+            out_s, _ = self._attend_prepared_slice(
+                absorbed_sh[start:end], physical[start:end], selected_lengths[start:end],
+                positions_sh[start:end], cache, weights=weights)
+            output[start:end].copy_(out_s)
+        return output
+
+    def attend_selected_shard(self, query_res_sh, physical, selected_lengths, positions_sh, slab, *,
+                              weights=None, attach_o=None):
+        """Run 64-head sparse MLA and output projection using pre-selected top-k positions."""
+        rows = query_res_sh.shape[0]
+        step = self.row_shard_slice
+        cache = slab.view(-1, 64, 528)
+        if rows == step:
+            absorbed = self._prepare_query_slice(query_res_sh, weights=weights)
+            out, _ = self._attend_prepared_slice(
+                absorbed, physical, selected_lengths, positions_sh, cache,
+                weights=weights, attach_o=attach_o)
+            return out
+        # Fused per-slice execution avoids materializing full-shard query/absorbed/attended/expanded.
+        output = torch.empty((rows, 4096), dtype=torch.bfloat16, device=query_res_sh.device)
+        for start in range(0, rows, step):
+            end = start + step
+            absorbed_s = self._prepare_query_slice(query_res_sh[start:end], weights=weights)
+            out_s, weights = self._attend_prepared_slice(
+                absorbed_s, physical[start:end], selected_lengths[start:end],
+                positions_sh[start:end], cache, weights=weights,
+                attach_o=attach_o if start == 0 else None)
+            output[start:end].copy_(out_s)
+        return output
 
     def attend_shard(self, query_res_sh, idx_query_sh, weight_in_sh, positions_sh, global_index_cache, slab, *, weights=None):
         """Run 64-head sparse MLA and output projection directly on this rank's owned rows."""
         physical, selected_lengths = self.select_shard(idx_query_sh, weight_in_sh, positions_sh, global_index_cache)
-        absorbed = self.prepare_query_shard(query_res_sh, weights=weights)
-        return self.attend_prepared_shard(absorbed, physical, selected_lengths, positions_sh, slab, weights=weights)
+        return self.attend_selected_shard(
+            query_res_sh, physical, selected_lengths, positions_sh, slab, weights=weights)

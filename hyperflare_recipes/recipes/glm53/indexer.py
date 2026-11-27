@@ -421,8 +421,18 @@ class PreparedGlmIndexer:
             query_scales.view(-1), weights_sh.view(-1), plan=self.query_plan)
         page_table = self.global_page_table.expand(rows, -1)
         flat_cache = global_cache.view(self.global_pages, -1)
-        for selector, scratch, start in zip(self.selectors, scratches, range(0, rows, _SELECT_ROWS), strict=True):
+        shared = scratches[0] if len(scratches) == 1 else None
+        for idx, (selector, start) in enumerate(zip(self.selectors, range(0, rows, _SELECT_ROWS), strict=True)):
             end = min(rows, start + _SELECT_ROWS)
+            if shared is not None:
+                shape, dtype = selector.scratch_layout[0]
+                nbytes = 1
+                for dim in shape:
+                    nbytes *= dim
+                nbytes *= dtype.itemsize
+                scratch = shared[:nbytes].view(dtype).view(shape)
+            else:
+                scratch = scratches[idx]
             binding = dsa_indexer.bind(
                 selector.plan, scratch=scratch,
                 q_fp8=query_fp8[start:end].view(end - start, 32, 128),

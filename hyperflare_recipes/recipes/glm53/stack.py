@@ -10,7 +10,14 @@ import torch
 from b12x.comm import pcie
 from flashinfer.triton.norm import rms_norm
 
-from ignition.components.collectives import PreparedAllReduce, PreparedGatherShards, PreparedReduceScatter, _roce, row_shard_surfaces
+from ignition.components.collectives import (
+    PreparedAllReduce,
+    PreparedGatherShards,
+    PreparedReduceScatter,
+    _roce,
+    _row_shard_capacity_bytes,
+    row_shard_surfaces,
+)
 from ignition.preparation.persistent import persistent_copy
 from ignition.preparation.scratch import ScratchArena
 from hyperflare_recipes.components.embedding import PreparedEmbedding
@@ -36,6 +43,8 @@ from .weights import ModelWeights, MoEWeights
 DMA_PREFILL_TOKENS = 1024
 PIPELINED_PREFILL_TOKENS = 2048
 ROW_SHARD_ATTENTION_MIN_TOKENS = 8192
+ROW_SHARD_ATTENTION_MIN_TOKENS_PCIE = 12288
+ROW_SHARD_ATTENTION_MIN_TOKENS_ROCE_BF16 = 16384
 QUARTER_MLP_PREFILL_TOKENS = 10240
 
 
@@ -175,7 +184,7 @@ def _prefill_shard_rows(enabled, mode, shard, runtime, scratch):
     return persistent_copy(torch.arange(first, last, device=scratch.embedding.device))
 
 
-def _prefill_pipelined(enabled, mode, shard, runtime, workspace, scratch):
+def _prefill_pipelined(enabled, mode, shard, runtime, workspace, scratch, *, quarter_mlp_eligible=False):
     tokens = scratch.embedding.shape[0]
     if (not enabled or mode != "prefill" or shard.world_size not in (2, 4) or tokens < PIPELINED_PREFILL_TOKENS
             or tokens % (2 * 128 * shard.world_size) or not isinstance(runtime, pcie.DmaAllReduce)
@@ -184,8 +193,22 @@ def _prefill_pipelined(enabled, mode, shard, runtime, workspace, scratch):
         return False
     half = tokens // 2
     rows = half // shard.world_size
-    return (PreparedReduceScatter.fits(runtime, scratch.kda.output[:half], scratch.attention_output[:rows])
-            and PreparedGatherShards.fits(runtime, scratch.attention_hc.normalized[:rows], scratch.embedding[:half]))
+    if (PreparedReduceScatter.fits(runtime, scratch.kda.output[:half], scratch.attention_output[:rows])
+            and PreparedGatherShards.fits(runtime, scratch.attention_hc.normalized[:rows], scratch.embedding[:half])):
+        return True
+    if not quarter_mlp_eligible:
+        return False
+    quarter = tokens // 4
+    q_rows = quarter // shard.world_size
+    cap = _row_shard_capacity_bytes(runtime)
+    scan_bytes = shard.world_size * ROW_SHARD_SCAN_SHAPE[0] * ROW_SHARD_SCAN_SHAPE[1] * 2
+    cache_bytes = half * 768 * 2
+    return (
+        PreparedReduceScatter.fits(runtime, scratch.kda.output[:quarter], scratch.attention_output[:q_rows])
+        and PreparedGatherShards.fits(runtime, scratch.attention_hc.normalized[:q_rows], scratch.embedding[:quarter])
+        and scan_bytes <= cap
+        and cache_bytes <= cap
+    )
 
 
 def _split_recurrent_metadata(metadata: DeltaMetadata, half: int) -> tuple[DeltaMetadata, DeltaMetadata]:
@@ -265,8 +288,41 @@ class PreparedDecoder:
         self.embedding = PreparedEmbedding(language.embed_tokens.weight, metadata.token_ids, scratch.embedding,
             num_rows=metadata.recurrent.num_tokens, session=session, name=f"{name}.embedding")
 
+        has_attn_weights = (
+            weights.layers[0].attention is not None
+            and isinstance(weights.layers[0].attention, dict)
+            and "input_proj" in weights.layers[0].attention
+        )
+        if _roce(runtime):
+            # BF16 attention weights are 2x larger per layer than quantized FP8 weights, so on RoCE
+            # enable row-sharded attention at 16K for BF16 checkpoints and 8K for quantized attention.
+            first_inp = weights.layers[0].attention.get("input_proj") if has_attn_weights else None
+            attn_min_tokens = (
+                ROW_SHARD_ATTENTION_MIN_TOKENS_ROCE_BF16
+                if isinstance(first_inp, torch.Tensor)
+                else ROW_SHARD_ATTENTION_MIN_TOKENS
+            )
+        else:
+            attn_min_tokens = ROW_SHARD_ATTENTION_MIN_TOKENS_PCIE
+        attn_eligible = (
+            row_shard_attention
+            and has_attn_weights
+            and self.tokens >= attn_min_tokens
+        )
+        quarter_mlp_eligible = (
+            attn_eligible
+            and context is not None and context.records is not None
+            and any(m.block_type == "indexed_attention" for m in language.layers)
+            and any(m.block_type == "linear_attention" for m in language.layers)
+            and self.tokens >= QUARTER_MLP_PREFILL_TOKENS
+            and self.tokens % (4 * 128 * weights.shard.world_size) == 0
+            and scoring is None and self.sample_rows == 1
+            and boundary_runtime is not None
+            and (not self.full_feedback or sharded_feedback)
+        )
         self.pipelined = _prefill_pipelined(
-            row_shard_prefill and scoring is None, mode, weights.shard, runtime, workspace, scratch)
+            row_shard_prefill and scoring is None, mode, weights.shard, runtime, workspace, scratch,
+            quarter_mlp_eligible=quarter_mlp_eligible)
         self.half_tokens = self.tokens // 2 if self.pipelined else 0
         self.shard_rows = self.shard_rows_a = self.shard_rows_b = None
         self.final_gather = self.final_gather_a = self.final_gather_b = None
@@ -282,17 +338,6 @@ class PreparedDecoder:
         self.mlp_quarters = False
         gathered_mlp = None
         final_norm_source = None
-
-        has_attn_weights = (
-            weights.layers[0].attention is not None
-            and isinstance(weights.layers[0].attention, dict)
-            and "input_proj" in weights.layers[0].attention
-        )
-        attn_eligible = (
-            row_shard_attention
-            and has_attn_weights
-            and self.tokens >= ROW_SHARD_ATTENTION_MIN_TOKENS
-        )
         self.weight_gather = None
         if self.pipelined:
             half = self.half_tokens
@@ -453,7 +498,7 @@ class PreparedDecoder:
             self.layers.append(layer)
             if progress is not None:
                 progress(f"declared {mode} layer {index + 1}/45")
-        if self.weight_gather is not None and self.pipelined:
+        if self.weight_gather is not None and (self.pipelined or self.weight_gather.async_roce):
             from .decoder import _collect_plans
 
             for layer in self.layers:
@@ -522,15 +567,54 @@ class PreparedDecoder:
             if metadata.indexed is not None:
                 pos_sh = torch.index_select(metadata.indexed.positions, 0, self.shard_rows)
         value, carry = embedded[:, None, :].expand(-1, 4, -1).contiguous(), None
+        use_channel_order = self.weight_gather is not None
+        channel_token = torch.empty(1, dtype=torch.int32, device=self.device) if use_channel_order else None
+        if channel_token is not None:
+            from .decoder import _order_barrier
+
+            _order_barrier(channel_token, [embedded])
+        use_async_roce = self.weight_gather is not None and self.weight_gather.async_roce
+        pending_roce_w = None
+        cur_roce_w = (
+            self.weight_gather.gather_sync(0, channel_token=channel_token)
+            if use_async_roce and (getattr(self.layers[0], "row_shard_kda", False) or getattr(self.layers[0], "row_shard_mla", False))
+            else None
+        )
+        n_layers = len(self.layers)
         for index, layer in enumerate(self.layers):
             layer_records = None if records is None or index not in records.layers else records.layer(index)
             indexed = layer.module.block_type == "indexed_attention"
             attention_metadata = metadata.indexed if indexed else metadata.recurrent
-            attn_w = (self.weight_gather.gather_sync(index)
-                      if self.weight_gather is not None and (getattr(layer, "row_shard_kda", False) or getattr(layer, "row_shard_mla", False))
-                      else None)
-            value, carry = layer(value, attention_metadata, carry, records=layer_records,
-                                 pos_sh=pos_sh if indexed else None, attn_weights=attn_w)
+            layer_needs_w = getattr(layer, "row_shard_kda", False) or getattr(layer, "row_shard_mla", False)
+            if use_async_roce:
+                if pending_roce_w is not None:
+                    cur_roce_w = self.weight_gather.finish_input(pending_roce_w, dependencies=(value,))
+                    pending_roce_w = None
+                attn_w = cur_roce_w if layer_needs_w else None
+                next_idx = (
+                    index + 1
+                    if (index + 1 < n_layers
+                        and (getattr(self.layers[index + 1], "row_shard_kda", False) or getattr(self.layers[index + 1], "row_shard_mla", False)))
+                    else None
+                )
+                res = layer(value, attention_metadata, carry, records=layer_records,
+                            pos_sh=pos_sh if indexed else None, attn_weights=attn_w,
+                            weight_gather=self.weight_gather, layer_index=index,
+                            next_layer_index=next_idx, channel_token=channel_token)
+                if len(res) == 3:
+                    value, carry, pending_roce_w = res
+                else:
+                    value, carry = res
+            else:
+                attn_w = (self.weight_gather.gather_sync(index, channel_token=channel_token)
+                          if self.weight_gather is not None and layer_needs_w else None)
+                value, carry = layer(value, attention_metadata, carry, records=layer_records,
+                                     pos_sh=pos_sh if indexed else None, attn_weights=attn_w,
+                                     channel_token=channel_token)
+        if channel_token is not None:
+            from .decoder import _order_barrier
+
+            _order_barrier(value, [channel_token])
         if self.sharded_final_norm:
             return self._finish_sharded_final_norm(language, value, metadata, records)
         auxiliary = None
@@ -552,6 +636,10 @@ class PreparedDecoder:
         if self.scoring is not None:
             self.scoring(auxiliary)
         logits = self.lm_head(hidden)
+        if self.full_feedback and self.scoring is None:
+            from .decoder import _order_barrier
+
+            _order_barrier(auxiliary, [logits])
         return hidden, logits, auxiliary, records
 
     def _call_pipelined(self, language, embedded, metadata, *, records=None):
@@ -572,10 +660,14 @@ class PreparedDecoder:
         if metadata.indexed is not None:
             pos_a = torch.index_select(metadata.indexed.positions, 0, self.shard_rows_a)
             pos_b = torch.index_select(metadata.indexed.positions, 0, self.shard_rows_b)
+        from .decoder import _order_barrier
+
+        channel_token = torch.empty(1, dtype=torch.int32, device=self.device)
+        _order_barrier(channel_token, [embedded])
         pending_mlp_b = None
         pending_weights = None
         cur_weights = (
-            self.weight_gather.gather_sync(0)
+            self.weight_gather.gather_sync(0, channel_token=channel_token)
             if self.weight_gather is not None and (getattr(self.layers[0], "row_shard_kda", False) or getattr(self.layers[0], "row_shard_mla", False))
             else None
         )
@@ -583,8 +675,10 @@ class PreparedDecoder:
         for index, layer in enumerate(self.layers):
             layer_records = None if records is None or index not in records.layers else records.layer(index)
             indexed = layer.module.block_type == "indexed_attention"
+            cur_pending_o = None
             if pending_weights is not None:
-                cur_weights = self.weight_gather.finish(pending_weights, dependencies=(incoming[0],))
+                cur_weights = self.weight_gather.finish_input(pending_weights, dependencies=(incoming[0],))
+                cur_pending_o = pending_weights
                 pending_weights = None
             next_idx = (
                 index + 1
@@ -602,13 +696,18 @@ class PreparedDecoder:
                 pending_mlp_b=pending_mlp_b,
                 records=layer_records,
                 attn_weights=cur_weights if (getattr(layer, "row_shard_kda", False) or getattr(layer, "row_shard_mla", False)) else None,
-                weight_gather=self.weight_gather if next_idx is not None else None,
+                weight_gather=self.weight_gather,
                 next_layer_index=next_idx,
+                pending_cur_o=cur_pending_o,
+                channel_token=channel_token,
             )
             if len(result) == 3:
                 incoming, pending_mlp_b, pending_weights = result
             else:
                 incoming, pending_mlp_b = result
+        from .decoder import _order_barrier
+
+        _order_barrier(incoming[0], [channel_token])
         if self.sharded_final_norm:
             return self._finish_sharded_final_norm(language, torch.cat(incoming, dim=0), metadata, records)
         if self.mlp_quarters:
@@ -640,6 +739,8 @@ class PreparedDecoder:
         if self.scoring is not None:
             self.scoring(auxiliary)
         logits = self.lm_head(hidden)
+        if self.full_feedback and self.scoring is None:
+            _order_barrier(auxiliary, [logits])
         return hidden, logits, auxiliary, records
 
     def _finish_sharded_final_norm(self, language, out_sh, metadata, records):
@@ -661,6 +762,10 @@ class PreparedDecoder:
         reduced = self.final_boundary_reduce(boundary)
         rank_tails = reduced[:world]
         hidden = reduced[world:world + 1]
-        auxiliary = (norm_sh, rank_tails) if self.full_feedback else None
         logits = self.lm_head(hidden)
+        if self.full_feedback:
+            from .decoder import _order_barrier
+
+            _order_barrier(norm_sh, [logits])
+        auxiliary = (norm_sh, rank_tails) if self.full_feedback else None
         return hidden, logits, auxiliary, records

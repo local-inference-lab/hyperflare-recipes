@@ -503,6 +503,10 @@ class PreparedGlmKDA:
         pool = torch.empty((6, 64, 128, 128), dtype=torch.float32, device=device)
         pool[0].zero_()
         pool[1].copy_(self.segment_eye)
+        # Pre-initialize transfer (slot 2 = I) and local state (slot 3 = 0) so ranks with
+        # live_r == 0 (tail ranks on shorter prompts) contribute an exact identity transform.
+        pool[2].copy_(self.segment_eye)
+        pool[3].zero_()
         rec_out = torch.empty((self.seg_tokens, 64, 128), dtype=torch.bfloat16, device=device)
         ns_one = torch.ones_like(live_r)
         zero_ckpt_idx = torch.zeros_like(metadata.checkpoint_state_indices[:1])
@@ -514,6 +518,9 @@ class PreparedGlmKDA:
             checkpoint_offsets=zero_ckpt_off, num_seqs=ns_one, num_tokens=live_r,
             scratch=seg_scratch, pool=pool, output=rec_out, lower_bound=-5.0, eps=1e-6,
         )
+        # segment_finalize only reads v (q/k are already prepared inside seg_scratch);
+        # copy v out so the 3x-larger convolved [seg_tokens, 24576] buffer frees immediately.
+        v_only = v.contiguous()
 
         # Per-row FP8 A_r + per-row INT16 B_r + post-conv state = 3.20 MiB/rank (12.81 MiB gathered).
         A_raw = pool[2]
@@ -528,7 +535,7 @@ class PreparedGlmKDA:
 
         conv_packed = local_conv[0].reshape(64, 1152)
         scan_sh = torch.cat((a_q, a_sc_p, b_q, b_sc_p, conv_packed), dim=-1).contiguous()
-        summary = (q, k, v, raw_g_h, raw_beta, qsl_r, ns_one, live_r,
+        summary = (v_only, v_only, v_only, raw_g_h, raw_beta, qsl_r, ns_one, live_r,
                    zero_ckpt_idx, zero_ckpt_off, seg_scratch, pool, rec_out)
         return summary, scan_sh
 
