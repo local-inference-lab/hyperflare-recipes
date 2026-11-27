@@ -395,7 +395,7 @@ wheels = [
 [[package]]
 name = "flare-heliopause"
 version = "0.1.0"
-source = { git = "https://github.com/NVIDIA/hyperflare-inference.git?subdirectory=heliopause&branch=main#425ab2d4696caee841b1fc8165ff8d806a5af7e9" }
+source = { git = "https://github.com/NVIDIA/hyperflare-inference.git?subdirectory=heliopause&branch=main#966df82e62325ac75163f0edbbfe98e99a1cc6a1" }
 
 [[package]]
 name = "flashinfer-python"
@@ -555,7 +555,7 @@ wheels = [
 [[package]]
 name = "ignition"
 version = "0.1.0"
-source = { git = "https://github.com/NVIDIA/hyperflare-inference.git?branch=main#425ab2d4696caee841b1fc8165ff8d806a5af7e9" }
+source = { git = "https://github.com/NVIDIA/hyperflare-inference.git?branch=main#966df82e62325ac75163f0edbbfe98e99a1cc6a1" }
 
 [package.optional-dependencies]
 prepare = [
