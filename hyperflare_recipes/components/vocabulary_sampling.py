@@ -95,7 +95,9 @@ def _score_tiles(
     if MARKOV:
         predecessor = tl.load(Pending + request_row) if STEP == 0 else tl.load(Drafts + request_row * DRAFTS + STEP - 1)
         predecessor = tl.minimum(tl.maximum(predecessor, 0), VOCAB - 1)
-        value += _transition_bias(Embedding, Head, HeadScale, predecessor, local_id, present, RANK, 64, BLOCK, FP8)
+        value += _transition_bias(
+            Embedding, Embedding, Head, HeadScale, predecessor, local_id, present, RANK, 64, BLOCK, FP8, False
+        )
     slot = tl.minimum(tl.maximum(tl.load(Slots + request_row).to(tl.int64), 0), CAPACITY - 1)
     temperature = tl.load(Params + slot * 6)
     repeat = tl.load(Params + slot * 6 + 3)
