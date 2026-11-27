@@ -19,7 +19,12 @@ from hyperflare_recipes.components.expert_overlap import ConcurrentSharedExpert
 from hyperflare_recipes.components.ring_commit import PreparedRingCommit
 from hyperflare_recipes.components.linear import UnquantizedProjection
 from hyperflare_recipes.components.mhc import MHCWeights, MHCScratch, PreparedMHC, PreparedMHCPost
-from hyperflare_recipes.components.mhc_overlap import SplitLaggedMHC
+from hyperflare_recipes.components.mhc_overlap import (
+    PreparedFusedMhcAllReducePostYNorm,
+    SplitLaggedMHC,
+    link_fused_mhc_layers as _link_fused_mhc_layers,
+    pack_mxfp8_scale_mma,
+)
 from hyperflare_recipes.components.mlp import MLPScratch, PreparedMLP
 from hyperflare_recipes.components.moe import RouteRecord, RouterScratch, PreparedRouter, PreparedRoutedExperts
 from hyperflare_recipes.components.vocabulary import PreparedVocabularyProjection
@@ -130,17 +135,6 @@ def _mhc_weights(weights, kind, norm):
     residual = weights.residual
     return MHCWeights(residual[f"hc_{kind}_fn"], residual[f"hc_{kind}_scale"],
                       residual[f"hc_{kind}_base"], residual[norm + ".weight"])
-
-
-def _mxfp8_scale_mma(scale_rows_2d: torch.Tensor, hidden: int) -> torch.Tensor:
-    """Swizzle contiguous [rows, hidden // 32] UE8M0 scale rows into b12x MMA tile layout."""
-    m_tiles, k_tiles = scale_rows_2d.shape[0] // 128, hidden // 128
-    return (
-        scale_rows_2d.view(m_tiles, 4, 32, k_tiles, 4)
-        .permute(0, 3, 2, 1, 4)
-        .contiguous()
-        .view(1, m_tiles, k_tiles, 32, 4, 4)
-    )
 
 
 class PreparedDecoderBoundary:
@@ -454,6 +448,10 @@ class PreparedLayer:
             and supports_split_lagged(
                 source.device, tokens, source.shape[-1], weights.residual["ffn_norm.weight"].dtype)
         )
+        self.attn_fused_mhc = None
+        self.ffn_fused_mhc = None
+        self.defer_mlp_reduce = False
+        self.fused_mhc_runtime = None
         if self.row_shard_dma:
             st = self.shard_tokens
             attn_incoming = ((s.mlp_output[:st], s.ffn_hc.residual[:st], s.ffn_hc.post[:st], s.ffn_hc.comb[:st])
@@ -474,6 +472,15 @@ class PreparedLayer:
             self.attention_hc = SplitLaggedMHC(
                 incoming, _mhc_weights(weights, "attn", "attn_norm"),
                 session=session, workspace=workspace, **options)
+            if carry and PreparedFusedMhcAllReducePostYNorm.fits(
+                runtime, tokens, source.shape[-1], weights.residual["attn_norm.weight"].dtype,
+                device=source.device,
+            ):
+                self.attn_fused_mhc = PreparedFusedMhcAllReducePostYNorm(
+                    incoming, _mhc_weights(weights, "attn", "attn_norm"),
+                    runtime=runtime, session=session, norm_eps=text["rms_norm_eps"],
+                    has_addend=True, release_dependents=True,
+                )
         else:
             incoming = ((s.mlp_output, s.ffn_hc.residual, s.ffn_hc.post, s.ffn_hc.comb) if carry else (source,))
             self.attention_hc = None if boundary is not None else PreparedMHC(
@@ -816,8 +823,18 @@ class PreparedLayer:
         else:
             self.att_reduce_0 = self.att_reduce_1 = self.mlp_reduce_0 = self.mlp_reduce_1 = None
             self.cr_att_0 = self.cr_att_1 = self.cr_mlp_0 = self.cr_mlp_1 = None
-            self.attention_reduce = PreparedAllReduce(s.attention.output, s.attention_output, runtime=runtime,
-                coordinator=coordinator, session=session, name=name + ".attention_reduce")
+            use_ffn_fused_mhc = (
+                self.split_mhc
+                and PreparedFusedMhcAllReducePostYNorm.fits(
+                    runtime, tokens, source.shape[-1], weights.residual["ffn_norm.weight"].dtype,
+                    device=source.device,
+                )
+            )
+            self.attention_reduce = (
+                None if use_ffn_fused_mhc
+                else PreparedAllReduce(s.attention.output, s.attention_output, runtime=runtime,
+                    coordinator=coordinator, session=session, name=name + ".attention_reduce")
+            )
             self.router_projection = UnquantizedProjection(s.ffn_hc.normalized, weights.experts.router, s.router_logits,
                 session=session, name=name + ".router")
             self.router = PreparedRouter(s.router_logits, s.router, session=session, name=name + ".topk",
@@ -829,10 +846,23 @@ class PreparedLayer:
                 s.router.weights, s.routed, session=session, name=name + ".experts", workspace=workspace,
                 router_plan=self.router.plan)
             if self.split_mhc:
+                ffn_weights = _mhc_weights(weights, "ffn", "ffn_norm")
                 self.ffn_hc = SplitLaggedMHC(
                     (s.attention_output, s.attention_hc.residual, s.attention_hc.post, s.attention_hc.comb),
-                    _mhc_weights(weights, "ffn", "ffn_norm"),
-                    session=session, workspace=workspace, experts=self.experts, **options)
+                    ffn_weights,
+                    session=session, workspace=workspace,
+                    experts=None if use_ffn_fused_mhc else self.experts,
+                    compile_post_y=not use_ffn_fused_mhc,
+                    **options)
+                if use_ffn_fused_mhc:
+                    self.ffn_fused_mhc = PreparedFusedMhcAllReducePostYNorm(
+                        (s.attention.output, s.attention_hc.residual, s.attention_hc.post, s.attention_hc.comb),
+                        ffn_weights,
+                        runtime=runtime, session=session, norm_eps=text["rms_norm_eps"],
+                        has_addend=False, release_dependents=True, experts=self.experts,
+                    )
+                    self.attention_reduce = self.ffn_fused_mhc
+                    self.fused_mhc_runtime = runtime
             else:
                 self.ffn_hc = PreparedMHC((s.attention_output, s.attention_hc.residual, s.attention_hc.post, s.attention_hc.comb),
                     _mhc_weights(weights, "ffn", "ffn_norm"), s.ffn_hc, session=session, name=name + ".ffn_hc", workspace=workspace,
@@ -853,6 +883,8 @@ class PreparedLayer:
 
         if self.attention_hc is not None:
             self.attention_hc.functional()
+        if self.attn_fused_mhc is not None:
+            self.attn_fused_mhc.functional(session=session)
         if self.row_shard_dma:
             if self.row_shard_attention:
                 if self.p2p_kv_gather:
@@ -926,7 +958,7 @@ class PreparedLayer:
         hidden = full_vals.shape[1]
         full_srows_2d = packed_full[:, self.attn_vals_bf16_cols:].contiguous().view(torch.uint8)
         full_srows = full_srows_2d.view(1, full_rows, hidden // 32)
-        full_smma = _mxfp8_scale_mma(full_srows_2d, hidden)
+        full_smma = pack_mxfp8_scale_mma(full_srows_2d, hidden)
         return full_vals, (full_vals, full_srows, full_smma)
 
     def _prepare_ffn_shard(self, normalized, mask, num_valid_tokens):
@@ -962,7 +994,7 @@ class PreparedLayer:
             hidden = full_vals.shape[1]
             full_srows_2d = meta_full[:, :self.ffn_meta_scale_cols].contiguous().view(torch.uint8)
             full_srows = full_srows_2d.view(1, full_rows, hidden // 32)
-            full_smma = _mxfp8_scale_mma(full_srows_2d, hidden)
+            full_smma = pack_mxfp8_scale_mma(full_srows_2d, hidden)
             ffn_encoded_bases = (full_vals, full_srows, full_smma)
             route_words = meta_full[:, self.ffn_meta_scale_cols:].contiguous().view(torch.int32)
             top_k = route_words.shape[1] // 2
@@ -972,6 +1004,8 @@ class PreparedLayer:
             routed = self.experts(full_vals, route_ids, route_weights,
                                   a_scales=full_srows, router_logits=None,
                                   selected_logits=None, image_mask=None)
+            if getattr(self.shared, "supports_residual", False):
+                return self.shared(full_vals, encoded_bases=ffn_encoded_bases, residual=routed), route_ids
             shared = self.shared(full_vals, encoded_bases=ffn_encoded_bases)
             return routed + shared, route_ids
         route_words = meta_full.contiguous().view(torch.int32)
@@ -981,6 +1015,8 @@ class PreparedLayer:
         RouteRecord(route_words).read(route_ids, route_weights)
         routed = self.experts(vals_full_bf16, route_ids, route_weights,
                               router_logits=None, selected_logits=None, image_mask=None)
+        if getattr(self.shared, "supports_residual", False):
+            return self.shared(vals_full_bf16, residual=routed), route_ids
         shared = self.shared(vals_full_bf16)
         return routed + shared, route_ids
 
@@ -1417,6 +1453,7 @@ class PreparedLayer:
                 self.attention.commit(metadata.lengths, records, metadata)
             att_a = self.cr_att_0.finish(p_att_a, out_b)
         else:
+            pending_attn_hc = None
             if pipelined_attn_hc:
                 mlp_a, prev_res_a, prev_post_a, prev_comb_a, p_mlp_b, prev_res_b, prev_post_b, prev_comb_b = incoming
                 pre_mix_a, pre_mix_b = pre_mix
@@ -1431,7 +1468,16 @@ class PreparedLayer:
                 residual = post = comb = attn_mix = None
             elif boundary is None:
                 if getattr(self, "split_mhc", False):
-                    residual, normalized, _, _ = self.attention_hc.post_y_norm(*incoming, pre_mix=pre_mix)
+                    if len(incoming) == 5 and getattr(self, "attn_fused_mhc", None) is not None:
+                        prev_routed, prev_shared, prev_res, prev_post, prev_comb = incoming
+                        residual, normalized, _, _ = self.attn_fused_mhc(
+                            prev_routed, prev_res, prev_post, prev_comb,
+                            pre_mix=pre_mix, input_addend=prev_shared,
+                        )
+                    else:
+                        residual, normalized, _, _ = self.attention_hc.post_y_norm(*incoming, pre_mix=pre_mix)
+                    if getattr(self, "ffn_fused_mhc", None) is not None:
+                        pending_attn_hc = self.attention_hc.start_sinkhorn(residual, normalized)
                     post = comb = attn_mix = None
                 else:
                     attn_mix = torch.empty_like(pre_mix)
@@ -1479,8 +1525,11 @@ class PreparedLayer:
             route_a = self.router(logits_a, image_mask=mask_a)
             routed_a = self.experts(norm_a, route_a.ids, route_a.weights, router_logits=logits_a,
                 selected_logits=route_a.selected_logits, image_mask=mask_a)
-            shared_a = self.shared(norm_a)
-            partial_a = routed_a + shared_a
+            if getattr(self.shared, "supports_residual", False):
+                partial_a = self.shared(norm_a, residual=routed_a)
+            else:
+                shared_a = self.shared(norm_a)
+                partial_a = routed_a + shared_a
             att_b = self.cr_att_1.finish(p_att_b, partial_a)
 
             p_mlp_a = self.cr_mlp_0.start(partial_a, dependencies=(att_b,))
@@ -1492,8 +1541,11 @@ class PreparedLayer:
             route_b = self.router(logits_b, image_mask=mask_b)
             routed_b = self.experts(norm_b, route_b.ids, route_b.weights, router_logits=logits_b,
                 selected_logits=route_b.selected_logits, image_mask=mask_b)
-            shared_b = self.shared(norm_b)
-            partial_b = routed_b + shared_b
+            if getattr(self.shared, "supports_residual", False):
+                partial_b = self.shared(norm_b, residual=routed_b)
+            else:
+                shared_b = self.shared(norm_b)
+                partial_b = routed_b + shared_b
             mlp_a = self.cr_mlp_0.finish(p_mlp_a, partial_b)
 
             p_mlp_b = self.cr_mlp_1.start(partial_b, dependencies=(mlp_a,))
@@ -1523,12 +1575,24 @@ class PreparedLayer:
             return incoming, next_mix, records, selection
 
         if getattr(self, "split_mhc", False):
-            pending_attn_hc = self.attention_hc.start_sinkhorn(residual, attended)
-            att_deps = (*att_reduce_deps, pending_attn_hc.pre_out)
-            attention_output = self.attention_reduce(attended, dependencies=att_deps)
-            post, comb, attn_mix = self.attention_hc.finish_sinkhorn(pending_attn_hc, attention_output)
-            residual, normalized, prequant_v, prequant_s = self.ffn_hc.post_y_norm(
-                attention_output, residual, post, comb, pre_mix=attn_mix)
+            if getattr(self, "ffn_fused_mhc", None) is not None:
+                if pending_attn_hc is None:
+                    pending_attn_hc = self.attention_hc.start_sinkhorn(residual, attended)
+                post, comb, attn_mix = self.attention_hc.finish_sinkhorn(pending_attn_hc, attended)
+                residual, normalized, prequant_v, prequant_s = self.ffn_fused_mhc(
+                    attended, residual, post, comb, pre_mix=attn_mix, dependencies=att_reduce_deps)
+                pending_ffn_hc = (
+                    self.ffn_hc.start_sinkhorn(residual, normalized)
+                    if getattr(self, "defer_mlp_reduce", False) else None
+                )
+            else:
+                pending_attn_hc = self.attention_hc.start_sinkhorn(residual, attended)
+                att_deps = (*att_reduce_deps, pending_attn_hc.pre_out)
+                attention_output = self.attention_reduce(attended, dependencies=att_deps)
+                post, comb, attn_mix = self.attention_hc.finish_sinkhorn(pending_attn_hc, attention_output)
+                residual, normalized, prequant_v, prequant_s = self.ffn_hc.post_y_norm(
+                    attention_output, residual, post, comb, pre_mix=attn_mix)
+                pending_ffn_hc = None
             pending = None if self.concurrent_shared is None else self.concurrent_shared.start(normalized)
             router_logits = self.router_projection(normalized)
             route = self.router(router_logits, image_mask=image_mask)
@@ -1537,13 +1601,17 @@ class PreparedLayer:
                                   prequant_a_values=prequant_v, prequant_a_scales=prequant_s)
             shared = (self.shared(normalized) if self.concurrent_shared is None
                       else self.concurrent_shared.finish(pending, routed))
-            pending_ffn_hc = self.ffn_hc.start_sinkhorn(residual, shared, routed)
-            output = (self.mlp_reduce(routed, addend=shared, dependencies=(pending_ffn_hc.pre_out,))
-                      if getattr(self.mlp_reduce, "fused_addend", False)
-                      else self.mlp_reduce(routed + shared, dependencies=(pending_ffn_hc.pre_out,)))
-            post, comb, next_mix = self.ffn_hc.finish_sinkhorn(pending_ffn_hc, output)
-            incoming = ((self.post(output, residual, post, comb),) if self.post is not None
-                        else (output, residual, post, comb))
+            if pending_ffn_hc is not None:
+                post, comb, next_mix = self.ffn_hc.finish_sinkhorn(pending_ffn_hc, shared)
+                incoming = (routed, shared, residual, post, comb)
+            else:
+                pending_ffn_hc = self.ffn_hc.start_sinkhorn(residual, shared, routed)
+                output = (self.mlp_reduce(routed, addend=shared, dependencies=(pending_ffn_hc.pre_out,))
+                          if getattr(self.mlp_reduce, "fused_addend", False)
+                          else self.mlp_reduce(routed + shared, dependencies=(pending_ffn_hc.pre_out,)))
+                post, comb, next_mix = self.ffn_hc.finish_sinkhorn(pending_ffn_hc, output)
+                incoming = ((self.post(output, residual, post, comb),) if self.post is not None
+                            else (output, residual, post, comb))
             return incoming, next_mix, records, selection
 
         attention_output = (self.attention_reduce(attended, dependencies=att_reduce_deps)
@@ -1556,10 +1624,15 @@ class PreparedLayer:
         route = self.router(router_logits, image_mask=image_mask)
         routed = self.experts(normalized, route.ids, route.weights, router_logits=router_logits,
                               selected_logits=route.selected_logits, image_mask=image_mask)
-        shared = (self.shared(normalized) if self.concurrent_shared is None
-                  else self.concurrent_shared.finish(pending, routed))
-        output = (self.mlp_reduce(routed, addend=shared)
-                  if getattr(self.mlp_reduce, "fused_addend", False) else self.mlp_reduce(routed + shared))
+        if (self.concurrent_shared is None
+                and not getattr(self.mlp_reduce, "fused_addend", False)
+                and getattr(self.shared, "supports_residual", False)):
+            output = self.mlp_reduce(self.shared(normalized, residual=routed))
+        else:
+            shared = (self.shared(normalized) if self.concurrent_shared is None
+                      else self.concurrent_shared.finish(pending, routed))
+            output = (self.mlp_reduce(routed, addend=shared)
+                      if getattr(self.mlp_reduce, "fused_addend", False) else self.mlp_reduce(routed + shared))
         incoming = ((self.post(output, residual, post, comb),) if self.post is not None
                     else (output, residual, post, comb))
         return incoming, next_mix, records, selection
@@ -1901,6 +1974,7 @@ class PreparedDecoder:
             self.layers.append(prepared_layer)
             carry = defer
             prev_defer_mlp_b = defer_mlp_b
+        _link_fused_mhc_layers(self.layers)
         self.encoder_boundary = None
         if self.encoder_only:
             self.encoder_boundary = PreparedDecoderBoundary(

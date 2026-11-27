@@ -9,6 +9,10 @@ import torch
 from b12x.norm import hyperconnection
 from b12x.preparation import PreparedCall
 
+from hyperflare_recipes.components.dense_epilogues import (
+    PreparedFusedSwiGLUDown,
+    supports_fused_swiglu_down,
+)
 from hyperflare_recipes.components.linear import QuantizedProjection, UnquantizedProjection
 from hyperflare_recipes.components.weights import MLPWeights
 from ignition.preparation.tuning import declare
@@ -74,19 +78,38 @@ class PreparedMLP:
                                        activation_mode=activation_mode, bias=bias, encoded=preencoded)
 
         self.up_projection = projection(source, weights.gate_up, gate_up, "gate_up", gate_up_bias, preencoded=encoded)
-        self.down_projection = projection(intermediate, weights.down, output, "down", down_bias)
-        self.activation_plan = hyperconnection.plan(
-            hyperconnection.Caps(device=source.device, max_tokens=tokens, hidden_size=width),
-            invocation={"operation": "swiglu", "limit": swiglu_limit, "round_silu": round_silu,
-                        "clamp_after_silu": clamp_after_silu,
-                        "swiglu_alpha": swiglu_alpha, "swiglu_beta": swiglu_beta},
-        )
-        declare(session, (self.activation_plan.request(
-            name=f"{name}.swiglu", prepare_call=lambda state: PreparedCall(
-                run=lambda: state.launch(gate_up, gate_up, intermediate),
-            ),
-        ),))
+        if supports_fused_swiglu_down(
+            intermediate, weights.down, output,
+            activation_mode=activation_mode, down_bias=down_bias, session=session,
+        ):
+            self.fused_swiglu_down = PreparedFusedSwiGLUDown(
+                gate_up, weights.down, output, session=session, name=f"{name}.down",
+                workspace=workspace,
+                limit=swiglu_limit, round_silu=round_silu,
+                clamp_after_silu=clamp_after_silu,
+                swiglu_alpha=swiglu_alpha, swiglu_beta=swiglu_beta,
+            )
+            self.down_projection = self.fused_swiglu_down
+            self.activation_plan = None
+        else:
+            self.fused_swiglu_down = None
+            self.down_projection = projection(intermediate, weights.down, output, "down", down_bias)
+            self.activation_plan = hyperconnection.plan(
+                hyperconnection.Caps(device=source.device, max_tokens=tokens, hidden_size=width),
+                invocation={"operation": "swiglu", "limit": swiglu_limit, "round_silu": round_silu,
+                            "clamp_after_silu": clamp_after_silu,
+                            "swiglu_alpha": swiglu_alpha, "swiglu_beta": swiglu_beta},
+            )
+            declare(session, (self.activation_plan.request(
+                name=f"{name}.swiglu", prepare_call=lambda state: PreparedCall(
+                    run=lambda: state.launch(gate_up, gate_up, intermediate),
+                ),
+            ),))
         self._functional_layout = None
+
+    @property
+    def supports_residual(self) -> bool:
+        return self.fused_swiglu_down is not None and self.fused_swiglu_down.supports_residual
 
     def functional(self, *, session):
         """Run the prepared MLP with compiler-local projection and activation outputs."""
@@ -101,8 +124,14 @@ class PreparedMLP:
             self.gate_up = self.intermediate = self.output = None
         return self
 
-    def __call__(self, source, *, encoded_bases=None):
+    def __call__(self, source, *, encoded_bases=None, residual=None):
         up_kwargs = {} if encoded_bases is None else {"encoded_bases": encoded_bases}
+        if self.fused_swiglu_down is not None:
+            if self._functional_layout is not None:
+                gate_up = self.up_projection(source, **up_kwargs)
+                return self.fused_swiglu_down(gate_up, residual=residual)
+            self.up_projection(source, **up_kwargs)
+            return self.fused_swiglu_down(self.gate_up, residual=residual)
         if self._functional_layout is not None:
             _, _, _, intermediate_shape, intermediate_stride, intermediate_dtype, _, _, _ = self._functional_layout
             gate_up = self.up_projection(source, **up_kwargs)
@@ -111,12 +140,14 @@ class PreparedMLP:
             hyperconnection.run_swiglu(gate_up, limit=self.swiglu_limit,
                                       round_silu=self.round_silu, out=intermediate,
                                       plan=self.activation_plan)
-            return self.down_projection(intermediate)
+            result = self.down_projection(intermediate)
+            return result if residual is None else result + residual
         self.up_projection(source, **up_kwargs)
         hyperconnection.run_swiglu(self.gate_up, limit=self.swiglu_limit,
                                   round_silu=self.round_silu, out=self.intermediate,
                                   plan=self.activation_plan)
-        return self.down_projection(self.intermediate)
+        result = self.down_projection(self.intermediate)
+        return result if residual is None else result + residual
 
 
 class PreparedUngatedMLP:

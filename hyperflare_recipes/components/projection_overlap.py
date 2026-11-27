@@ -6,6 +6,11 @@
 
 import torch
 
+from hyperflare_recipes.components.dense_epilogues import (
+    register_dense_gemm_rope,
+    run_encoded_dense_rope,
+    run_quantized_dense_rope,
+)
 from hyperflare_recipes.components.linear import QuantizedProjection, UnquantizedProjection
 from hyperflare_recipes.components.rotary import _rotate_grouped
 from ignition.preparation.scratch import ScratchArena
@@ -70,6 +75,11 @@ def _run_mxfp8_with_rope(source, values, scales, gain, activation_scale, scale_k
         stream_handle = stream.cuda_stream if hasattr(stream, "cuda_stream") else stream
         runner(source, values, scales, output, angles,
                workspace if workspace.numel() > 0 else None, tc_flags, stream_handle)
+        return
+    if run_quantized_dense_rope(
+        source, values, scales, output, workspace, plan_handle,
+        angles, head_dim, rope_dim, rope_split=True, stream=stream,
+    ):
         return
     from hyperflare_recipes.components.sm103_projection import packed_out_workspace
 
@@ -364,7 +374,12 @@ class ConcurrentProjectionChain:
 
 
 def _run_encoded_with_rope(values_base, mma_base, weight_values, weight_mma_base,
-                           output, workspace, dense_handle, angles, head_dim, rope_dim):
+                           output, workspace, dense_handle, angles, head_dim, rope_dim, *, stream=None):
+    if run_encoded_dense_rope(
+        values_base, mma_base, weight_values, weight_mma_base, output,
+        dense_handle, angles, head_dim, rope_dim, rope_split=True, stream=stream,
+    ):
+        return
     from b12x import gemm
     from b12x.preparation.types import plan_from_handle
 
@@ -407,7 +422,7 @@ def _start_attn_preencoded_rope(query_low: torch.Tensor, q_w: torch.Tensor, q_s:
     auxiliary.wait_stream(torch.cuda.current_stream(query_low.device))
     with torch.cuda.stream(auxiliary):
         _run_encoded_with_rope(values_base, mma_base, q_w, q_s, q_out, workspace,
-                               q_plan, layer_angles, head_dim, rope_dim)
+                               q_plan, layer_angles, head_dim, rope_dim, stream=auxiliary)
 
 
 @_start_attn_preencoded_rope.register_fake
@@ -472,7 +487,7 @@ def _start_attn_aux_indexed(
     with torch.cuda.stream(auxiliary):
         if q_values_base is not None:
             _run_encoded_with_rope(q_values_base, q_mma_base, q_w, q_s, q_out, workspace,
-                                   q_plan, layer_angles, q_head_dim, rope_dim)
+                                   q_plan, layer_angles, q_head_dim, rope_dim, stream=auxiliary)
         else:
             _run_mxfp8_with_rope(query_low, q_w, q_s, q_gain, q_act_scale, q_scale_kind,
                                  q_out, workspace, q_plan, layer_angles, q_head_dim, rope_dim, auxiliary)
@@ -616,12 +631,21 @@ class ConcurrentAttentionAux:
     def _finalize_functional(self):
         self.q_handle = self.q_owner.plan.handle
         side_plans = [self.q_owner.plan]
-        if not self.q_preencoded:
-            register_tc_gemv_rope(self.q_owner.plan, head_dim=self.q_head_dim, rope_dim=self.rope_dim)
+        if self.q_preencoded:
+            register_dense_gemm_rope(
+                self.q_owner.plan, head_dim=self.q_head_dim, rope_dim=self.rope_dim, rope_split=True
+            )
+        elif not register_tc_gemv_rope(self.q_owner.plan, head_dim=self.q_head_dim, rope_dim=self.rope_dim):
+            register_dense_gemm_rope(
+                self.q_owner.plan, head_dim=self.q_head_dim, rope_dim=self.rope_dim, rope_split=True
+            )
         if self.has_indexer:
             self.iq_handle = self.iq_owner.plan.handle
             self.iw_handle = self.iw_owner.plan.handle
-            register_tc_gemv_rope(self.iq_owner.plan, head_dim=self.iq_head_dim, rope_dim=self.rope_dim)
+            if not register_tc_gemv_rope(self.iq_owner.plan, head_dim=self.iq_head_dim, rope_dim=self.rope_dim):
+                register_dense_gemm_rope(
+                    self.iq_owner.plan, head_dim=self.iq_head_dim, rope_dim=self.rope_dim, rope_split=True
+                )
             side_plans.extend((self.iq_owner.plan, self.iw_owner.plan))
             self.selector_handles = [sel.plan.handle for sel in self.selector_owners]
             self.selector_starts = [a for a, _ in self.selector_slices]

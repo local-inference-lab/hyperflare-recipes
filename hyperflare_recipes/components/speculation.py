@@ -829,7 +829,9 @@ class PreparedSpeculativeStateCommit:
         # owner's values in one update, so no slot is written twice whatever the core capacity.
         matches = selected[:, None] & selected[None, :] & (slots[:, None] == slots[None, :])
         count = matches.sum(1)
-        row = torch.where(matches, rows[None, :], 0).amax(1)
+        # Clamp amax into [0, B - 1] so masked Triton lanes on non-power-of-two
+        # batch capacities (e.g. B=6, 12, 24) never index with INT64_MIN.
+        row = torch.where(matches, rows[None, :], 0).amax(1).clamp(0, rows.numel() - 1)
         leader = selected & (row == rows)
         ids = acceptance.token_ids[row]
         inputs = inputs[row]

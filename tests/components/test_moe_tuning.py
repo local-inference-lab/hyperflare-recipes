@@ -184,3 +184,76 @@ def test_expert_precision_reaches_the_canonical_execution_query(monkeypatch, tok
     assert operation.plan.query.quant_modes == ("w4a16",)
     assert declarations[0].plan is operation.plan
     assert len(finalizers) == 1
+
+
+def test_csf_scale_expansion_benchmark_forwards_prequantized_a_scales(monkeypatch):
+    tokens = 4
+    source = torch.zeros((tokens, 32), dtype=torch.float8_e4m3fn)
+    a_scales = torch.zeros((tokens, 1), dtype=torch.uint8)
+    ids = torch.zeros((tokens, 4), dtype=torch.int32)
+    weights = torch.zeros((tokens, 4), dtype=torch.float32)
+    output = torch.zeros((tokens, 32), dtype=torch.bfloat16)
+    planes = {name: torch.zeros(16, dtype=torch.uint8) for name in
+              ("w1_fp4", "w2_fp4", "w1_blockscale", "w2_blockscale",
+               "w1_alphas", "w2_alphas", "a1_gscale", "a2_gscale")}
+    active_buf = torch.zeros(16, dtype=torch.uint8)
+    experts = SimpleNamespace(
+        num_experts=16,
+        has_csf_blocks=True,
+        plan=SimpleNamespace(activation=SimpleNamespace(outer_scale="token")),
+        _impl=SimpleNamespace(
+            **planes,
+            representation=None,
+            nvfp4_csf=SimpleNamespace(
+                first=SimpleNamespace(fixed=None, exceptions=None, task_offsets=None, value_lut=None),
+                second=SimpleNamespace(fixed=None, exceptions=None, task_offsets=None, value_lut=None),
+                active=active_buf,
+                indexed_scales=(),
+            ),
+        ),
+    )
+    arena = ScratchArena("cpu")
+    arena.reserve(256)
+    arena.freeze()
+    resources, requests = {}, []
+    session = SimpleNamespace(prepare=lambda declarations: requests.extend(declarations))
+    specs = (ScratchBufferSpec(name="workspace", shape=(16,), dtype=torch.uint8, device=torch.device("cpu")),)
+    scale_plan = SimpleNamespace(request=lambda **kwargs: SimpleNamespace(**kwargs))
+    exec_plan = SimpleNamespace(scratch_specs=lambda: specs, request=lambda **kwargs: SimpleNamespace(**kwargs))
+
+    monkeypatch.setattr(moe.fused_moe, "plan_scale_expansion", lambda *args, **kwargs: scale_plan)
+    monkeypatch.setattr(moe.fused_moe, "plan_execution", lambda **kwargs: exec_plan)
+    monkeypatch.setattr(moe, "register_finalizer", lambda *args, **kwargs: None)
+    monkeypatch.setattr(moe_fixtures, "benchmark_resource", lambda _s, k, f: resources.setdefault(k, f()))
+    monkeypatch.setattr(
+        "b12x.preparation._measurement.capture_benchmark_call",
+        lambda call: call,
+    )
+
+    moe.PreparedRoutedExperts(
+        source, experts, ids, weights, output,
+        session=session, name="prefill16384.layer0.experts", workspace=arena,
+        a_scales=a_scales,
+    )
+    assert len(requests) == 2
+    scale_req, moe_req = requests
+
+    scale_state = SimpleNamespace(bind=lambda **kwargs: SimpleNamespace(run=lambda: None, **kwargs))
+    scale_req.benchmark_call(scale_state)
+    fixture = resources[("moe_inputs", "prefill16384.layer0.experts")]
+    assert fixture.a_scales is not None
+    assert fixture.a_scales.shape == a_scales.shape and fixture.a_scales.dtype == a_scales.dtype
+
+    bound = {}
+
+    def moe_bind(**kwargs):
+        bound.update(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    moe_state = SimpleNamespace(
+        scratch=SimpleNamespace(scratch_specs=lambda: specs),
+        bind=moe_bind,
+        run=lambda b: None,
+    )
+    moe_req.benchmark_call(moe_state)
+    assert bound["a_scales"] is fixture.a_scales

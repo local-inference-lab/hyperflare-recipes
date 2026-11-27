@@ -92,3 +92,66 @@ def test_layer_consumes_standalone_router_results_with_runtime_image_mask():
     assert torch.equal(observed[0][1], torch.tensor([False, True, False]))
     assert records is residual
     assert actual_selection is selection
+
+
+@pytest.mark.parametrize("rows", [1, 8, 16, 32, 64, 128, 129])
+@pytest.mark.parametrize("mode", ["decode", "verify", "draft", "prefill"])
+def test_layer_split_mhc_activation_tracks_b12x_support(monkeypatch, rows, mode):
+    from b12x.norm.mhc import _split_lagged
+
+    scratch = decoder.Scratch.allocate(rows, 1, 4, "meta")
+    split_calls = []
+
+    class Component:
+        plan = object()
+
+        def functional(self, **kwargs):
+            return self
+
+    def component(*args, **kwargs):
+        return Component()
+
+    def split_mhc(*args, **kwargs):
+        split_calls.append((args, kwargs))
+        return Component()
+
+    class FakeArena(decoder.ScratchArena):
+        def __init__(self):
+            self.overlap = True
+
+    for name in ("PreparedMHC", "PreparedAttention", "PreparedAllReduce", "UnquantizedProjection",
+                 "PreparedRouter", "PreparedRoutedExperts", "PreparedMLP", "PreparedMHCPost",
+                 "ConcurrentSharedExpert"):
+        monkeypatch.setattr(decoder, name, component)
+    monkeypatch.setattr(decoder, "SplitLaggedMHC", split_mhc)
+    monkeypatch.setattr(decoder, "_mhc_weights", lambda *args: None)
+    monkeypatch.setattr(decoder, "register_finalizer", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        _split_lagged,
+        "supports_split_lagged",
+        lambda device, max_tokens, hidden, dtype: 1 <= int(max_tokens) <= _split_lagged.SPLIT_LAGGED_MAX_TOKENS,
+    )
+    text = dict(rms_norm_eps=1e-6, hc_eps=1e-6, hc_sinkhorn_iters=20,
+                scoring_func="sigmoid", norm_topk_prob=True, routed_scaling_factor=1., swiglu_limit=10.)
+    residual_weights = {
+        "attn_norm.weight": torch.empty(5120, dtype=torch.bfloat16, device="meta"),
+        "ffn_norm.weight": torch.empty(5120, dtype=torch.bfloat16, device="meta"),
+    }
+    weights = SimpleNamespace(
+        engram=None,
+        attention=None,
+        residual=residual_weights,
+        experts=SimpleNamespace(
+            vision_correction=None, router=None, correction=None, experts=None, shared=None
+        ),
+    )
+    layer = decoder.PreparedLayer(
+        3, weights, None, scratch,
+        SimpleNamespace(token_ids=torch.empty(rows, device="meta")),
+        SimpleNamespace(config=SimpleNamespace(text=text)), None,
+        shard=SimpleNamespace(world_size=4), mode=mode, runtime=object(), coordinator=None,
+        session=object(), name="layer", workspace=FakeArena(), carry=False, defer_post=True,
+    )
+    expected = mode in ("decode", "verify", "draft") and rows <= _split_lagged.SPLIT_LAGGED_MAX_TOKENS
+    assert layer.split_mhc is expected
+    assert len(split_calls) == (2 if expected else 0)

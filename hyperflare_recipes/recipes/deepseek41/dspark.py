@@ -11,7 +11,7 @@ from hyperflare_recipes.components.vocabulary import PreparedVocabularyProjectio
 from ignition.preparation.tuning import register_finalizer
 
 from .attention import AttentionIndices, Rotary, normalize
-from .decoder import PreparedLayer
+from .decoder import PreparedLayer, _link_fused_mhc_layers
 
 
 class PreparedDraft:
@@ -32,6 +32,7 @@ class PreparedDraft:
             defer_post=i + 1 < len(weights.draft.layers), mla_compute_mode=mla_compute_mode,
             window_metadata=self.window_metadata, examples=examples)
             for i, layer in enumerate(weights.draft.layers))
+        _link_fused_mhc_layers(self.layers)
         self.head_hidden = torch.zeros_like(scratch.hidden)
         self.head_hidden_shape = tuple(scratch.hidden.shape)
         self.logit_shape, self.logit_dtype = tuple(scratch.logits.shape), scratch.logits.dtype

@@ -88,5 +88,7 @@ class PreparedGlmMoe:
         pending = None if self.concurrent_shared is None else self.concurrent_shared.start(source)
         routes = self.routing(logits)
         routed = self.experts(source, routes.ids, routes.weights)
+        if pending is None and getattr(self.shared, "supports_residual", False):
+            return self.shared(source, residual=routed)
         shared = self.shared(source) if pending is None else self.concurrent_shared.finish(pending, routed)
         return torch.add(routed, shared)

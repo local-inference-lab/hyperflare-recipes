@@ -73,9 +73,15 @@ class SpeculativePreparation:
         # Only sampling uses the result channel; model forwards receive the collectives above.
         self.result_runtime = result_runtime
         self.block_proposal_broadcast = block_proposal_broadcast
-        self.rng = SpeculativeRngState.allocate(pool.backing.device, capacity=requests.capacity)
+        device = pool.backing.device
+        self.rng = SpeculativeRngState.allocate(device, capacity=requests.capacity)
         self.generation = torch.zeros_like(requests.generation)
         self.offset = torch.zeros_like(requests.generation)
+        copy_width = max(7, draft_tokens)
+        self.copy_ids = torch.full((requests.capacity, copy_width), -1, dtype=torch.int64, device=device)
+        self.copy_count = torch.zeros(requests.capacity, dtype=torch.int32, device=device)
+        self.copy_expected = torch.full((requests.capacity,), -1, dtype=torch.int64, device=device)
+        self.copy_generation = torch.zeros(requests.capacity, dtype=torch.int64, device=device)
         draft = weights.config.draft
         self.logit_offset = logit_offset
         self.block_size = max(1, draft_tokens) if block_size is None else block_size
@@ -84,10 +90,18 @@ class SpeculativePreparation:
             tokens,
             tokens,
             weights.shard.world_size,
-            pool.backing.device,
+            device,
             experts=draft.experts,
             top_k=draft.top_k,
         )
+
+    def buffers(self):
+        return {
+            "copy_token_ids": self.copy_ids,
+            "copy_token_count": self.copy_count,
+            "copy_expected_consumed": self.copy_expected,
+            "copy_generation": self.copy_generation,
+        }
 
     def release_examples(self):
         self.scratch = self.draft_scratch = None
@@ -124,18 +138,38 @@ class PreparedContext:
     """Project accepted target feedback into persistent draft context rings."""
 
     def __init__(self, weights, auxiliary, metadata, pool, *, session, name, workspace,
-                 cache_format="deepseek_v41", compact_prefill=False):
+                 cache_format="deepseek_v41", compact_prefill=False, runtime=None, coordinator=None):
         tokens, device = auxiliary.shape[0], auxiliary.device
         self.compact = compact_prefill and metadata.starts.numel() == 1 and metadata.positions.numel() > 128
         if self.compact and tokens != 128:
             raise ValueError("compact prefill feedback must contain the retained 128-row suffix")
-        projected = torch.empty((tokens, weights.config.text["hidden_size"]), dtype=torch.bfloat16, device=device)
+        hidden = weights.config.text["hidden_size"]
+        main_weight = weights.draft.main_projection
+        local_hidden = main_weight.shape[0] if isinstance(main_weight, torch.Tensor) else main_weight.out_features
+        world_size = getattr(getattr(weights, "shard", None), "world_size", 1)
+        projected = torch.empty((tokens, hidden), dtype=torch.bfloat16, device=device)
         main = torch.empty_like(projected)
         kv = torch.empty((tokens, 512 * len(weights.draft.layers)), dtype=torch.bfloat16, device=device)
         normalized = torch.empty((tokens, 512), dtype=torch.bfloat16, device=device)
         slots = torch.full((tokens,), -1, dtype=torch.int64, device=device)
-        self.project = QuantizedProjection(auxiliary, weights.draft.main_projection, projected,
-            session=session, name=name + ".main", workspace=workspace, activation_mode="auto").functional(session=session)
+        if local_hidden == hidden:
+            self.gather = None
+            self.project = QuantizedProjection(auxiliary, main_weight, projected,
+                session=session, name=name + ".main", workspace=workspace, activation_mode="auto").functional(session=session)
+        else:
+            if world_size < 2 or hidden % world_size != 0 or local_hidden != hidden // world_size:
+                raise ValueError(
+                    f"draft main_projection output width {local_hidden} must equal hidden_size {hidden} "
+                    f"or hidden_size // world_size ({hidden} // {world_size})"
+                )
+            if runtime is None:
+                raise ValueError("output-sharded draft main_projection requires a collective all-gather runtime")
+            local_projected = torch.empty((tokens, local_hidden), dtype=torch.bfloat16, device=device)
+            local_project = QuantizedProjection(auxiliary, main_weight, local_projected,
+                session=session, name=name + ".main", workspace=workspace, activation_mode="auto").functional(session=session)
+            self.gather = _prepare_context_gather(local_projected, projected, runtime=runtime,
+                coordinator=coordinator, session=session, name=name + ".main_gather")
+            self.project = _ShardedMainProjection(local_project, self.gather)
         self.norm = PreparedRMSNorm(projected, weights.draft.main_norm, main,
             eps=weights.config.text["rms_norm_eps"], session=session, name=name + ".main_norm").functional()
         self.context_projection = QuantizedProjection(main, weights.draft.context_kv, kv,
@@ -239,3 +273,60 @@ class PreparedMarkov:
         if self.gather is not None:
             logits = self.gather(logits.view(torch.bfloat16)).view(torch.float32)
         return logits
+
+
+class _ShardedMainProjection:
+    """Run an output-sharded ``mtp.0.main_proj`` projection and gather its BF16 columns."""
+
+    def __init__(self, local, gather):
+        self.local = local
+        self.gather = gather
+
+    def __call__(self, auxiliary):
+        return self.gather(self.local(auxiliary))
+
+
+class _ChunkedRoceAllGather:
+    """Row-chunked column all-gather for RoCE payloads exceeding ``runtime.max_gather_bytes``."""
+
+    def __init__(self, source, output, *, runtime, session, coordinator, name):
+        from ignition.components import collectives
+
+        rows = source.shape[0]
+        row_bytes = source.shape[1] * source.element_size()
+        step = runtime.max_gather_bytes // row_bytes
+        if step < 1:
+            raise ValueError("one draft context row exceeds the RoCE all-gather capacity")
+        self.bounds = tuple((start, min(start + step, rows)) for start in range(0, rows, step))
+        self.parts = tuple(
+            collectives.PreparedAllGather(
+                source[begin:end],
+                output[begin:end],
+                runtime=runtime,
+                session=session,
+                coordinator=coordinator,
+                name=name if len(self.bounds) == 1 else f"{name}.{index}",
+            ).functional(session=session)
+            for index, (begin, end) in enumerate(self.bounds)
+        )
+        self.output_layout = (tuple(output.shape), output.stride(), output.dtype)
+
+    def __call__(self, source):
+        shape, stride, dtype = self.output_layout
+        output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
+        for (begin, end), part in zip(self.bounds, self.parts, strict=True):
+            part(source[begin:end], output[begin:end])
+        return output
+
+
+def _prepare_context_gather(source, output, *, runtime, coordinator, session, name):
+    """Prepare a functional BF16 column all-gather sized for any context row count."""
+    from ignition.components import collectives
+
+    if collectives._roce(runtime) and source.numel() * source.element_size() > runtime.max_gather_bytes:
+        return _ChunkedRoceAllGather(
+            source, output, runtime=runtime, session=session, coordinator=coordinator, name=name
+        )
+    return collectives.PreparedChunkedAllGather(
+        source, output, runtime=runtime, session=session, coordinator=coordinator, name=name
+    ).functional(session=session)

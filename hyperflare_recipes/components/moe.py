@@ -312,7 +312,7 @@ class PreparedRoutedExperts:
             benchmark_call=partial(moe_fixtures.scale_expansion_benchmark_call,
                 source=source, experts=experts, top_k=ids.shape[1], session=session, name=name,
                 allocate_router=RouterScratch.allocate, router_plan=router_plan,
-                integrated_query=integrated_query, output_template=output)),)
+                integrated_query=integrated_query, output_template=output, a_scales=a_scales)),)
         declare(session, (*scale_requests, self.plan.request(name=name, prepare_call=prepare_call,
             dependencies=tuple(request.name for request in scale_requests),
             benchmark_call=partial(moe_fixtures.benchmark_call, source=source, experts=experts,

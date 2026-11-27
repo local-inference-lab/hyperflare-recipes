@@ -118,14 +118,15 @@ def scale_expansion_call(state, *, ids, experts):
 
 
 def scale_expansion_benchmark_call(state, *, source, experts, top_k, session, name,
-                                 allocate_router, router_plan, integrated_query=None, output_template=None):
+                                 allocate_router, router_plan, integrated_query=None, output_template=None,
+                                 a_scales=None):
     from dataclasses import replace
     from b12x.preparation._measurement import capture_benchmark_call
 
     operands = benchmark_resource(session, ("moe_inputs", name),
         lambda: ExpertBenchmarkInputs(source, experts=experts.num_experts,
             top_k=top_k, allocate_router=allocate_router, router_plan=router_plan,
-            integrated_query=integrated_query, output_template=output_template))
+            integrated_query=integrated_query, output_template=output_template, a_scales=a_scales))
     call = scale_expansion_call(state, ids=operands.router.ids, experts=experts)
     producers = operands.producers
     return capture_benchmark_call(replace(call,

@@ -9,6 +9,12 @@ from functools import partial
 
 import torch
 
+from hyperflare_recipes.components.dense_epilogues import (
+    allocate_mxfp8_activation_bases,
+    is_fused_swiglu_down_plan,
+    mxfp8_bases_from_byte_buffer,
+    run_fused_swiglu_down,
+)
 from hyperflare_recipes.components.linear import QuantizedProjection
 from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.tuning import register_finalizer
@@ -66,11 +72,18 @@ def _run_shared_expert(source, weights, scales, gains, activation_scales, scale_
     gate_up, intermediate, projected = outputs[:3]
     with torch.cuda.stream(auxiliary):
         project(source, 0, gate_up)
-        if activation == "relu2":
-            torch.ops.b12x.hyperconnection_relu2(gate_up, intermediate, plans[-1])
+        if is_fused_swiglu_down_plan(plans[1]):
+            bases = encoded[encoding_offsets[1]:encoding_offsets[2]]
+            run_fused_swiglu_down(
+                gate_up, bases[0], bases[1], bases[2], weights[1], scales[1],
+                projected, plans[1], stream=auxiliary,
+            )
         else:
-            torch.ops.b12x.hyperconnection_swiglu(gate_up, intermediate, limit, round_silu, plans[-1])
-        project(intermediate, 1, projected)
+            if activation == "relu2":
+                torch.ops.b12x.hyperconnection_relu2(gate_up, intermediate, plans[-1])
+            else:
+                torch.ops.b12x.hyperconnection_swiglu(gate_up, intermediate, limit, round_silu, plans[-1])
+            project(intermediate, 1, projected)
         if len(weights) == 3:
             project(source, 2, outputs[3])
 
@@ -175,10 +188,16 @@ class ConcurrentSharedExpert:
             self.projections += (gate_projection,)
             self.outputs.append(gate_projection.output)
         self.weights, self.scales, self.gains, self.activation_scales, self.scale_kinds = [], [], [], [], []
+        self.bound_encoded = []
+        self.encoding_offsets = [0]
         for projection in self.projections:
             if projection.bias is not None:
                 raise ValueError("shared-expert overlap requires unbiased projections")
-            if isinstance(projection, QuantizedProjection):
+            if getattr(projection, "is_fused_swiglu_down", False):
+                values, scales = projection.parts[:2]
+                gain, activation_scale, kind = None, None, "none"
+                self.bound_encoded.extend(projection.encoded_bases)
+            elif isinstance(projection, QuantizedProjection):
                 values, scales, gain, fp4 = _weight_parts(projection.weight)
                 if scales.dtype == torch.float8_e8m0fnu:
                     scales = scales.view(torch.uint8)
@@ -194,13 +213,15 @@ class ConcurrentSharedExpert:
             self.gains.append(gain)
             self.activation_scales.append(activation_scale)
             self.scale_kinds.append(("none", "multiplier", "reciprocal", "block_fp8").index(kind))
+            self.encoding_offsets.append(len(self.bound_encoded))
             for main_plan in self.parallel_plans:
                 workspace.register_parallel(main_plan, projection.plan)
-        self.plans = [projection.plan.handle for projection in self.projections] + [mlp.activation_plan.handle]
+        activation_handle = 0 if mlp.activation_plan is None else mlp.activation_plan.handle
+        self.plans = [projection.plan.handle for projection in self.projections] + [activation_handle]
         self.stream = workspace.auxiliary_stream
         self.stream_handle = self.stream.cuda_stream
-        self.encoding_offsets = [0] * (len(self.projections) + 1)
         self.quantizers = [0] * len(self.projections)
+        self.fused_down_layout = None
         register_finalizer(session, partial(self.refresh, self.parallel_plans, workspace), workspace=workspace)
 
     def functional(self, *, session):
@@ -208,6 +229,7 @@ class ConcurrentSharedExpert:
         if self.outputs is not None:
             self.output_layouts = tuple((tuple(t.shape), t.stride(), t.dtype) for t in self.outputs)
             self.outputs = None
+            self.bound_encoded = []
             self.mlp.functional(session=session)
             for projection in self.projections:
                 projection.functional(session=session)
@@ -231,6 +253,11 @@ class ConcurrentSharedExpert:
                     self.encoded_layouts.append(((columns // 128, rows), torch.float32))
                     self.encoded_layouts.append((tuple(projection.weight.scales.T.shape), torch.float32))
                 sizes.append(_workspace_bytes(projection.plan))
+            elif getattr(projection, "is_fused_swiglu_down", False):
+                self.fused_down_layout = (len(self.encoded_layouts), projection.encoded_layout)
+                self.encoded_layouts.extend(projection.encoded_layout)
+                self.weights[index], self.scales[index] = projection.parts[:2]
+                sizes.append(0)
             else:
                 layout = getattr(projection, "encoded_layout", None)
                 if layout is not None:
@@ -247,6 +274,7 @@ class ConcurrentSharedExpert:
                     sizes.append(projection.plan.memory_requirements().scratch_nbytes)
             self.encoding_offsets.append(len(self.encoded_layouts))
         self.workspace_nbytes = max(sizes, default=0)
+        self.bound_encoded = []
         self.workspace = self.arena = self.mlp = self.parallel_plans = None
 
     @property
@@ -261,6 +289,17 @@ class ConcurrentSharedExpert:
         main_bytes = max(plan.memory_requirements().scratch_nbytes for plan in parallel_plans)
         shared_bytes = max(projection.plan.memory_requirements().scratch_nbytes for projection in self.projections)
         _, self.workspace = arena.views(((main_bytes,), torch.uint8), ((shared_bytes,), torch.uint8))
+        if self.outputs is not None:
+            refreshed = []
+            for projection in self.projections:
+                if getattr(projection, "is_fused_swiglu_down", False):
+                    refreshed.extend(
+                        mxfp8_bases_from_byte_buffer(
+                            self.workspace, projection.encoded_layout, projection.rows
+                        )
+                    )
+            if refreshed:
+                self.bound_encoded = refreshed
 
     def start(self, source):
         if self.outputs is None:
@@ -268,6 +307,12 @@ class ConcurrentSharedExpert:
                        for shape, stride, dtype in self.output_layouts]
             workspace = torch.empty(self.workspace_nbytes, dtype=torch.uint8, device=source.device)
             encoded = [torch.empty(shape, dtype=dtype, device=source.device) for shape, dtype in self.encoded_layouts]
+            fused_down_layout = getattr(self, "fused_down_layout", None)
+            if fused_down_layout is not None:
+                offset, layout = fused_down_layout
+                encoded[offset:offset + 3] = list(
+                    allocate_mxfp8_activation_bases(layout, int(source.shape[0]), source.device)
+                )
             pending = PendingSharedExpert(source, outputs, workspace, encoded)
             _start_shared_expert(source, self.weights, self.scales, self.gains, self.activation_scales,
                 self.scale_kinds, outputs, workspace, self.plans, self.activation, self.limit, self.round_silu,
@@ -276,7 +321,7 @@ class ConcurrentSharedExpert:
         _start_shared_expert(source, self.weights, self.scales, self.gains, self.activation_scales,
                             self.scale_kinds, self.outputs, self.workspace, self.plans, self.activation, self.limit,
                             self.round_silu, self.stream_handle, self.launch_order,
-                            [], self.encoding_offsets, self.quantizers)
+                            self.bound_encoded, self.encoding_offsets, self.quantizers)
 
     def finish(self, source, routed):
         from ignition.components.collectives import WeightedGroupSource
@@ -293,5 +338,5 @@ class ConcurrentSharedExpert:
         _join_shared_expert(source, routed, self.weights, self.scales, self.gains, self.activation_scales,
                            self.scale_kinds, self.outputs, self.workspace, self.plans, self.activation, self.limit,
                            self.round_silu, self.stream_handle, self.launch_order,
-                           [], self.encoding_offsets, self.quantizers)
+                           self.bound_encoded, self.encoding_offsets, self.quantizers)
         return self.mlp.down_projection.output

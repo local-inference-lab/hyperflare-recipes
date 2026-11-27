@@ -17,7 +17,15 @@ from b12x.preparation import PreparedCall
 from hyperflare_recipes.components import sm103_projection
 from hyperflare_recipes.components.compressed_mla import PreparedCompressedCacheWriter, PreparedCompressedMLA
 from hyperflare_recipes.components.attention_output import PreparedGroupedOutputProjection
-from hyperflare_recipes.components.linear import BatchedUnquantizedProjection, QuantizedProjection, UnquantizedProjection
+from hyperflare_recipes.components.dense_epilogues import (
+    register_dense_gemm_rope,
+    run_encoded_projection_rope,
+)
+from hyperflare_recipes.components.linear import (
+    BatchedUnquantizedProjection,
+    QuantizedProjection,
+    UnquantizedProjection,
+)
 from hyperflare_recipes.components.mla_norm_quant import PreparedMLANormQuant
 from hyperflare_recipes.components.mxfp4_indexer import PreparedMXFP4Indexer
 from hyperflare_recipes.components.projection_overlap import (
@@ -555,6 +563,11 @@ class PreparedBF16GroupedOutputProjection:
 
 
 class PreparedAttention:
+    q_b_fused_rope = False
+    q_b_dense_rope = False
+    index_query_fused_rope = False
+    index_query_dense_rope = False
+
     def __init__(self, layer, weights, source, scratch, metadata, pool, rotary, *, mode,
                  world, session, name, workspace, replay_start=None, window_staging=None,
                  mla_compute_mode="auto", window_metadata=None, examples=None, pipelined_mode=None,
@@ -833,7 +846,9 @@ class PreparedAttention:
         self.query_shape = (prefix_tokens, query_buf.shape[1], query_buf.shape[2])
         self.candidate_source = config.text["candidate_source_layer_id"]
         self.q_b_fused_rope = False
+        self.q_b_dense_rope = False
         self.index_query_fused_rope = False
+        self.index_query_dense_rope = False
         self.projections["qkv_a"].functional(session=session)
         if self.concurrent_query is None:
             self.projections["q_b"].functional(session=session)
@@ -858,19 +873,71 @@ class PreparedAttention:
         register_finalizer(session, self.release_examples)
 
     def _finalize_standalone_rope(self):
+        q_b = self.projections["q_b"]
         if (not self.row_shard_attention and self.concurrent_query is None
                 and self.angles is not None and self.angles.split
-                and isinstance(self.projections["q_b"], QuantizedProjection)
-                and self.projections["q_b"].encoded is None
-                and self.projections["q_b"].encoded_layout is None):
-            self.q_b_fused_rope = register_tc_gemv_rope(
-                self.projections["q_b"].plan, head_dim=512, rope_dim=64)
+                and isinstance(q_b, QuantizedProjection)
+                and q_b.encoded is None and q_b.encoded_layout is None):
+            self.q_b_fused_rope = register_tc_gemv_rope(q_b.plan, head_dim=512, rope_dim=64)
+        if (not self.q_b_fused_rope and self.concurrent_query is None
+                and self.angles is not None and self.angles.split
+                and isinstance(q_b, QuantizedProjection)):
+            self.q_b_dense_rope = register_dense_gemm_rope(
+                q_b.plan, head_dim=512, rope_dim=64, rope_split=True)
         if (not self.row_shard_attention and self.selectors
                 and (self.concurrent_query is None or not self.concurrent_query.has_indexer)
                 and self.index_angles is not None and self.index_angles.split
                 and self.index_query.encoded is None and self.index_query.encoded_layout is None):
             self.index_query_fused_rope = register_tc_gemv_rope(
                 self.index_query.plan, head_dim=128, rope_dim=64)
+        if (not self.index_query_fused_rope and self.selectors
+                and (self.concurrent_query is None or not self.concurrent_query.has_indexer)
+                and self.index_angles is not None and self.index_angles.split):
+            self.index_query_dense_rope = register_dense_gemm_rope(
+                self.index_query.plan, head_dim=128, rope_dim=64, rope_split=True)
+
+    def _project_q_b_with_rope(self, query_low, layer_angles, *, encoded_bases=None):
+        q_b = self.projections["q_b"]
+        if self.q_b_fused_rope:
+            return run_mxfp8_projection_rope(q_b, query_low, layer_angles, head_dim=512).view(self.query_shape)
+        if self.q_b_dense_rope:
+            if q_b.encoded_layout is not None:
+                if encoded_bases is None and q_b.quantizer_plan is not None:
+                    encoded_bases = tuple(
+                        torch.empty(shape, dtype=dtype, device=query_low.device)
+                        for shape, dtype in q_b.encoded_layout
+                    )
+                    mxfp8.quantize_dense_rows(query_low, *encoded_bases, plan=q_b.quantizer_plan)
+                if encoded_bases is not None:
+                    return run_encoded_projection_rope(
+                        q_b, encoded_bases[0], encoded_bases[2], layer_angles,
+                        head_dim=512, rope_dim=64, rope_split=True,
+                    ).view(self.query_shape)
+            else:
+                return run_mxfp8_projection_rope(q_b, query_low, layer_angles, head_dim=512).view(self.query_shape)
+        query = (q_b(query_low, encoded_bases=encoded_bases) if isinstance(q_b, QuantizedProjection)
+                 else q_b(query_low)).view(self.query_shape)
+        self.angles.apply(query, layer_angles)
+        return query
+
+    def _project_index_q_with_rope(self, query_low, index_angles, rows):
+        if self.index_query_fused_rope or self.index_query_dense_rope:
+            if self.index_query.encoded_layout is not None and self.index_query.quantizer_plan is not None:
+                encoded_bases = tuple(
+                    torch.empty(shape, dtype=dtype, device=query_low.device)
+                    for shape, dtype in self.index_query.encoded_layout
+                )
+                mxfp8.quantize_dense_rows(query_low, *encoded_bases, plan=self.index_query.quantizer_plan)
+                return run_encoded_projection_rope(
+                    self.index_query, encoded_bases[0], encoded_bases[2], index_angles,
+                    head_dim=128, rope_dim=64, rope_split=True,
+                ).view(rows, 32, 128)
+            return run_mxfp8_projection_rope(
+                self.index_query, query_low, index_angles, head_dim=128
+            ).view(rows, 32, 128)
+        index_query = self.index_query(query_low).view(rows, 32, 128)
+        self.index_angles.apply(index_query, index_angles)
+        return index_query
 
     def plans(self):
         result = []
@@ -937,8 +1004,7 @@ class PreparedAttention:
         else:
             query_low, window_values, encoded_bases = self.norm_quant(projected)
             self.angles.apply(window_values, layer_angles)
-        query = self.projections["q_b"](query_low, encoded_bases=encoded_bases).view(self.query_shape)
-        self.angles.apply(query, layer_angles)
+        query = self._project_q_b_with_rope(query_low, layer_angles, encoded_bases=encoded_bases)
         return query, query_low, window_values, layer_angles
 
     def run_shard_qkv_q(self, source_shard, *, indices, shard_rows, half_idx=None, shard_inputs=None):
@@ -964,13 +1030,12 @@ class PreparedAttention:
         else:
             kv_pack_sh = window_values
         if self.selectors:
-            iq_sh = self.index_query(query_low).view(self.shard_tokens, 32, 128)
             idx_angles = (
                 shard_inputs.angles[(True, 0)][half_idx]
                 if shard_inputs is not None and half_idx is not None and (True, 0) in shard_inputs.angles
                 else torch.index_select(indices.angles[(True, 0)], 0, shard_rows)
             )
-            self.index_angles.apply(iq_sh, idx_angles)
+            iq_sh = self._project_index_q_with_rope(query_low, idx_angles, self.shard_tokens)
             iw_sh = self.index_weight(source_shard)
             iw_sh.mul_(128 ** -.5 * 32 ** -.5)
         else:
@@ -1105,8 +1170,7 @@ class PreparedAttention:
         else:
             query_low, window_values, encoded_bases = self.norm_quant(projected)
             self.angles.apply(window_values, layer_angles)
-        query = self.projections["q_b"](query_low, encoded_bases=encoded_bases).view(self.query_shape)
-        self.angles.apply(query, layer_angles)
+        query = self._project_q_b_with_rope(query_low, layer_angles, encoded_bases=encoded_bases)
         self.window_writer(window_values, indices.window_slots[sl], cache=window_cache)
         selected, _, _ = selection
         geometry = indices.compressed(self.ratio) if self.ratio else None
@@ -1137,8 +1201,7 @@ class PreparedAttention:
         else:
             query_low, window_values, encoded_bases = self.norm_quant(projected)
             self.angles.apply(window_values, layer_angles)
-        query = self.projections["q_b"](query_low, encoded_bases=encoded_bases).view(self.query_shape)
-        self.angles.apply(query, layer_angles)
+        query = self._project_q_b_with_rope(query_low, layer_angles, encoded_bases=encoded_bases)
         self.window_writer(window_values, indices.window_slots, cache=window_cache)
         selected, candidates, candidate_counts = selection
         records = None
@@ -1149,8 +1212,7 @@ class PreparedAttention:
                 records = self.global_kv(source, self.selectors[0], m, geometry,
                     angles=indices.angles[(True, self.ratio)])
             if self.selectors:
-                index_query = self.index_query(query_low).view(source.shape[0], 32, 128)
-                self.index_angles.apply(index_query, indices.angles[(True, 0)])
+                index_query = self._project_index_q_with_rope(query_low, indices.angles[(True, 0)], source.shape[0])
                 index_weights = self.index_weight(source)
                 index_weights.mul_(128 ** -.5 * 32 ** -.5)
                 outputs, candidate_outputs, count_outputs = [], [], []
@@ -1224,14 +1286,7 @@ class PreparedAttention:
                 window_values = self.window_norm(projected[:, 1280:])
             self.angles.apply(window_values, layer_angles)
         if self.concurrent_query is None:
-            if self.q_b_fused_rope:
-                query = run_mxfp8_projection_rope(
-                    self.projections["q_b"], query_low, layer_angles, head_dim=512).view(self.query_shape)
-            else:
-                qb = self.projections["q_b"]
-                query = (qb(query_low, encoded_bases=encoded_bases) if isinstance(qb, QuantizedProjection)
-                         else qb(query_low)).view(self.query_shape)
-                self.angles.apply(query, layer_angles)
+            query = self._project_q_b_with_rope(query_low, layer_angles, encoded_bases=encoded_bases)
         self.window_writer(window_values, indices.window_slots,
                            history_rows=m.state_rows if self.mode in ("verify", "draft") else None, cache=window_cache)
         dependency = window_cache
@@ -1254,13 +1309,7 @@ class PreparedAttention:
                     index_query = iq_flat.view(source.shape[0], 32, 128)
                     joined_query = True
                 else:
-                    if self.index_query_fused_rope:
-                        index_query = run_mxfp8_projection_rope(
-                            self.index_query, query_low, indices.angles[(True, 0)], head_dim=128
-                        ).view(source.shape[0], 32, 128)
-                    else:
-                        index_query = self.index_query(query_low).view(source.shape[0], 32, 128)
-                        self.index_angles.apply(index_query, indices.angles[(True, 0)])
+                    index_query = self._project_index_q_with_rope(query_low, indices.angles[(True, 0)], source.shape[0])
                     index_weights = self.index_weight(source)
                     index_weights.mul_(128 ** -.5 * 32 ** -.5)
                 outputs, candidate_outputs, count_outputs = [], [], []

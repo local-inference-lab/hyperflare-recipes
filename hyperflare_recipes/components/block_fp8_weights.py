@@ -18,15 +18,24 @@ class BlockFP8WeightLoader(DirectWeightLoader):
             raise ValueError("native FP8 loading requires square block-32 or block-128 scales")
         return shape[0]
 
-    def load_linear_group(self, prefixes, *, row_ranges=None, column_range=None, pad=False, temporary=False):
+    def load_linear_group(
+        self, prefixes, *, row_ranges=None, column_range=None, pad=False, temporary=False, k_alignment=128
+    ):
         """Pack aligned checkpoint slices, optionally zero-padding beyond their source extents."""
         prefixes = tuple(prefixes)
         ranges = (None,) * len(prefixes) if row_ranges is None else row_ranges
         parts = [
-            self._dense_blocks(prefix, rows=rows, columns=column_range, pad=pad, temporary=temporary or len(prefixes) > 1)
+            self._dense_blocks(
+                prefix,
+                rows=rows,
+                columns=column_range,
+                pad=pad,
+                temporary=temporary or len(prefixes) > 1,
+                k_alignment=k_alignment,
+            )
             for prefix, rows in zip(prefixes, ranges, strict=True)
         ]
-        return self._pack_blocks(parts, dim=0, temporary=temporary)
+        return self._pack_blocks(parts, dim=0, temporary=temporary, k_alignment=k_alignment)
 
     def load_linear_columns(self, prefix, column_ranges, *, rows=None):
         """Gather aligned input-column ranges without changing checkpoint values or scales."""
@@ -37,12 +46,12 @@ class BlockFP8WeightLoader(DirectWeightLoader):
             raise ValueError("a projection requires at least one input-column range")
         return self._pack_blocks(parts, dim=1)
 
-    def _pack_blocks(self, parts, *, dim, temporary=False):
+    def _pack_blocks(self, parts, *, dim, temporary=False, k_alignment=128):
         from b12x.gemm.blockscaled import pack_weight
 
         self._session.flush()
         columns = sum(part[0].shape[1] for part in parts) if dim == 1 else parts[0][0].shape[1]
-        concatenate = torch.cat if temporary or columns % 128 else persistent_cat
+        concatenate = torch.cat if temporary or columns % k_alignment else persistent_cat
         values = concatenate([p[0] for p in parts], dim=dim) if len(parts) > 1 else parts[0][0]
         scales = concatenate(
             [
@@ -51,9 +60,11 @@ class BlockFP8WeightLoader(DirectWeightLoader):
             ], dim=dim,
         )
         options = {} if temporary else {"allocate": persistent_empty}
+        if k_alignment != 128:
+            options["k_alignment"] = k_alignment
         return pack_weight(values, scales, recipe="mxfp8", **options)
 
-    def _dense_blocks(self, prefix, *, rows=None, columns=None, pad=False, temporary=True):
+    def _dense_blocks(self, prefix, *, rows=None, columns=None, pad=False, temporary=True, k_alignment=128):
         self._require_open()
         weight, scale = self._sources[f"{prefix}.weight"], self._sources[f"{prefix}.scale"]
         block = self.block_size
@@ -67,7 +78,7 @@ class BlockFP8WeightLoader(DirectWeightLoader):
             raise ValueError(f"{prefix}: expected UE8M0 scales for {block}-by-{block} blocks")
         r0, r1 = _aligned_range(rows, max(n, rows[1]) if pad and rows else n, block)
         c0, c1 = _aligned_range(columns, max(k, columns[1]) if pad and columns else k, block)
-        allocate = torch.empty if temporary or (c1 - c0) % 128 else persistent_empty
+        allocate = torch.empty if temporary or (c1 - c0) % k_alignment else persistent_empty
         values = allocate((r1 - r0, c1 - c0), dtype=weight.dtype, device=self.device)
         scales = torch.empty(((r1 - r0) // block, (c1 - c0) // block), dtype=torch.uint8, device=self.device)
         nr, nc = max(0, min(r1, n) - r0), max(0, min(c1, k) - c0)
