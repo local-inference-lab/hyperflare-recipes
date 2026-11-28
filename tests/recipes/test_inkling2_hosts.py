@@ -200,9 +200,20 @@ def test_local_channels_are_unchanged(monkeypatch, drafting):
                             dict(max_rows=samples, columns=512 * 4, ipc=ipc)] if drafting else [])
 
 
-def test_hidden_reductions_round_to_bf16_only_over_roce(monkeypatch):
+def test_hidden_reductions_round_to_bf16_on_single_rank_and_roce(monkeypatch):
     local, remote = object(), object()
     monkeypatch.setattr(decoder, "_roce", lambda runtime: runtime is remote)
-    assert decoder.reduction_dtype(None) == torch.float32
+    assert decoder.reduction_dtype(None) == torch.bfloat16
     assert decoder.reduction_dtype(local) == torch.float32
     assert decoder.reduction_dtype(remote) == torch.bfloat16
+
+
+def test_single_rank_layer_and_decoder_bypass_reduction_and_gather():
+    # Direct TP=1 bypass in PreparedLayer.forward uses BF16 tensors without invoking a collective.
+    layer = object.__new__(decoder.PreparedLayer)
+    layer.reduction = None
+    layer.reduction_dtype = torch.bfloat16
+    x = torch.randn(4, 16, dtype=torch.bfloat16)
+    raw = x.to(torch.bfloat16) if layer.reduction is None else layer.reduction(x.to(layer.reduction_dtype)).to(torch.bfloat16)
+    assert raw is x
+    assert raw.dtype == torch.bfloat16

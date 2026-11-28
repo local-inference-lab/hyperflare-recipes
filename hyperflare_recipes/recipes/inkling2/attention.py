@@ -179,7 +179,7 @@ class PreparedAttention(torch.nn.Module):
     """A rank's attention for prefill, decode or speculative verification."""
 
     def __init__(self, layer, weights: AttentionWeights, text, cache: LayerCache, metadata, *, mode, tokens,
-                 session, workspace, name, examples=None, tuning_page_count=None):
+                 session, workspace, name, examples=None, tuning_page_count=None, output_dtype=torch.float32):
         super().__init__()
         if mode not in ("prefill", "decode", "verify"):
             raise ValueError(f"unsupported Inkling attention mode: {mode}")
@@ -208,7 +208,7 @@ class PreparedAttention(torch.nn.Module):
             for index, (weight, width) in enumerate(zip(weights.projections, self.columns.widths(), strict=True)))
         attended = example("inkling.attention.attended", (tokens, self.heads * self.dim))
         self.output_projection = UnquantizedProjection(attended, weights.output,
-            example("inkling.attention.partial", (tokens, text.hidden), torch.float32),
+            example("inkling.attention.partial", (tokens, text.hidden), output_dtype),
             session=session, name=f"{name}.output").functional(session=session)
         query = example("inkling.attention.query", (tokens, self.heads, self.dim))
         output = example("inkling.attention.output", (tokens, self.heads, self.dim))
