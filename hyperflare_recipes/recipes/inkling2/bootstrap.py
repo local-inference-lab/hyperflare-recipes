@@ -78,6 +78,10 @@ class PreparationConfig(BasePreparationConfig):
         return self.parameters.draft_quantization.draft_head_quantization
 
     @property
+    def expert_scale_compression(self) -> str | None:
+        return self.parameters.expert_scale_compression.encoding
+
+    @property
     def markov_head_quantization(self) -> str | None:
         if self.parameters.draft_quantization is None:
             return None
@@ -230,6 +234,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
         if model.text.loop is not None:
             from .mini_decoder import PreparedLoopDecoder
             decoder_type = PreparedLoopDecoder
+        elif config.expert_scale_compression is not None:
+            raise ValueError('expert_scale_compression is only supported for Inkling-2-Mini')
     # Continuation rows and pages hold the prepared layers only.
     text = (model.text if config.decoder_layers is None else model.text.prefix(config.decoder_layers)).cache_config
     if not text.global_layers:
@@ -286,6 +292,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
             identity_payload["draft_head_quantization"] = config.draft_head_quantization
         if config.markov_head_quantization is not None:
             identity_payload["markov_head_quantization"] = config.markov_head_quantization
+        if config.expert_scale_compression is not None:
+            identity_payload["expert_scale_compression"] = config.expert_scale_compression
         identity = hashlib.sha256(json.dumps(identity_payload, sort_keys=True, default=str).encode()).hexdigest()
         session = RecordedPreparationSession(compile_workers=config.compile_workers,
             native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,

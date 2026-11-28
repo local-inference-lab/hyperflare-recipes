@@ -262,3 +262,69 @@ def test_loop_histories_snapshot_branch_restore(snapshot, endpoint, drafting):
             assert torch.equal(cache[2], tails[name])
         assert not cache[3:].count_nonzero()
     graph.reset()
+
+
+@pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="requires assigned CUDA device")
+@pytest.mark.parametrize("layer,compression", [(0, None), (0, "csf"), (20, None)])
+@pytest.mark.parametrize("tokens", [4, 64])
+@torch.no_grad()
+def test_b12x_situ_moe_checkpoint_accuracy_and_graph_replay(snapshot, layer, compression, tokens):
+    from ignition import runtime_patches
+    runtime_patches.apply()
+    from hyperflare_recipes.components.parallel import TensorParallelShard
+    from hyperflare_recipes.components.situ_experts import PreparedSiTUExperts
+    from ignition.preparation.checkpoint import inspect_indexed_checkpoint
+    from ignition.preparation.scratch import ScratchArena
+    from ignition.preparation.tuning import RecordedPreparationSession
+    from hyperflare_recipes.recipes.inkling2.mini_weights import MiniWeightLoader
+    from hyperflare_recipes.recipes.inkling2.mini_experts import load_experts
+
+    device = torch.device("cuda:0")
+    with MiniWeightLoader(inspect_indexed_checkpoint(snapshot), "cuda:0", shard=TensorParallelShard(0, 1), vision=False) as loader:
+        dense_experts = load_experts(loader, layer, shard=loader.shard)
+        experts = (dense_experts if compression is None
+                   else load_experts(loader, layer, shard=loader.shard, expert_scale_compression=compression))
+    if compression == "csf":
+        assert experts.s13_exc is not None and experts.s2_exc is not None
+        assert experts.s13.nbytes + experts.s13_exc.nbytes + experts.s13_slab_offsets.nbytes < dense_experts.s13.nbytes
+
+    triton_op = PreparedSiTUExperts(dense_experts, tokens=tokens, top_k=8)
+    arena = ScratchArena(device)
+    with RecordedPreparationSession(
+        device=device, checkpoint="test", workload_schema="inkling2", numerical_policy="default", autotune_effort="off"
+    ) as session:
+        session.register_scratch(arena)
+        b12x_op = PreparedSiTUExperts(experts, tokens=tokens, top_k=8, session=session, workspace=arena,
+                                      name=f"test_situ_l{layer}_{compression}_{tokens}")
+        assert b12x_op.plan is not None
+        session.tune()
+        arena.release_preparation()
+
+    torch.manual_seed(917 + layer + tokens)
+    x = (torch.randn(tokens, 2304, device=device) * 0.25).to(torch.bfloat16)
+    ids = torch.stack([torch.randperm(128, device=device)[:8] for _ in range(tokens)]).to(torch.int32)
+    ids[-1] = -1
+    rw = torch.softmax(torch.randn(tokens, 8, device=device), -1) * 8
+
+    expected = triton_op(x, ids, rw)
+    actual = b12x_op(x, ids, rw)
+    assert torch.isfinite(actual).all()
+    assert torch.count_nonzero(actual[-1]) == 0
+    cos = torch.nn.functional.cosine_similarity(actual.float().flatten(), expected.float().flatten(), dim=0).item()
+    assert cos > 0.999, f"layer={layer} compression={compression} tokens={tokens} cos={cos:.6f}"
+
+    # Bit-exact CUDA graph replay check.
+    stream = torch.cuda.Stream(device=device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(stream):
+        _ = b12x_op(x, ids, rw)
+    torch.cuda.current_stream(device).wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graphed = b12x_op(x, ids, rw)
+    x.normal_(std=0.25)
+    eager = b12x_op(x, ids, rw)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(graphed, eager, rtol=0, atol=0)
+    graph.reset()

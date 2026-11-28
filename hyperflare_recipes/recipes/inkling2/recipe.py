@@ -10,7 +10,7 @@ from ignition.declaration import Checkpoint, RankCosts, RankUsage, Recipe, Sampl
 from ignition.parameters import RecipeParameters, SpeculationParameters, VisionParameters
 from ignition.preparation.bootstrap import common_preparation_kwargs
 
-from hyperflare_recipes.parameters import DraftQuantizationParameters, NativeDenseActivationsParameters
+from hyperflare_recipes.parameters import DraftQuantizationParameters, ExpertScaleCompressionParameters, NativeDenseActivationsParameters
 
 from .frontend import SAMPLING_DEFAULTS
 
@@ -21,6 +21,7 @@ class Inkling2Parameters(RecipeParameters):
 
     native_dense_activations: NativeDenseActivationsParameters = NativeDenseActivationsParameters()
     draft_quantization: DraftQuantizationParameters | None = None
+    expert_scale_compression: ExpertScaleCompressionParameters = ExpertScaleCompressionParameters()
 
 
 def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False,
@@ -83,6 +84,7 @@ MINI_RECIPE = replace(RECIPE, name="inkling2_mini", served_model_name="inkling-2
         )),
     checkpoints=(Checkpoint(alias="inkling-2-mini", repository="thinkingmachines/Inkling-2-Mini",
         revision="ed40e7da625f594fc9c4990f5f66be24873c22d7", architecture="Inkling2LoopForConditionalGeneration",
-        stored_bytes=19_525_870_752, device_bytes=20_263_810_112, draft_bytes=737_939_360),),
+        stored_bytes=19_525_870_752, device_bytes=20_263_810_112, draft_bytes=737_939_360,
+        scale_compressed_device_bytes=MappingProxyType({"csf": 19_654_436_240})),),
     ranks=MappingProxyType({1: RankCosts(107_347_968, 2_621_440, 3 << 30)}),
     plain_ranks=MappingProxyType({1: RankCosts(98_435_072, 2_097_152, 3 << 30)}))
