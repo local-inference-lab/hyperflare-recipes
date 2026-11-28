@@ -7,12 +7,24 @@ from dataclasses import dataclass, replace
 from types import MappingProxyType
 
 from ignition.declaration import Checkpoint, RankCosts, RankUsage, Recipe, SamplingDefaults
-from ignition.parameters import RecipeParameters, SpeculationParameters, VisionParameters
+from ignition.parameters import ParameterContext, RecipeParameters, SpeculationParameters, VisionParameters
 from ignition.preparation.bootstrap import common_preparation_kwargs
 
-from hyperflare_recipes.parameters import DraftQuantizationParameters, NativeDenseActivationsParameters
+from hyperflare_recipes.parameters import (
+    DraftQuantizationParameters,
+    NativeDenseActivationsParameters,
+    OnlineMXFP8Parameters,
+)
 
 from .frontend import SAMPLING_DEFAULTS
+
+# Online MXFP8 weight savings measured on RTX 5090 (Inkling-2-Mini, TP=1):
+# - attention: 24 layers x fused QKVGR + O_proj BF16 -> MXFP8 (609,429,504 B / 581.2 MiB)
+# - all: attention + 201,024 x 2,304 lm_head BF16 -> MXFP8 (1,043,948,032 B / 995.6 MiB)
+MINI_ONLINE_MXFP8_SAVINGS = MappingProxyType({
+    "attention": 609_429_504,
+    "all": 1_043_948_032,
+})
 
 
 @dataclass(frozen=True)
@@ -20,7 +32,24 @@ class Inkling2Parameters(RecipeParameters):
     """Preparation parameters for Inkling 2 checkpoints."""
 
     native_dense_activations: NativeDenseActivationsParameters = NativeDenseActivationsParameters()
+    online_mxfp8: OnlineMXFP8Parameters = OnlineMXFP8Parameters(
+        default_scope="attention",
+        supported_scopes=("attention", "all"),
+    )
     draft_quantization: DraftQuantizationParameters | None = None
+
+    def adjust_weights_bytes(self, weights_bytes: int, context: ParameterContext) -> int:
+        weights_bytes = super().adjust_weights_bytes(weights_bytes, context)
+        if (
+            self.online_mxfp8.enabled
+            and context.checkpoint is not None
+            and context.checkpoint.alias == "inkling-2-mini"
+            and context.world_size is not None
+        ):
+            saving = MINI_ONLINE_MXFP8_SAVINGS.get(self.online_mxfp8.effective_scope, 0)
+            if saving > 0:
+                weights_bytes = max(0, weights_bytes - saving // context.world_size)
+        return weights_bytes
 
 
 def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False,

@@ -15,7 +15,7 @@ from ignition.preparation.examples import declaration_tensor
 from .decoder import PreparedDecoder, PreparedLayer, ResidualState, reduction_dtype
 from .loop import PreparedCrossPassRouter, PreparedMessageGate, PreparedSharedQKVNormCat
 from .residual import PreparedResidualMix
-from .vocabulary import PreparedLogits, embedding_rows
+from .vocabulary import PreparedLogits, embedding_rows, head_rows
 
 
 class PreparedLoopLayer(PreparedLayer):
@@ -134,9 +134,10 @@ class PreparedLoopDecoder(PreparedDecoder):
             num_cross_pass_streams=num_streams if pass_index > 0 else 0)
             for visit, (index, pass_index) in enumerate(self.visits)]
         self.logits = PreparedLogits(weights.head, text, weights.rank, tokens=samples,
-                                     session=session, name=name + ".logits", examples=examples)
-        local = example("local_logits", (samples, weights.head.shape[0]), torch.float32)
-        gathered = example("gathered_logits", (samples, weights.head.shape[0] * weights.world), torch.float32)
+                                     session=session, name=name + ".logits", workspace=workspace, examples=examples)
+        vocab_cols = head_rows(weights.head)
+        local = example("local_logits", (samples, vocab_cols), torch.float32)
+        gathered = example("gathered_logits", (samples, vocab_cols * weights.world), torch.float32)
         self.gather = PreparedAllGather(local.view(torch.bfloat16), gathered.view(torch.bfloat16),
             runtime=vocabulary_runtime, coordinator=coordinator, session=session,
             name=name + ".logit_gather").functional(session=session)
