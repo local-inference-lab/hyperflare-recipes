@@ -46,8 +46,22 @@ class DFlash2Preparation:
         if type(block_size) is not int or not width <= block_size <= 16:
             raise ValueError("DFlash2 proposal block must cover the verification width through sixteen tokens")
         self.block_size, self.logit_offset = block_size, 1
+        device = pool.backing.device
+        copy_width = max(7, width - 1)
+        self.copy_ids = torch.full((requests.capacity, copy_width), -1, dtype=torch.int64, device=device)
+        self.copy_count = torch.zeros(requests.capacity, dtype=torch.int32, device=device)
+        self.copy_expected = torch.full((requests.capacity,), -1, dtype=torch.int64, device=device)
+        self.copy_generation = torch.zeros(requests.capacity, dtype=torch.int64, device=device)
         self.draft_scratch = DraftScratch.allocate(weights.config.draft, weights.shard,
-            requests.capacity * block_size, pool.backing.device, block_size=block_size)
+            requests.capacity * block_size, device, block_size=block_size)
+
+    def buffers(self):
+        return {
+            "copy_token_ids": self.copy_ids,
+            "copy_token_count": self.copy_count,
+            "copy_expected_consumed": self.copy_expected,
+            "copy_generation": self.copy_generation,
+        }
 
     def round(self, batch, width, name, *, target_token_capacity=None):
         from .parallel_draft import PreparedParallelDraftRound
