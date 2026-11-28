@@ -152,8 +152,9 @@ def _cpu_scale_columns(source, weight, out):
 @pytest.mark.parametrize("subchunks", [1, 2])
 @pytest.mark.parametrize("aux_stream", ["attn_res", "prefix"])
 @pytest.mark.parametrize("split_moe,split_kda", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("aux_layers", [(1, 3, 4), ()])
 def test_row_sharded_prefill_matches_serial_decoder_bit_exact_across_all_ranks(
-    monkeypatch, subchunks, aux_stream, split_moe, split_kda
+    monkeypatch, subchunks, aux_stream, split_moe, split_kda, aux_layers
 ):
     """Verify exact bit-for-bit parity of row-sharded prefill (M=2, subchunks=1,2) vs serial decoder."""
     monkeypatch.setattr(kimi_residual.ResidualStream, "mix", _cpu_mix)
@@ -172,7 +173,6 @@ def test_row_sharded_prefill_matches_serial_decoder_bit_exact_across_all_ranks(
     eps = 1e-5
     block_size = 2
     layer_kinds = ("kda", "kda", "kda", "dsa", "kda")  # Dense L0 + KDA->KDA->DSA->KDA MoE transitions
-    aux_layers = (1, 3, 4)
 
     # Deterministic input embedding shared across ranks.
     embedding_full = torch.randn((tokens, hidden), dtype=torch.bfloat16)
@@ -455,7 +455,10 @@ def test_row_sharded_prefill_matches_serial_decoder_bit_exact_across_all_ranks(
         r_sampled, r_logits, r_aux, _ = sharded_res[rank]
         assert torch.equal(r_sampled, s_sampled), f"sampled hidden mismatch on rank {rank}"
         assert torch.equal(r_logits, s_logits), f"logits mismatch on rank {rank}"
-        assert torch.equal(r_aux, s_aux), f"auxiliary mismatch on rank {rank}"
+        if aux_layers:
+            assert torch.equal(r_aux, s_aux), f"auxiliary mismatch on rank {rank}"
+        else:
+            assert r_aux is None and s_aux is None
 
 
 @pytest.mark.parametrize(
@@ -583,3 +586,88 @@ def test_prepared_decoder_selects_row_shard_pipeline_for_1024_through_4096(
     else:
         assert dec.shard_rows is None
         assert dec.final_gather is None
+
+
+@pytest.mark.parametrize("sources,write", [(0, -1), (0, 0), (3, -1), (3, 3)])
+def test_aux_residual_mix_compiled_graph_matches_residual_stream_bit_exact(sources, write):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    from ignition.preparation.compilation import compile_forward
+
+    device = torch.device("cuda:0")
+    aux = torch.cuda.Stream(device=device)
+    rows, hidden, blocks_n = 128, 7168, 8
+    half = rows // 2
+    g = torch.Generator(device=device).manual_seed(91 + write + sources)
+    prefix_orig = torch.randn((rows, hidden), dtype=torch.bfloat16, device=device, generator=g)
+    blocks_orig = torch.randn((rows, blocks_n, hidden), dtype=torch.bfloat16, device=device, generator=g)
+    delta = torch.randn((half, hidden), dtype=torch.bfloat16, device=device, generator=g)
+    score = torch.randn((hidden,), dtype=torch.float32, device=device, generator=g)
+    norm = torch.randn((hidden,), dtype=torch.bfloat16, device=device, generator=g)
+
+    prefix_ref = prefix_orig.clone()
+    blocks_ref = blocks_orig.clone()
+    out_ref = torch.empty((half, hidden), dtype=torch.bfloat16, device=device)
+    kimi_residual.ResidualStream(prefix_ref[half:], blocks_ref[half:], out_ref).mix(
+        delta, kimi_residual.ADD, sources=sources, write=write,
+        score=score, norm=norm, eps=1e-6, output_eps=1e-6,
+    )
+
+    prefix_cand = prefix_orig.clone()
+    blocks_cand = blocks_orig.clone()
+
+    class _AuxMixStep:
+        def __init__(self):
+            self.saved = torch.empty((half, hidden), dtype=torch.bfloat16, device=device)
+            self.ws = torch.empty(0, dtype=torch.uint8, device=device)
+
+        def __call__(self):
+            out = torch.empty((half, hidden), dtype=torch.bfloat16, device=device)
+            kimi_decoder._aux_residual_mix(
+                prefix_cand[half:], delta, blocks_cand[half:], score, norm, out,
+                1e-6, 1e-6, sources, write, kimi_residual.ADD, aux.cuda_stream,
+            )
+            kimi_decoder._join_shared_expert(prefix_cand, out, [out], self.ws, aux.cuda_stream)
+            self.saved.copy_(out)
+
+    step = _AuxMixStep()
+    compiled = compile_forward(step)
+    # compile_forward executes one warmup call on caller-owned state; restore before checking.
+    prefix_cand.copy_(prefix_orig)
+    blocks_cand.copy_(blocks_orig)
+    step.saved.fill_(float("nan"))
+    torch.cuda.synchronize(device)
+    compiled()
+    torch.cuda.synchronize(device)
+    assert torch.equal(step.saved, out_ref)
+    assert torch.equal(prefix_cand, prefix_ref)
+    assert torch.equal(blocks_cand, blocks_ref)
+
+    # Verify CUDA graph capture + replay with changed delta and zero replay allocations.
+    prefix_ref2 = prefix_orig.clone()
+    blocks_ref2 = blocks_orig.clone()
+    delta2 = torch.randn((half, hidden), dtype=torch.bfloat16, device=device, generator=g)
+    out_ref2 = torch.empty((half, hidden), dtype=torch.bfloat16, device=device)
+    kimi_residual.ResidualStream(prefix_ref2[half:], blocks_ref2[half:], out_ref2).mix(
+        delta2, kimi_residual.ADD, sources=sources, write=write,
+        score=score, norm=norm, eps=1e-6, output_eps=1e-6,
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        compiled()
+    torch.cuda.synchronize(device)
+    try:
+        prefix_cand.copy_(prefix_orig)
+        blocks_cand.copy_(blocks_orig)
+        delta.copy_(delta2)
+        step.saved.fill_(float("nan"))
+        torch.cuda.synchronize(device)
+        before = torch.cuda.memory_stats(device)["allocation.all.allocated"]
+        graph.replay()
+        torch.cuda.synchronize(device)
+        assert torch.cuda.memory_stats(device)["allocation.all.allocated"] == before
+        assert torch.equal(step.saved, out_ref2)
+        assert torch.equal(prefix_cand, prefix_ref2)
+        assert torch.equal(blocks_cand, blocks_ref2)
+    finally:
+        graph.reset()
