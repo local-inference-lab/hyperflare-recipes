@@ -390,7 +390,6 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
                 gather_bytes=gather_bytes, ring=config.roce_ring, ring_open=config.roce_chain, core_storage=core_storage, varlen_bytes=varlen_bytes)
         elif group is not None:
             from .stack import (
-                DMA_PREFILL_TOKENS,
                 PIPELINED_PREFILL_TOKENS,
                 QUARTER_MLP_PREFILL_TOKENS,
                 ROW_SHARD_ATTENTION_MIN_TOKENS_PCIE,
