@@ -102,7 +102,11 @@ class PreparedLayer(torch.nn.Module):
                    else self.input_mix((*state.blocks, state.partial)))
         _, attention_partial, attention_values = self.attention.attend(streams, m)
         attention_raw = self.reduction(attention_partial.to(self.reduction_dtype)).to(torch.bfloat16)
-        attention, attention_previous = self.attention_convolution(attention_raw, m)
+        if self.mode == "decode":
+            attention = self.attention_convolution.forward_and_commit(attention_raw, m)
+            attention_previous = None
+        else:
+            attention, attention_previous = self.attention_convolution(attention_raw, m)
         if self.layer % t.residual_block == 0:
             mlp_input = self.mlp_mix((*state.blocks, state.partial, attention))[0]
         else:
@@ -110,10 +114,14 @@ class PreparedLayer(torch.nn.Module):
         routes = self.router(self.router_projection(mlp_input.float()), num_valid_tokens=m.live_counts[:1])
         expert_partial = self.experts(mlp_input, routes.ids, routes.weights)
         mlp_raw = self.reduction(expert_partial.to(self.reduction_dtype)).to(torch.bfloat16)
-        mlp, mlp_previous = self.mlp_convolution(mlp_raw, m)
-        if self.mode != "verify":
-            self.attention_convolution.commit(attention_previous, attention_raw, m)
-            self.mlp_convolution.commit(mlp_previous, mlp_raw, m)
+        if self.mode == "decode":
+            mlp = self.mlp_convolution.forward_and_commit(mlp_raw, m)
+            mlp_previous = None
+        else:
+            mlp, mlp_previous = self.mlp_convolution(mlp_raw, m)
+            if self.mode != "verify":
+                self.attention_convolution.commit(attention_previous, attention_raw, m)
+                self.mlp_convolution.commit(mlp_previous, mlp_raw, m)
         records = (attention_values, attention_previous, attention_raw, mlp_previous, mlp_raw)
         if self.layer % t.residual_block == 0:
             state = ResidualState((*state.blocks, state.partial), (attention.float() + mlp.float()).to(torch.bfloat16))

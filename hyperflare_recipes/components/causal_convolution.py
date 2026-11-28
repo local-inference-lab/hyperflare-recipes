@@ -84,6 +84,63 @@ def _commit(Previous, X, Starts, QueryStarts, Slots, Counts, History,
         tl.store(History + slot * HS0 + lag * HS1 + channel, value, (channel < CHANNELS) & live)
 
 
+@triton.jit
+def _forward_and_commit_decode(
+    X, Weight, Dynamic, History, Starts, QueryStarts, Slots, Lengths, Y,
+    TOKENS: tl.constexpr, SEQS: tl.constexpr, CHANNELS: tl.constexpr, WIDTH: tl.constexpr,
+    XS: tl.constexpr, WS0: tl.constexpr, WS1: tl.constexpr,
+    DS0: tl.constexpr, DS1: tl.constexpr, DS2: tl.constexpr,
+    HS0: tl.constexpr, HS1: tl.constexpr, DYNAMIC: tl.constexpr,
+    GROUP: tl.constexpr, SCALE: tl.constexpr, BLOCK: tl.constexpr,
+):
+    """Single-launch decode convolution with in-place history shift (at most one token per request)."""
+    req = tl.program_id(0)
+    channel = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    col_live = channel < CHANNELS
+
+    total_live = tl.load(QueryStarts + SEQS)
+    if req >= total_live and req < TOKENS:
+        tl.store(Y + req.to(tl.int64) * CHANNELS + channel, tl.zeros((BLOCK,), dtype=tl.bfloat16), col_live)
+
+    length = tl.load(Lengths + req)
+    slot = tl.load(Slots + req).to(tl.int64)
+    live = (length > 0) & (slot >= 0)
+    if live:
+        start = tl.load(Starts + req)
+        tok = tl.load(QueryStarts + req).to(tl.int64)
+        cur_bf16 = tl.load(X + tok * XS + channel, col_live, other=0)
+        cur = cur_bf16.to(tl.float32)
+
+        h_base = History + slot * HS0 + channel
+        total = tl.full((BLOCK,), 0., tl.float32)
+        for tap in tl.static_range(WIDTH):
+            lag = tap if DYNAMIC else WIDTH - 1 - tap
+            valid = (start - lag) >= 0
+            if lag == 0:
+                val = cur
+            else:
+                val = tl.load(h_base + (WIDTH - 1 - lag) * HS1, col_live & valid, other=0).to(tl.float32)
+            if DYNAMIC:
+                w = tl.load(Weight + tap * WS0 + channel * WS1, col_live, other=0).to(tl.float32)
+                delta = tl.load(Dynamic + tok * DS0 + (channel // GROUP) * DS1 + tap * DS2, col_live, other=0).to(tl.float32)
+                w = w + delta
+            else:
+                w = tl.load(Weight + channel * WS0 + tap * WS1, col_live, other=0).to(tl.float32)
+            prod = val * w
+            if tap == 0:
+                total = prod
+            else:
+                total = total + prod
+        res = (total + cur) * SCALE
+        tl.store(Y + tok * CHANNELS + channel, res.to(tl.bfloat16), col_live)
+
+        # Shift history left by one in ascending order so each read precedes its slot's overwrite.
+        for lag in tl.static_range(WIDTH - 2):
+            older = tl.load(h_base + (lag + 1) * HS1, col_live, other=0)
+            tl.store(h_base + lag * HS1, tl.where(start - (WIDTH - 2 - lag) >= 0, older, 0), col_live)
+        tl.store(h_base + (WIDTH - 2) * HS1, tl.where(start >= 0, cur_bf16, 0), col_live)
+
+
 class PreparedCausalConvolution:
     """Residual-scaled convolution and accepted-prefix raw-history commits.
 
@@ -163,3 +220,28 @@ class PreparedCausalConvolution:
             previous, source, metadata.starts, metadata.query_start_loc, metadata.state_rows, counts, self.history,
             source.shape[0], self.channels, self.width - 1, source.stride(0),
             self.history.stride(0), self.history.stride(1), 128, enable_fp_fusion=False)
+
+    def forward_and_commit(self, source, metadata, *, dynamic=None):
+        """Fused single-launch forward and in-place history commit for single-token-per-request decode."""
+        self._source(source)
+        if self.dynamic_heads:
+            if (dynamic is None or dynamic.shape != (source.shape[0], self.dynamic_heads, self.width)
+                    or dynamic.dtype != torch.bfloat16 or dynamic.device != source.device):
+                raise ValueError("dynamic convolution requires matching BF16 per-head tap coefficients")
+            ds = dynamic.stride()
+        else:
+            if dynamic is not None:
+                raise ValueError("static convolution does not consume dynamic tap coefficients")
+            ds = (0, 0, 0)
+        tokens, requests = source.shape[0], metadata.state_rows.numel()
+        if tokens != requests:
+            raise ValueError("fused decode convolution requires one token capacity per request row")
+        output = torch.empty_like(source, memory_format=torch.contiguous_format)
+        torch.library.wrap_triton(_forward_and_commit_decode)[(requests, triton.cdiv(self.channels, 128))](
+            source, self.weight, dynamic, self.history, metadata.starts, metadata.query_start_loc,
+            metadata.state_rows, metadata.lengths, output,
+            tokens, requests, self.channels, self.width, source.stride(0), *self.weight.stride(),
+            *ds, self.history.stride(0), self.history.stride(1), bool(self.dynamic_heads),
+            self.channels // self.dynamic_heads if self.dynamic_heads else 1, self.scale, 128,
+            enable_fp_fusion=False)
+        return output

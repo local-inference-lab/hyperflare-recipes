@@ -306,12 +306,17 @@ class PreparedAttention(torch.nn.Module):
         heads, kv_heads, dim = self.heads, self.kv_heads, self.dim
         key_raw, value_raw = parts["key"], parts["value"]
         dynamic_shape = (tokens, kv_heads, t.convolution_width)
-        key, key_previous = self.key_convolution(key_raw, m,
-            dynamic=None if self.local else parts["key_lags"].reshape(dynamic_shape))
-        value, value_previous = self.value_convolution(value_raw, m,
-            dynamic=None if self.local else parts["value_lags"].reshape(dynamic_shape))
+        key_dynamic = None if self.local else parts["key_lags"].reshape(dynamic_shape)
+        value_dynamic = None if self.local else parts["value_lags"].reshape(dynamic_shape)
+        if self.mode == "decode":
+            key = self.key_convolution.forward_and_commit(key_raw, m, dynamic=key_dynamic)
+            value = self.value_convolution.forward_and_commit(value_raw, m, dynamic=value_dynamic)
+            key_previous = value_previous = None
+        else:
+            key, key_previous = self.key_convolution(key_raw, m, dynamic=key_dynamic)
+            value, value_previous = self.value_convolution(value_raw, m, dynamic=value_dynamic)
         tau = None if self.local else log_scaling(m.positions, t.log_scaling_floor, t.log_scaling_alpha)
-        if self.mode != "verify":
+        if self.mode == "prefill":
             self.key_convolution.commit(key_previous, key_raw, m)
             self.value_convolution.commit(value_previous, value_raw, m)
         query = l2_clip(parts["query"].reshape(tokens, heads, dim), t.qk_clip, scale=self.weights.query_clip_scale,

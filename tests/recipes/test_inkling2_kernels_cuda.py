@@ -197,7 +197,7 @@ def _reference_controller(dest, s0, s1, query, down, gain, forget, norm, eps):
 
 
 @torch.no_grad()
-@pytest.mark.parametrize("tokens", [1, 8, 64, 512])
+@pytest.mark.parametrize("tokens", [1, 2, 4, 8, 16, 64, 512])
 def test_cross_pass_router_and_fused_message_gates_match_reference(tokens):
     device = torch.device("cuda:0")
     torch.manual_seed(43)
@@ -243,36 +243,58 @@ def test_cross_pass_router_and_fused_message_gates_match_reference(tokens):
         assert rel_l2.item() <= 1.5e-2, f"tokens={tokens} stream={idx} rel_l2={rel_l2.item()}"
 
     # Shared-hidden Q/K/V path (sliding loop layers; exercises _norm_cat_qkv_shared_hidden and _gate_mix_rms_norm_qkv_shared).
+    qkv_weights = tuple(
+        GateWeights(
+            down=raw_weights[idx][0],
+            forget_gain=torch.cat((raw_weights[idx][2], raw_weights[idx][1]), dim=0).contiguous(),
+            forget_t=raw_weights[idx][2].t().contiguous(),
+            gain_t=raw_weights[idx][1].t().contiguous(),
+        )
+        for idx in range(3)
+    )
     shared_gates = [
         PreparedMessageGate(
-            GateWeights(
-                down=raw_weights[idx][0],
-                forget_gain=torch.cat((raw_weights[idx][2], raw_weights[idx][1]), dim=0).contiguous(),
-                forget_t=raw_weights[idx][2].t().contiguous(),
-                gain_t=raw_weights[idx][1].t().contiguous(),
-            ),
+            qkv_weights[idx],
             shared_norm, stream_idx=idx, num_streams=num_streams,
             tokens=tokens, hidden=hidden, eps=eps,
         )
         for idx in range(3)
     ]
     qkv_cat = PreparedSharedQKVNormCat(shared_norm, base_stream=0, num_streams=num_streams,
-                                       tokens=tokens, hidden=hidden, eps=eps, device=device)
-    cat_q, cat_k, cat_v = qkv_cat(shared_dest, n0, n1, probs)
-    if qkv_cat.use_fused_mix:
-        outs = qkv_cat.mix_qkv(shared_dest, n0, n1, probs,
-                               shared_gates[0].compute_fg(cat_q),
-                               shared_gates[1].compute_fg(cat_k),
-                               shared_gates[2].compute_fg(cat_v))
+                                       tokens=tokens, hidden=hidden, eps=eps, device=device,
+                                       gates=qkv_weights)
+    if qkv_cat.use_fused_decode:
+        outs = qkv_cat.apply_fused_decode(shared_dest, n0, n1, probs)
     else:
-        outs = (
-            shared_gates[0].apply_with_cat(shared_dest, cat_q, n0, n1, probs),
-            shared_gates[1].apply_with_cat(shared_dest, cat_k, n0, n1, probs),
-            shared_gates[2].apply_with_cat(shared_dest, cat_v, n0, n1, probs),
-        )
+        cat_q, cat_k, cat_v = qkv_cat(shared_dest, n0, n1, probs)
+        if qkv_cat.use_fused_mix:
+            outs = qkv_cat.mix_qkv(shared_dest, n0, n1, probs,
+                                   shared_gates[0].compute_fg(cat_q),
+                                   shared_gates[1].compute_fg(cat_k),
+                                   shared_gates[2].compute_fg(cat_v))
+        else:
+            outs = (
+                shared_gates[0].apply_with_cat(shared_dest, cat_q, n0, n1, probs),
+                shared_gates[1].apply_with_cat(shared_dest, cat_k, n0, n1, probs),
+                shared_gates[2].apply_with_cat(shared_dest, cat_v, n0, n1, probs),
+            )
     for idx in range(3):
         ref = _reference_controller(shared_dest, s0, s1, queries[idx], *raw_weights[idx], shared_norm, eps)
         cos = torch.nn.functional.cosine_similarity(outs[idx].float().flatten(), ref.float().flatten(), dim=0)
         rel_l2 = (outs[idx].float() - ref.float()).norm() / ref.float().norm()
         assert cos.item() >= 0.9999, f"shared tokens={tokens} stream={idx} cos={cos.item()}"
         assert rel_l2.item() <= 1.5e-2, f"shared tokens={tokens} stream={idx} rel_l2={rel_l2.item()}"
+
+    if qkv_cat.use_fused_decode:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            g_outs = qkv_cat.apply_fused_decode(shared_dest, n0, n1, probs)
+            g_mlp = gates[3](dests[3], n0, n1, probs)
+        allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+        for idx in range(3):
+            assert torch.equal(g_outs[idx], outs[idx])
+        assert torch.equal(g_mlp, gates[3](dests[3], n0, n1, probs))
+        graph.reset()

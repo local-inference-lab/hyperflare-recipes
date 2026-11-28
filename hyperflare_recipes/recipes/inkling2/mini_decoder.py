@@ -38,7 +38,8 @@ class PreparedLoopLayer(PreparedLayer):
             if len(weights.input_norms) == 1:
                 self.shared_qkv_cat = PreparedSharedQKVNormCat(weights.input_norms[0],
                     base_stream=base, num_streams=num_cross_pass_streams, tokens=tokens,
-                    hidden=text.hidden, eps=text.eps, device=weights.router.device, examples=examples)
+                    hidden=text.hidden, eps=text.eps, device=weights.router.device, examples=examples,
+                    gates=(ctrl.q, ctrl.k, ctrl.v))
 
     def _build_experts(self, source, weights, routes, *, tokens, mode, session, workspace, name, example):
         del source, routes, mode, session, workspace, name, example
@@ -54,26 +55,33 @@ class PreparedLoopLayer(PreparedLayer):
             dests = self.input_mix.mix((*state.blocks, state.partial))
             if self.shared_qkv_cat is not None:
                 h = dests[0]
-                cat_q, cat_k, cat_v = self.shared_qkv_cat(h, n0, n1, probs)
-                if self.shared_qkv_cat.use_fused_mix:
-                    streams = self.shared_qkv_cat.mix_qkv(
-                        h, n0, n1, probs,
-                        self.gates[0].compute_fg(cat_q),
-                        self.gates[1].compute_fg(cat_k),
-                        self.gates[2].compute_fg(cat_v),
-                    )
+                if self.shared_qkv_cat.use_fused_decode:
+                    streams = self.shared_qkv_cat.apply_fused_decode(h, n0, n1, probs)
                 else:
-                    streams = (
-                        self.gates[0].apply_with_cat(h, cat_q, n0, n1, probs),
-                        self.gates[1].apply_with_cat(h, cat_k, n0, n1, probs),
-                        self.gates[2].apply_with_cat(h, cat_v, n0, n1, probs),
-                    )
+                    cat_q, cat_k, cat_v = self.shared_qkv_cat(h, n0, n1, probs)
+                    if self.shared_qkv_cat.use_fused_mix:
+                        streams = self.shared_qkv_cat.mix_qkv(
+                            h, n0, n1, probs,
+                            self.gates[0].compute_fg(cat_q),
+                            self.gates[1].compute_fg(cat_k),
+                            self.gates[2].compute_fg(cat_v),
+                        )
+                    else:
+                        streams = (
+                            self.gates[0].apply_with_cat(h, cat_q, n0, n1, probs),
+                            self.gates[1].apply_with_cat(h, cat_k, n0, n1, probs),
+                            self.gates[2].apply_with_cat(h, cat_v, n0, n1, probs),
+                        )
             else:
                 streams = tuple(gate(dest, n0, n1, probs)
                                 for gate, dest in zip(self.gates[:3], dests, strict=True))
         _, attention_partial, attention_values = self.attention.attend(streams, m)
         attention_raw = self.reduction(attention_partial.to(self.reduction_dtype)).to(torch.bfloat16)
-        attention, attention_previous = self.attention_convolution(attention_raw, m)
+        if self.mode == "decode":
+            attention = self.attention_convolution.forward_and_commit(attention_raw, m)
+            attention_previous = None
+        else:
+            attention, attention_previous = self.attention_convolution(attention_raw, m)
         sources = (*state.blocks, state.partial, attention) if self.layer % t.residual_block == 0 else (*state.blocks, state.partial)
         options = {} if self.layer % t.residual_block == 0 else dict(addend=attention)
         if cross_pass is None:
@@ -84,10 +92,14 @@ class PreparedLoopLayer(PreparedLayer):
         routes = self.router(self.router_projection(mlp_input.to(self.router_dtype)), num_valid_tokens=m.live_counts[:1])
         expert_partial = self.experts(mlp_input, routes.ids, routes.weights)
         mlp_raw = self.reduction(expert_partial.to(self.reduction_dtype)).to(torch.bfloat16)
-        mlp, mlp_previous = self.mlp_convolution(mlp_raw, m)
-        if self.mode != "verify":
-            self.attention_convolution.commit(attention_previous, attention_raw, m)
-            self.mlp_convolution.commit(mlp_previous, mlp_raw, m)
+        if self.mode == "decode":
+            mlp = self.mlp_convolution.forward_and_commit(mlp_raw, m)
+            mlp_previous = None
+        else:
+            mlp, mlp_previous = self.mlp_convolution(mlp_raw, m)
+            if self.mode != "verify":
+                self.attention_convolution.commit(attention_previous, attention_raw, m)
+                self.mlp_convolution.commit(mlp_previous, mlp_raw, m)
         records = (attention_values, attention_previous, attention_raw, mlp_previous, mlp_raw)
         if self.layer % t.residual_block == 0:
             state = ResidualState((*state.blocks, state.partial), (attention.float() + mlp.float()).to(torch.bfloat16))
