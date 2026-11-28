@@ -224,6 +224,39 @@ class PreparedAttention(torch.nn.Module):
             eps=text.eps, session=session, name=f"{name}.value_norm").functional()
         projection = example("inkling.attention.projection0", (tokens, self.columns.widths()[0]))
         channels = self.heads * self.dim
+        self._q_clip_opts = dict(
+            HEADS=self.heads, DIM=self.dim, BLOCK_D=triton.next_power_of_2(self.dim),
+            ROW_STRIDE=projection.stride(0), THRESHOLD=float(text.qk_clip), EPS=1e-6,
+            HAS_SCALE=True, HAS_TAU=not self.local, num_warps=4,
+        )
+        self._k_clip_opts = dict(
+            HEADS=self.kv_heads, DIM=self.dim, BLOCK_D=triton.next_power_of_2(self.dim),
+            ROW_STRIDE=self.kv_heads * self.dim, THRESHOLD=float(text.qk_clip), EPS=1e-6,
+            HAS_SCALE=False, HAS_TAU=False, num_warps=4,
+        )
+        self._r_clip_opts = dict(
+            HEADS=self.heads, DIM=RELATIVE_RANK, BLOCK_D=triton.next_power_of_2(RELATIVE_RANK),
+            ROW_STRIDE=projection.stride(0), THRESHOLD=float(text.relative_clip), EPS=1e-6,
+            HAS_SCALE=True, HAS_TAU=not self.local, num_warps=1,
+        )
+        tau_ex = example("inkling.attention.clip_tau", (tokens,), torch.float32)
+        rel_out_ex = example("inkling.attention.relative_factor", (tokens, self.heads, RELATIVE_RANK))
+        q_tau_ex = metadata.positions if self.local else tau_ex
+        self._q_clip_compiled = prepare_triton(
+            _l2_clip_kernel,
+            (projection[:, :channels], weights.query_clip_scale, q_tau_ex, query),
+            (tokens, self.heads, 1), **self._q_clip_opts,
+        ).compiled
+        self._k_clip_compiled = prepare_triton(
+            _l2_clip_kernel,
+            (key.view(tokens, -1), weights.query_clip_scale, metadata.positions, key),
+            (tokens, self.kv_heads, 1), **self._k_clip_opts,
+        ).compiled
+        self._r_clip_compiled = prepare_triton(
+            _l2_clip_kernel,
+            (projection[:, :self.heads * RELATIVE_RANK], weights.relative_clip_scale, q_tau_ex, rel_out_ex),
+            (tokens, self.heads, 1), **self._r_clip_opts,
+        ).compiled
         self.gate = PreparedHeadGate(attended.view(tokens, channels, 1), projection[:, channels:2 * channels],
             session=session, name=f"{name}.gate").functional(session=session)
         slots = example("inkling.attention.slots", (tokens,), torch.int64)
@@ -314,12 +347,27 @@ class PreparedAttention(torch.nn.Module):
         if self.mode != "verify":
             self.key_convolution.commit(key_previous, key_raw, m)
             self.value_convolution.commit(value_previous, value_raw, m)
-        query = l2_clip(parts["query"].reshape(tokens, heads, dim), t.qk_clip, scale=self.weights.query_clip_scale,
-                        tau=tau)
-        key = l2_clip(key.reshape(tokens, kv_heads, dim), t.qk_clip)
+        tau_arg = m.positions if tau is None else tau
+        query = torch.empty((tokens, heads, dim), dtype=torch.bfloat16, device=key.device)
+        launch_triton(
+            _l2_clip_kernel, self._q_clip_compiled,
+            (parts["query"], self.weights.query_clip_scale, tau_arg, query),
+            (tokens, heads, 1), **self._q_clip_opts,
+        )
+        key_clipped = torch.empty((tokens, kv_heads, dim), dtype=torch.bfloat16, device=key.device)
+        launch_triton(
+            _l2_clip_kernel, self._k_clip_compiled,
+            (key, self.weights.query_clip_scale, m.positions, key_clipped),
+            (tokens, kv_heads, 1), **self._k_clip_opts,
+        )
+        key = key_clipped
         value = self.value_norm(value.view(-1, dim)).view(tokens, kv_heads, dim)
-        relative = l2_clip(parts["relative"].reshape(tokens, heads, RELATIVE_RANK), t.relative_clip,
-                           scale=self.weights.relative_clip_scale, tau=tau)
+        relative = torch.empty((tokens, heads, RELATIVE_RANK), dtype=torch.bfloat16, device=key.device)
+        launch_triton(
+            _l2_clip_kernel, self._r_clip_compiled,
+            (parts["relative"], self.weights.relative_clip_scale, tau_arg, relative),
+            (tokens, heads, 1), **self._r_clip_opts,
+        )
         return dict(query=query, key=key, value=value, relative=relative, sink=parts["sink"].to(dtype=torch.float32, memory_format=torch.contiguous_format),
                     gate=parts["gate"].reshape(tokens, heads, dim), key_raw=key_raw, value_raw=value_raw,
                     key_previous=key_previous, value_previous=value_previous)
@@ -412,6 +460,33 @@ class PreparedAttention(torch.nn.Module):
         self.value_convolution.commit(values["value_previous"], values["value_raw"], metadata, counts=counts)
         if self.local:
             self._retain_kv(values["key"], values["value"], counts.int(), metadata)
+
+
+@triton.jit
+def _l2_clip_kernel(
+    Src, Scale, Tau, Dst,
+    HEADS: tl.constexpr, DIM: tl.constexpr, BLOCK_D: tl.constexpr,
+    ROW_STRIDE: tl.constexpr, THRESHOLD: tl.constexpr, EPS: tl.constexpr,
+    HAS_SCALE: tl.constexpr, HAS_TAU: tl.constexpr,
+):
+    """Fused strided L2-clip matching `arithmetic.l2_clip` without intermediate contiguous copies."""
+    t = tl.program_id(0).to(tl.int64)
+    h = tl.program_id(1).to(tl.int64)
+    cols = tl.arange(0, BLOCK_D)
+    mask = cols < DIM
+    src_off = t * ROW_STRIDE + h * DIM + cols
+    x = tl.load(Src + src_off, mask=mask, other=0.0).to(tl.float32)
+    if HAS_SCALE:
+        s = tl.load(Scale + h * DIM + cols, mask=mask, other=0.0).to(tl.float32)
+        x = x * s
+    norm = tl.sqrt(tl.sum(x * x, axis=0))
+    factor = tl.minimum(THRESHOLD / (norm + EPS), 1.0)
+    y = (x * factor).to(tl.bfloat16)
+    if HAS_TAU:
+        tau = tl.load(Tau + t).to(tl.float32)
+        y = (y.to(tl.float32) * tau).to(tl.bfloat16)
+    dst_off = (t * HEADS + h) * DIM + cols
+    tl.store(Dst + dst_off, y, mask=mask)
 
 
 @triton.jit
