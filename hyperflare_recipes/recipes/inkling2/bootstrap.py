@@ -357,11 +357,14 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
                     add(name, forward, mode, rows, capacity if mode == "prefill" else 1, fields, enabled)
         if speculation is not None:
             from hyperflare_recipes.components.parallel_draft import PreparedParallelDraftRound
+            if hasattr(speculation, "buffers"):
+                buffers.update(speculation.buffers())
+            speculative_inputs = (*forward_inputs, *speculation.buffers()) if hasattr(speculation, "buffers") else forward_inputs
             for batch, width, packed in sorted(config.speculative_round_shapes, key=lambda x: (x[2], x[0]), reverse=True):
                 name = f"speculative{batch}x{width}-tokens{packed}"
                 forward = PreparedParallelDraftRound(speculation, batch, width, name, target_token_capacity=packed)
                 forward.prepare()
-                add(name, forward, "speculative", batch, width, forward_inputs, True, packed)
+                add(name, forward, "speculative", batch, width, speculative_inputs, True, packed)
         row_inputs = ("request_state_rows", "row_slot_ids", "row_generations", "live_rows")
         for enabled in serving_modes(config.drafting, config.mtp_only):
             suffix = "-no-mtp" if config.drafting and not enabled else ""

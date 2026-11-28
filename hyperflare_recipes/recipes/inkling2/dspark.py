@@ -287,8 +287,22 @@ class SpeculativePreparation:
         self.rng = SpeculativeRngState.allocate(pool.backing.device, capacity=requests.capacity)
         self.generation, self.offset = (persistent_zeros(requests.generation.shape, requests.generation.dtype,
             requests.generation.device) for _ in range(2))
+        device = pool.backing.device
+        copy_width = max(7, draft_tokens)
+        self.copy_ids = torch.full((requests.capacity, copy_width), -1, dtype=torch.int64, device=device)
+        self.copy_count = torch.zeros(requests.capacity, dtype=torch.int32, device=device)
+        self.copy_expected = torch.full((requests.capacity,), -1, dtype=torch.int64, device=device)
+        self.copy_generation = torch.zeros(requests.capacity, dtype=torch.int64, device=device)
         self.draft_scratch = DraftScratch.allocate(weights.config, weights.shard,
-            requests.capacity * self.block_size, self.block_size, pool.backing.device)
+            requests.capacity * self.block_size, self.block_size, device)
+
+    def buffers(self):
+        return {
+            "copy_token_ids": self.copy_ids,
+            "copy_token_count": self.copy_count,
+            "copy_expected_consumed": self.copy_expected,
+            "copy_generation": self.copy_generation,
+        }
 
     def release_examples(self):
         self.scratch = self.draft_scratch = None
