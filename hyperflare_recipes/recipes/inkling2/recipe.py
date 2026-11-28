@@ -64,7 +64,7 @@ RECIPE = Recipe(name="inkling2", served_model_name="Inkling-2-Small-NVFP4", prep
                                           packed_verification=True, graph_budget=64),
         vision=VisionParameters(separable_encoder=True),
     ),
-    ranks=MappingProxyType({4: RankCosts(31_293_440, 655_360, 5 << 30)}),
+    ranks=MappingProxyType({4: RankCosts(31_293_440, 589_824, 5 << 30)}),
     plain_ranks=MappingProxyType({4: RankCosts(26_935_296, 524_288, 5 << 30)}))
 
 
@@ -84,5 +84,5 @@ MINI_RECIPE = replace(RECIPE, name="inkling2_mini", served_model_name="inkling-2
     checkpoints=(Checkpoint(alias="inkling-2-mini", repository="thinkingmachines/Inkling-2-Mini",
         revision="ed40e7da625f594fc9c4990f5f66be24873c22d7", architecture="Inkling2LoopForConditionalGeneration",
         stored_bytes=19_525_870_752, device_bytes=20_263_810_112, draft_bytes=737_939_360),),
-    ranks=MappingProxyType({1: RankCosts(107_347_968, 2_621_440, 3 << 30)}),
+    ranks=MappingProxyType({1: RankCosts(107_347_968, 2_359_296, 3 << 30)}),
     plain_ranks=MappingProxyType({1: RankCosts(98_435_072, 2_097_152, 3 << 30)}))

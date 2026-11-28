@@ -32,12 +32,12 @@ def test_target_and_draft_state_geometry(configuration):
     layout = continuation_layout(config.text, geometry, config.draft)
     assert (geometry.heads, geometry.kv_heads, geometry.ring) == (12, 2, 1152)
     assert config.text.global_layers == (5, 11, 17, 23, 29, 35, 41, 47)
-    assert sum(shape[0] for _, shape in page_specs(config.text, geometry, config.draft)) == 655360
-    assert layout.row_bytes == 31293440
+    assert sum(shape[0] for _, shape in page_specs(config.text, geometry, config.draft)) == 589824
+    assert layout.row_bytes == 29130752
     assert len([r for r in layout.regions if r.name.startswith('layer') and r.name.endswith('convolution')]) == 192
     for layer in (0, 1, 3, 4):
         assert layout.region(f'draft{layer}.key').shape == (1024, 2, 128)
-        assert layout.region(f'draft{layer}.key').dtype == torch.bfloat16
+        assert layout.region(f'draft{layer}.key').dtype == torch.float8_e4m3fn
     assert layout.region('draft.rnn_context').shape == (4608,)
     assert TensorParallelShard(3, 4).padded_partition(config.text.vocabulary, alignment=64) == (150912, 201216)
 

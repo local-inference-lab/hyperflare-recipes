@@ -134,12 +134,13 @@ def test_sequential_recurrent_draws_record_actual_q_and_reset_state(batch, depth
         graph.reset()
 
 
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @torch.no_grad()
-def test_accepted_context_replaces_proposals_and_preserves_zero_count_rows():
+def test_accepted_context_replaces_proposals_and_preserves_zero_count_rows(kv_dtype):
     device, hidden, heads, dimension, window = torch.device("cuda:0"), 128, 2, 128, 1024
     generator = torch.Generator().manual_seed(31)
-    def values(*shape):
-        return (torch.randint(-2, 3, shape, generator=generator).float() / 8).to(device, torch.bfloat16)
+    def values(*shape, dtype=torch.bfloat16):
+        return (torch.randint(-2, 3, shape, generator=generator).float() / 8).to(device, dtype)
     layers = tuple(SimpleNamespace(context_kv=values(2 * heads * dimension, hidden),
         context_key_norm=torch.ones(dimension, dtype=torch.bfloat16, device=device),
         context_norm=torch.ones(hidden, dtype=torch.bfloat16, device=device)) for _ in range(5))
@@ -149,10 +150,10 @@ def test_accepted_context_replaces_proposals_and_preserves_zero_count_rows():
     weights = SimpleNamespace(config=SimpleNamespace(draft=draft, text={"hidden_size": hidden}),
         shard=TensorParallelShard(0, 1), draft=SimpleNamespace(layers=layers, alpha=alpha,
             recurrent=SimpleNamespace(context_norm=torch.ones(hidden, dtype=torch.bfloat16, device=device))))
-    regions = {f"draft{index}.{kind}": values(3, window, heads, dimension)
+    regions = {f"draft{index}.{kind}": values(3, window, heads, dimension, dtype=kv_dtype)
         for index in (0, 1, 3, 4) for kind in ("key", "value")}
     regions["draft.rnn_context"] = values(3, hidden)
-    key, value = values(20, 128, heads, dimension), values(20, 128, heads, dimension)
+    key, value = values(20, 128, heads, dimension, dtype=kv_dtype), values(20, 128, heads, dimension, dtype=kv_dtype)
     pool = SimpleNamespace(reserved_region=regions.__getitem__, key=lambda *args, **kwargs: key,
         value=lambda *args, **kwargs: value)
     m = Metadata.pack(torch.tensor([1022, 127], device=device), torch.tensor([8, 8], device=device),
@@ -162,7 +163,7 @@ def test_accepted_context_replaces_proposals_and_preserves_zero_count_rows():
     auxiliary, counts = values(16, 8, hidden), torch.tensor([3, 0], device=device, dtype=torch.int32)
     snapshots = {name: tensor.clone() for name, tensor in regions.items()}
     key_before, value_before = key.clone(), value.clone()
-    with RecordedPreparationSession(device=device, checkpoint="synthetic-dspark-context",
+    with RecordedPreparationSession(device=device, checkpoint=f"synthetic-dspark-context-{kv_dtype}",
             workload_schema="accepted-context", numerical_policy="bf16-checkpoint",
             autotune_effort="off", compile_workers=2) as session:
         operation = PreparedContext(weights, auxiliary, m, pool, session=session, name="context")
@@ -170,6 +171,7 @@ def test_accepted_context_replaces_proposals_and_preserves_zero_count_rows():
         operation(auxiliary, counts, m)
         torch.cuda.synchronize()
         inverse = 1. / (1e6 ** (torch.arange(0, dimension, 2, device=device).float() / dimension))
+        rtol = 0.08 if kv_dtype == torch.float8_e4m3fn else 0.008
         for index, layer in enumerate(layers):
             mixed = mix_features(auxiliary, alpha[index], layer.context_norm, 1e-6)
             projected = (mixed.double() @ layer.context_kv.double().T).bfloat16()
@@ -178,19 +180,22 @@ def test_accepted_context_replaces_proposals_and_preserves_zero_count_rows():
             k = (k * torch.rsqrt(k.square().mean(-1, keepdim=True) + 1e-6)).bfloat16()
             k = rotary(k, m.positions, inverse)
             v = v.view(16, heads, dimension)
+            if kv_dtype == torch.float8_e4m3fn:
+                k = k.clamp(-448.0, 448.0).to(kv_dtype)
+                v = v.clamp(-448.0, 448.0).to(kv_dtype)
             if index in draft.local_layers:
                 for kind, expected in (("key", k), ("value", v)):
                     name = f"draft{index}.{kind}"
                     reference = snapshots[name].clone()
                     reference[1, torch.tensor([1022, 1023, 0], device=device)] = expected[:3]
-                    torch.testing.assert_close(regions[name], reference, rtol=.008, atol=0.)
-                    assert torch.equal(regions[name][0], snapshots[name][0])
-                    assert torch.equal(regions[name][2], snapshots[name][2])
+                    torch.testing.assert_close(regions[name].float(), reference.float(), rtol=rtol, atol=0.)
+                    assert torch.equal(regions[name][0].view(torch.uint8), snapshots[name][0].view(torch.uint8))
+                    assert torch.equal(regions[name][2].view(torch.uint8), snapshots[name][2].view(torch.uint8))
             else:
                 for actual, before, expected in ((key, key_before, k), (value, value_before, v)):
                     reference = before.clone()
                     reference.view(-1, heads, dimension)[1022:1025] = expected[:3]
-                    torch.testing.assert_close(actual, reference, rtol=.008, atol=0.)
+                    torch.testing.assert_close(actual.float(), reference.float(), rtol=rtol, atol=0.)
         expected_context = snapshots["draft.rnn_context"].clone()
         expected_context[1] = mix_features(auxiliary[2:3], alpha[-1], weights.draft.recurrent.context_norm, 1e-6)[0]
         assert torch.equal(regions["draft.rnn_context"], expected_context)
@@ -199,27 +204,29 @@ def test_accepted_context_replaces_proposals_and_preserves_zero_count_rows():
         counts.zero_()
         operation(auxiliary, counts, m)
         torch.cuda.synchronize()
-        assert all(torch.equal(regions[name], before) for name, before in retained.items())
-        assert torch.equal(key, key_before) and torch.equal(value, value_before)
+        assert all(torch.equal(regions[name].view(torch.uint8), before.view(torch.uint8)) for name, before in retained.items())
+        assert (torch.equal(key.view(torch.uint8), key_before.view(torch.uint8))
+                and torch.equal(value.view(torch.uint8), value_before.view(torch.uint8)))
 
 
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("layer,start,page_ids,leading_inactive", [(0, 1027, tuple(range(9)), False),
     (2, 1027, tuple(range(9)), False), (2, 127, (2,), False), (2, 255, (2, 4), False),
     (2, 127, (2,), True)])
 @torch.no_grad()
-def test_draft_attention_preserves_committed_kv_with_short_target_page_tables(layer, start, page_ids, leading_inactive):
+def test_draft_attention_preserves_committed_kv_with_short_target_page_tables(kv_dtype, layer, start, page_ids, leading_inactive):
     device, hidden, heads, kv_heads, dimension = torch.device("cuda:0"), 128, 12, 2, 128
     generator = torch.Generator().manual_seed(231)
-    def values(*shape):
-        return (torch.randn(shape, generator=generator) / 16).to(device, torch.bfloat16)
+    def values(*shape, dtype=torch.bfloat16):
+        return (torch.randn(shape, generator=generator) / 16).to(device, dtype)
     d = SimpleNamespace(heads=heads, kv_heads=kv_heads, head_dim=dimension, window=1024, block_size=8,
         local_layers=(0, 1, 3, 4), theta=1e6, text={"rms_norm_eps": 1e-6, "intermediate_size": 256})
     config = SimpleNamespace(text={"hidden_size": hidden}, draft=d, vocabulary=576)
     weights = SimpleNamespace(qkv=values((heads + 2 * kv_heads) * dimension, hidden),
         query_norm=torch.ones(dimension, dtype=torch.bfloat16, device=device),
         key_norm=torch.ones(dimension, dtype=torch.bfloat16, device=device), output=values(hidden, heads * dimension))
-    regions = {f"draft0.{kind}": values(3, 1024, kv_heads, dimension) for kind in ("key", "value")}
-    key, value = values(10, 128, kv_heads, dimension), values(10, 128, kv_heads, dimension)
+    regions = {f"draft0.{kind}": values(3, 1024, kv_heads, dimension, dtype=kv_dtype) for kind in ("key", "value")}
+    key, value = values(10, 128, kv_heads, dimension, dtype=kv_dtype), values(10, 128, kv_heads, dimension, dtype=kv_dtype)
     pool = SimpleNamespace(reserved_region=regions.__getitem__, key=lambda *args, **kwargs: key,
         value=lambda *args, **kwargs: value)
     starts, lengths, states, tables = ([0, start], [0, 8], [0, 1], [[-1] * len(page_ids), page_ids]) if leading_inactive else (
@@ -233,7 +240,7 @@ def test_draft_attention_preserves_committed_kv_with_short_target_page_tables(la
     source = values(batch * 8, hidden)
     committed = {name: tensor.clone() for name, tensor in regions.items()}
     committed_key, committed_value = key.clone(), value.clone()
-    with RecordedPreparationSession(device=device, checkpoint="synthetic-dspark-attention",
+    with RecordedPreparationSession(device=device, checkpoint=f"synthetic-dspark-attention-{kv_dtype}",
             workload_schema="noncausal-block", numerical_policy="bf16-checkpoint",
             autotune_effort="off", compile_workers=2) as session:
         arena = ScratchArena(device, overlap=False)
@@ -250,16 +257,20 @@ def test_draft_attention_preserves_committed_kv_with_short_target_page_tables(la
         q = rotary(normalize(q, heads), m.positions[:8], operation.inverse)
         k = rotary(normalize(k, kv_heads), m.positions[:8], operation.inverse)
         v = v.reshape(8, kv_heads, dimension)
+        if kv_dtype == torch.float8_e4m3fn:
+            k = k.clamp(-448.0, 448.0).to(kv_dtype)
+            v = v.clamp(-448.0, 448.0).to(kv_dtype)
         if layer == 0:
             positions = torch.arange(max(0, start - d.window), start, device=device) % d.window
             context_k = torch.cat((committed["draft0.key"][1, positions], k), 0)
             context_v = torch.cat((committed["draft0.value"][1, positions], v), 0)
-            assert all(torch.equal(regions[name], tensor) for name, tensor in committed.items())
+            assert all(torch.equal(regions[name].view(torch.uint8), tensor.view(torch.uint8)) for name, tensor in committed.items())
         else:
             pages = torch.tensor(page_ids, device=device)
             context_k = torch.cat((committed_key[pages].flatten(0, 1)[:start], k), 0)
             context_v = torch.cat((committed_value[pages].flatten(0, 1)[:start], v), 0)
-        assert torch.equal(key, committed_key) and torch.equal(value, committed_value)
+        assert (torch.equal(key.view(torch.uint8), committed_key.view(torch.uint8))
+                and torch.equal(value.view(torch.uint8), committed_value.view(torch.uint8)))
         expanded_k = context_k.repeat_interleave(heads // kv_heads, 1).double()
         expanded_v = context_v.repeat_interleave(heads // kv_heads, 1).double()
         scores = torch.einsum("qhd,khd->hqk", q.double(), expanded_k) / dimension**.5
@@ -289,8 +300,9 @@ def test_draft_attention_preserves_committed_kv_with_short_target_page_tables(la
         graph.replay()
         torch.cuda.synchronize()
         assert not replayed.count_nonzero()
-        assert torch.equal(key, committed_key) and torch.equal(value, committed_value)
-        assert all(torch.equal(regions[name], tensor) for name, tensor in committed.items())
+        assert (torch.equal(key.view(torch.uint8), committed_key.view(torch.uint8))
+                and torch.equal(value.view(torch.uint8), committed_value.view(torch.uint8)))
+        assert all(torch.equal(regions[name].view(torch.uint8), tensor.view(torch.uint8)) for name, tensor in committed.items())
         m.lengths.copy_(active_lengths)
         m.query_start_loc.copy_(begins)
         m.positions.copy_(positions)

@@ -65,7 +65,7 @@ def page_specs(text, geometry: RankGeometry, draft=None):
         for layer in range(draft.layers):
             if layer not in draft.local_layers:
                 for kind in ("key", "value"):
-                    yield f"draft{layer}.{kind}", (geometry.page_bytes * 2,)
+                    yield f"draft{layer}.{kind}", (geometry.page_bytes,)
 
 
 def continuation_layout(text, geometry: RankGeometry, draft=None):
@@ -87,7 +87,7 @@ def continuation_layout(text, geometry: RankGeometry, draft=None):
         for layer in sorted(draft.local_layers):
             for kind in ("key", "value"):
                 regions.append((f"draft{layer}.{kind}",
-                                (draft.window, geometry.kv_heads, geometry.head_dim), torch.bfloat16))
+                                (draft.window, geometry.kv_heads, geometry.head_dim), KV_DTYPE))
         regions.append(("draft.rnn_context", (geometry.hidden,), torch.bfloat16))
     regions.extend((("last_hidden", (geometry.hidden,), torch.bfloat16), ("consumed_tokens", (1,), torch.int64)))
     layout = StateLayout.from_specs(regions)
@@ -123,7 +123,7 @@ class ContinuationPool(PagedStateStorage):
         if layer in self.draft.local_layers:
             return self.reserved_region(f"draft{layer}.{kind}")
         g = self.geometry
-        return self.pages[f"draft{layer}.{kind}"].view(torch.bfloat16).view(
+        return self.pages[f"draft{layer}.{kind}"].view(KV_DTYPE).view(
             -1, PAGE_TOKENS, g.kv_heads, g.head_dim)
 
     def cache(self, layer, kind):
