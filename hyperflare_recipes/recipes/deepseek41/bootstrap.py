@@ -59,7 +59,7 @@ from .dfly2 import PreparedDFly2Context, PreparedDFly2Draft
 from .dfly2_weights import DFly2Weights
 from hyperflare_recipes.components.dspark import PreparedContext, PreparedMarkov
 from .dspark import PreparedDraft
-from .engram import Tables
+from .engram import LookaheadInputs, Tables
 from hyperflare_recipes.components.paged_generation import PreparedGeneration
 from hyperflare_recipes.components.paged_maintenance import PreparedMaintenance
 from .pool import ContinuationPool, PAGE_TOKENS, continuation_layout, page_bytes
@@ -679,6 +679,12 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             state_pool=pool.backing, memory_capacity=pool.memory_capacity,
             sampling_grammar_mask=requests.grammar_mask, frame_index=frame,
             submission_sequence=sequence, **completion.buffers())
+        lookahead_inputs = (
+            LookaheadInputs.allocate(config.prefill_chunk_size, config.request_capacity, device)
+            if tables.prefetch_mailboxes else None
+        )
+        if lookahead_inputs is not None:
+            buffers.update(lookahead_inputs.buffers())
         if vision_state is not None:
             buffers.update(vision_inputs.buffers(), **vision_prefill.buffers())
         context_factory = (
@@ -774,7 +780,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                             suffix_runtime=collective if mode == "prefill" and capacity >= 512 else None,
                             vocabulary_runtime=vocabulary_collective,
                             coordinator=coordinator, session=session, name=name, workspace=arena,
-                            encoder_only=encoder_only)
+                            encoder_only=encoder_only,
+                            lookahead_inputs=lookahead_inputs if graph_kind == "prefill" else None)
                         batch = PreparedBatch(inputs, requests, metadata[name], mode=mode, shard=shard, pool=pool,
                             input_vocabulary=INPUT_VOCABULARY if vision_state is not None else None,
                             validate_prefill=vision_state.validate_prefill if vision_state is not None and mode == "prefill" else None,
@@ -789,6 +796,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                             context_factory=ctx_factory,
                             sample=sample)
                         fields = (*forward_inputs, "vision_token_indices", "vision_feature_slot") if mode == "prefill" and vision_state is not None else forward_inputs
+                        if graph_kind == "prefill" and lookahead_inputs is not None:
+                            fields = (*fields, "lookahead_token_ids", "lookahead_query_lengths")
                         add(name, forward, graph_kind, rows, capacity if mode == "prefill" else 1, fields, enabled=enabled)
         confidence = _prepare_speculation_catalog(config, speculation, add=add, buffers=buffers,
             forward_inputs=forward_inputs,

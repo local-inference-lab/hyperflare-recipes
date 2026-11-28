@@ -2095,14 +2095,17 @@ class PreparedDecoder:
                  vocabulary_runtime, coordinator, session, name, workspace,
                  vision=None, mla_compute_mode="auto", scoring=None, vocabulary_parallel=False, examples=None,
                  suffix_runtime=None, kv_runtime=None, encoder_only=False, row_shard_prefill=False,
-                 row_shard_attention=False):
+                 row_shard_attention=False, lookahead_inputs=None):
         if scratch.local_logits.dtype != torch.float32 or scratch.logits.dtype != torch.float32:
             raise ValueError("DeepSeek target vocabulary logits require FP32 storage")
         self.weights, self.scratch, self.metadata, self.pool = weights, scratch, metadata, pool
         self.mode = mode
         self.encoder_only = bool(encoder_only)
         self.vision = vision if mode == "prefill" else None
-        self.table_requests = PreparedTableRequests(tables, metadata, pool, session=session, name=name + ".table_requests")
+        self.table_requests = PreparedTableRequests(
+            tables, metadata, pool, session=session, name=name + ".table_requests",
+            lookahead_inputs=lookahead_inputs if mode == "prefill" else None,
+        )
         decoder_start = weights.config.decoder_start
         if self.encoder_only:
             if mode != "prefill" or decoder_start is None or scoring is not None:

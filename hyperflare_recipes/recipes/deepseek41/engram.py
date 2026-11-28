@@ -4,7 +4,7 @@
 
 """File-backed FP8 n-gram tables, compact GPU inputs, and residual injection."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 import inspect
 
@@ -32,6 +32,31 @@ def _supports_compact_heads() -> bool:
     )
 
 
+def _supports_advisory_prefetch() -> bool:
+    return hasattr(PreparedEngramRequests, "publish_lookahead")
+
+
+@dataclass(frozen=True)
+class LookaheadInputs:
+    """Upcoming prefill-chunk token window consumed by graph-driven advisory prefetch."""
+
+    lookahead_token_ids: torch.Tensor
+    lookahead_query_lengths: torch.Tensor
+
+    @classmethod
+    def allocate(cls, tokens, capacity, device):
+        return cls(
+            torch.zeros(tokens, dtype=torch.int64, device=device),
+            torch.zeros(capacity, dtype=torch.int32, device=device),
+        )
+
+    def buffers(self):
+        return {
+            "lookahead_token_ids": self.lookahead_token_ids,
+            "lookahead_query_lengths": self.lookahead_query_lengths,
+        }
+
+
 @dataclass(frozen=True)
 class Tables:
     geometry: object
@@ -44,6 +69,7 @@ class Tables:
     row_mapping: dict
     columns: torch.Tensor
     readiness_runtime: object = None
+    prefetch_mailboxes: dict = field(default_factory=dict)
 
     @property
     def staged_heads(self) -> int:
@@ -71,7 +97,8 @@ class Tables:
             raise ValueError("Engram hash geometry differs from checkpoint tables")
         compact_heads = _supports_compact_heads() and shard.world_size > 1 and 24 % shard.world_size == 0
         staged_heads = 24 // shard.world_size if compact_heads else 24
-        sources, inputs, mailboxes, row_mapping = {}, {}, {}, {}
+        advisory_prefetch = _supports_advisory_prefetch()
+        sources, inputs, mailboxes, prefetch_mailboxes, row_mapping = {}, {}, {}, {}, {}
         timings = ReadinessTimings.allocate(frame, len(geometry.layer_ids))
         with phase(progress, "Prepare embedding tables") as stage:
             for index, layer in enumerate(geometry.layer_ids):
@@ -94,10 +121,16 @@ class Tables:
                     inputs[layer] = EngramInputs.allocate(tokens, device, timings=timings, interval=index)
                 mailboxes[layer] = host_allocator(f"engram_{layer}_requests", (tokens * staged_heads + 1,), torch.int64)
                 mailboxes[layer].host_view.zero_()
+                if advisory_prefetch:
+                    prefetch_mailboxes[layer] = host_allocator(
+                        f"engram_{layer}_prefetch", (tokens * staged_heads + 2,), torch.int64
+                    )
+                    prefetch_mailboxes[layer].host_view.zero_()
             stage.update(f"{sum(source.nbytes for pair in sources.values() for source in pair) / (1 << 30):.1f} GiB in checkpoint spans")
         columns = persistent_copy(torch.tensor([head * 256 + column for head in range(shard.rank, 24, shard.world_size)
                                 for column in range(256)], dtype=torch.int64, device=device))
-        return cls(geometry, tuple(token_map), sources, inputs, mailboxes, sequence, shard, row_mapping, columns)
+        return cls(geometry, tuple(token_map), sources, inputs, mailboxes, sequence, shard, row_mapping, columns,
+                   prefetch_mailboxes=prefetch_mailboxes)
 
     @cached_property
     def device_token_map(self):
@@ -107,6 +140,7 @@ class Tables:
     def buffers(self):
         return {**{name: tensor for layer, inputs in self.inputs.items() for name, tensor in inputs.buffers(layer).items()},
                 **{f"engram_{layer}_requests": mailbox.device_view for layer, mailbox in self.mailboxes.items()},
+                **{f"engram_{layer}_prefetch": mailbox.device_view for layer, mailbox in self.prefetch_mailboxes.items()},
                 **next(iter(self.inputs.values())).timings.buffers()}
 
     def events(self):
@@ -139,7 +173,8 @@ class Tables:
                 embedding_width=256, scale_block=32, encoding="FP8_E4M3_E8M0",
                 weight_buffer=f"engram_{layer}_weights", scale_buffer=f"engram_{layer}_scales",
                 hash_buffer=f"engram_{layer}_hashes", ready_event=f"engram_{layer}_ready",
-                request_buffer=f"engram_{layer}_requests")
+                request_buffer=f"engram_{layer}_requests",
+                **({"prefetch_buffer": f"engram_{layer}_prefetch"} if layer in self.prefetch_mailboxes else {}))
             offsets = [0] * 24
             first = 0
             shards = []
@@ -168,11 +203,15 @@ class Tables:
 
 
 class PreparedTableRequests:
-    def __init__(self, tables, metadata, pool, *, session, name):
+    def __init__(self, tables, metadata, pool, *, session, name, lookahead_inputs=None):
         self.pool = pool
         history = torch.zeros((metadata.starts.numel(), 3), dtype=torch.int64, device=metadata.starts.device)
         self.token_map = tables.device_token_map
+        self.lookahead_inputs = lookahead_inputs
+        self.tokens = metadata.token_ids.numel()
+        self.staged_heads = tables.staged_heads
         operations = []
+        prefetch_mailboxes = []
         for ordinal, (layer, inputs) in enumerate(tables.inputs.items()):
             extra = (
                 {"head_indices": tables.partition(ordinal, tables.shard.rank).heads}
@@ -182,7 +221,10 @@ class PreparedTableRequests:
                 history, metadata.live_counts, tables.mailboxes[layer].device_view, tables.sequence,
                 layer=layer, token_map=tables.token_map, geometry=tables.geometry, session=session,
                 name=f"{name}.{layer}", row_mapping=tables.row_mapping[layer], **extra).functional())
+            mailbox = tables.prefetch_mailboxes.get(layer)
+            prefetch_mailboxes.append(None if mailbox is None else mailbox.device_view)
         self.operations = tuple(operations)
+        self.prefetch_mailboxes = tuple(prefetch_mailboxes)
 
     def __call__(self, metadata):
         m = metadata
@@ -193,6 +235,41 @@ class PreparedTableRequests:
         # Image token types stop n-grams at image boundaries, including across prefill chunks.
         text = (raw >= 0) & (raw < self.token_map.numel())
         history = torch.where(text, self.token_map[raw.clamp(0, self.token_map.numel() - 1)], -1)
+        if self.lookahead_inputs is not None and any(mb is not None for mb in self.prefetch_mailboxes):
+            # Publish advisory lookahead rows before the real request mailbox's release flag
+            # so the host reader can snapshot them race-free before releasing the consuming graph.
+            rows = m.starts.numel()
+            la_tokens = self.lookahead_inputs.lookahead_token_ids[:self.tokens]
+            la_lengths = torch.where(
+                m.lengths > 0,
+                self.lookahead_inputs.lookahead_query_lengths[:rows],
+                0,
+            ).clamp(0, self.tokens)
+            la_ends = la_lengths.cumsum(0).clamp(max=self.tokens).to(torch.int32)
+            la_qsl = torch.cat((torch.zeros(1, dtype=torch.int32, device=m.starts.device), la_ends))
+            la_live_seqs = (la_lengths > 0).sum().reshape(1).to(torch.int32)
+            la_live_counts = torch.cat((la_ends[-1:], la_live_seqs))
+            la_live_rows = la_ends[-1:].to(torch.int64) * self.staged_heads
+            relative = m.lengths[:, None].long() + columns - 3
+            indices = (m.query_start_loc[:-1, None] + relative).clamp(0, m.token_ids.numel() - 1)
+            next_raw = torch.where(
+                relative >= 0,
+                m.token_ids[indices],
+                raw_history.gather(1, (relative + 3).clamp(0, 2)),
+            )
+            next_starts = m.starts + m.lengths.long()
+            next_raw = torch.where(columns >= 3 - next_starts[:, None], next_raw, 2)
+            next_text = (next_raw >= 0) & (next_raw < self.token_map.numel())
+            next_history = torch.where(
+                next_text,
+                self.token_map[next_raw.clamp(0, self.token_map.numel() - 1)],
+                -1,
+            )
+            for operation, mailbox in zip(self.operations, self.prefetch_mailboxes, strict=True):
+                if mailbox is not None:
+                    operation.publish_lookahead(
+                        la_tokens, la_qsl, next_history, la_live_counts, la_live_rows, mailbox
+                    )
         for operation in self.operations:
             operation(m.token_ids, m.query_start_loc, history, m.live_counts)
         return raw_history
