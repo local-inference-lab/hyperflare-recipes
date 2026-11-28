@@ -607,7 +607,9 @@ class PreparedGlmMLA:
             ("o_proj", scratch.expanded[:rs_s].view(rs_s, -1), scratch.output[:rs_s]),
         ):
             self.projections[key] = prepare_projection(input, active_weights[key], output,
-                session=session, name=f"{name}.{key}", workspace=workspace, activation_mode="auto")
+                session=session, name=f"{name}.{key}", workspace=workspace, activation_mode="auto",
+                # Grouped packed qkv_a_proj writes into strided columns of projected_input; scratch.output is dead here.
+                staging=scratch.output if key == "qkv_a_proj" else None)
         if isinstance(active_weights["kv_b_proj"], torch.Tensor):
             values = active_weights["kv_b_proj"].view(heads, 512, 512)
             self.absorb_weights, self.expand_weights = values[:, :256], values[:, 256:]

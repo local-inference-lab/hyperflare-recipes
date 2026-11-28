@@ -257,7 +257,8 @@ class PreparedMTP:
         if self.row_shard:
             self.shard_qkv_a_proj = prepare_projection(self.normalized[:s_rows],
                 weights.mtp.attention["qkv_a_proj"], scratch.attention.projected_input[:s_rows],
-                session=session, name=f"{name}.shard_qkv_a_proj", workspace=workspace, activation_mode="auto")
+                session=session, name=f"{name}.shard_qkv_a_proj", workspace=workspace, activation_mode="auto",
+                staging=scratch.attention.output[:s_rows])
             self.shard_gate_proj = UnquantizedProjection(self.normalized[:s_rows],
                 weights.mtp.attention["indexer.index_kpool_compress_gate"],
                 scratch.attention.index.gate[:s_rows], session=session, name=f"{name}.shard_gate")

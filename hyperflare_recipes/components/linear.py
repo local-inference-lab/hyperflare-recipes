@@ -76,11 +76,16 @@ class PreparedProjectionGroup:
                 projection.functional(session=session, release_weight=release_weight)
         return self
 
-    def __call__(self, source, *, weight=None):
+    def __call__(self, source, output=None, *, weight=None):
         parts = None if weight is None else (weight.parts if hasattr(weight, "parts") else weight)
         if self.output is None:
             shape, stride, dtype = self.output_layout
-            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
+            if output is not None:
+                if (tuple(output.shape) != shape or output.stride() != stride
+                        or output.dtype != dtype or output.device != source.device):
+                    raise ValueError("projection output must preserve the prepared shape, strides, dtype, and device")
+            else:
+                output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
             if parts is None:
                 for projection, target in zip(self.projections, output.split(self.widths, dim=-1), strict=True):
                     target.copy_(projection(source))
@@ -88,6 +93,8 @@ class PreparedProjectionGroup:
                 for projection, part, target in zip(self.projections, parts, output.split(self.widths, dim=-1), strict=True):
                     target.copy_(projection(source, weight=part))
             return output
+        if output is not None and output is not self.output:
+            raise ValueError("bound projection group output cannot be overridden")
         if parts is None:
             for projection, destination in zip(self.projections, self.copies, strict=True):
                 value = projection(source)

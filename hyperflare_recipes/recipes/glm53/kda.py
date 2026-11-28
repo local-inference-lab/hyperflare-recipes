@@ -180,7 +180,11 @@ class PreparedGlmKDA:
                 session=session, workspace=workspace)
         conv_state_buf = local_conv if self.row_shard else state.convolution
         conv_drafts = 0 if self.row_shard else self.drafts
-        conv_x = seg_qkv[:, :24576] if self.row_shard else scratch.projected_qkv
+        if self.row_shard:
+            conv_x = (seg_qkv[:, :24576] if (self.single_segment or self.supports_zero_copy_segment)
+                      else scratch.convolved_qkv)
+        else:
+            conv_x = scratch.projected_qkv
         conv_args = {
             "x": conv_x, "conv_weight": weights["conv1d.weight"],
             "query_start_loc": metadata.query_start_loc, "state_slot_ids": metadata.convolution_slots,
@@ -416,8 +420,8 @@ class PreparedGlmKDA:
 
     @property
     def supports_zero_copy_segment(self):
-        from hyperflare_recipes.components.linear import UnquantizedProjection
-        return (isinstance(self.projections["input_proj"], UnquantizedProjection)
+        from hyperflare_recipes.components.linear import PreparedProjectionGroup, UnquantizedProjection
+        return (isinstance(self.projections["input_proj"], (UnquantizedProjection, PreparedProjectionGroup))
                 and isinstance(self.projections["f_b_proj"], UnquantizedProjection))
 
     def project_input_shard(self, source, *, out=None, weights=None):

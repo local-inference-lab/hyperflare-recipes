@@ -509,7 +509,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
             forward_inputs += ("draft_page_tables",)
 
     scoring = PromptScoring.allocate(config, device, buffers, frame=frame, group=group,
-        ipc=core_storage.peer_storage, runtime=collective, coordinator=coordinator)
+        ipc=ipc, runtime=collective, coordinator=coordinator)
     graph_modes = serving_modes(config.mtp, config.mtp_only)
     graph_count = (len(graph_modes) * (prefill_graph_count(config.prefill_capacities, scoring)
                            + 4 * len(config.batch_capacities))
