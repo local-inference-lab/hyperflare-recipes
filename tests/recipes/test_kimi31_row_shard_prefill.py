@@ -456,3 +456,130 @@ def test_row_sharded_prefill_matches_serial_decoder_bit_exact_across_all_ranks(
         assert torch.equal(r_sampled, s_sampled), f"sampled hidden mismatch on rank {rank}"
         assert torch.equal(r_logits, s_logits), f"logits mismatch on rank {rank}"
         assert torch.equal(r_aux, s_aux), f"auxiliary mismatch on rank {rank}"
+
+
+@pytest.mark.parametrize(
+    "tokens,row_shard,channel_rows,expected_chunk,expected_step,expected_row_shard",
+    [
+        # TP16 row-sharded prefill with 2048-row island channel (2 * REDUCE_ROWS):
+        # 512 stays serial; 1024/1536/2048..4096 all split into two row-sharded halves.
+        (512, True, 2048, None, None, False),
+        (1024, True, 2048, 512, 512, True),
+        (1536, True, 2048, 768, 768, True),
+        (2048, True, 2048, 1024, 1024, True),
+        (2560, True, 2048, 1280, 1280, True),
+        (3072, True, 2048, 1536, 1536, True),
+        (3584, True, 2048, 1792, 1792, True),
+        (4096, True, 2048, 2048, 2048, True),
+        # Smaller 1024-row channel (e.g. --prefill-chunk-size 1024 or 2-subchunk halves):
+        (1024, True, 1024, 512, 512, True),
+        (2048, True, 1024, 1024, 1024, True),
+        (4096, True, 1024, 2048, 1024, True),
+        # Non-row-sharded prefill preserves its 2048-token threshold and subchunking:
+        (1024, False, 1024, None, None, False),
+        (1536, False, 1024, None, None, False),
+        (2048, False, 1024, 1024, 1024, False),
+        (4096, False, 1024, 2048, 1024, False),
+    ],
+)
+def test_prepared_decoder_selects_row_shard_pipeline_for_1024_through_4096(
+    monkeypatch,
+    tokens,
+    row_shard,
+    channel_rows,
+    expected_chunk,
+    expected_step,
+    expected_row_shard,
+):
+    """PreparedDecoder starts step selection at half so 2048 fits, and enables 1024/1536 row-sharding."""
+    world = 16
+    hidden = 7168
+    latent = 3584
+
+    class _StubOp:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def functional(self, *args, **kwargs):
+            return self
+
+    class _StubRuntime:
+        world_size = world
+
+        def should_allreduce(self, tensor):
+            return tensor.shape[0] <= channel_rows
+
+    monkeypatch.setattr(kimi_decoder, "PreparedShardedEmbedding", _StubOp)
+    monkeypatch.setattr(kimi_decoder, "PreparedVocabularyProjection", _StubOp)
+    monkeypatch.setattr(kimi_decoder, "PreparedGatherShards", type("_GS", (_StubOp,), {"fits": staticmethod(lambda *a: True)}))
+    monkeypatch.setattr(kimi_decoder, "PreparedReduceScatter", type("_RS", (_StubOp,), {"fits": staticmethod(lambda *a: True)}))
+    monkeypatch.setattr(kimi_decoder, "PreparedRowToColAllToAll", type("_A2A", (_StubOp,), {"fits": staticmethod(lambda *a: True)}))
+    monkeypatch.setattr(kimi_decoder, "row_shard_surfaces", lambda rt: True)
+    monkeypatch.setattr(kimi_decoder, "_route_max_rows", lambda rt, cfg, w: channel_rows)
+    monkeypatch.setattr(kimi_decoder, "persistent_copy", lambda t: t)
+
+    rt = _StubRuntime()
+    source = torch.empty((tokens, hidden), dtype=torch.bfloat16)
+    scratch = SimpleNamespace(
+        activations=source,
+        hidden=torch.empty((1, hidden), dtype=torch.bfloat16),
+        local_logits=torch.empty((1, 16), dtype=torch.bfloat16),
+        logits=torch.empty((1, 256), dtype=torch.bfloat16),
+    )
+    weights = SimpleNamespace(
+        config=SimpleNamespace(
+            text={
+                "attn_res_block_size": 8,
+                "rms_norm_eps": 1e-6,
+                "routed_expert_hidden_size": latent,
+                "vocab_size": 256,
+            },
+            layers=(),
+            draft=None,
+            mla_norm_eps=1e-6,
+        ),
+        embedding=torch.empty((256, hidden // world), dtype=torch.bfloat16),
+        head=torch.empty((256 // world, hidden), dtype=torch.bfloat16),
+        layers=(),
+        draft=None,
+        shard=SimpleNamespace(rank=0, world_size=world),
+    )
+    metadata = SimpleNamespace(
+        starts=torch.zeros(1, dtype=torch.int32),
+        token_ids=torch.zeros(tokens, dtype=torch.int32),
+        live_counts=torch.tensor([tokens, 1], dtype=torch.int32),
+        sample_indices=torch.tensor([tokens - 1], dtype=torch.int64),
+    )
+    buffers = SimpleNamespace(row_tuning=None)
+    workspace = SimpleNamespace(overlap=True)
+
+    dec = PreparedDecoder(
+        weights,
+        scratch,
+        metadata,
+        pool=None,
+        mode="prefill",
+        runtime=rt,
+        vocabulary_runtime=None,
+        embedding_runtime=None,
+        router_runtime=None,
+        vision_state=None,
+        coordinator=None,
+        session=None,
+        name=f"prefill{tokens}",
+        workspace=workspace,
+        buffers=buffers,
+        prefill_route_runtime=rt,
+        row_shard_prefill=row_shard,
+    )
+    assert dec.pipeline_chunk == expected_chunk
+    assert dec.reduce_step == expected_step
+    assert dec.row_shard_prefill is expected_row_shard
+    assert dec.split_kda is expected_row_shard
+    if expected_row_shard:
+        assert dec.shard_rows is not None and len(dec.shard_rows) == 2
+        assert dec.shard_rows[0].numel() == expected_chunk // world
+        assert dec.final_gather is not None
+    else:
+        assert dec.shard_rows is None
+        assert dec.final_gather is None

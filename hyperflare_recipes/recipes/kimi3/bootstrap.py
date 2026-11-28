@@ -417,7 +417,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
                             if shard.world_size > 1 else None)
         prefill_route_collective = (
             collective
-            if (config.row_shard_prefill and shard.world_size == 16 and max_tokens >= 2048
+            if (config.row_shard_prefill and shard.world_size == 16 and max_tokens >= 1024
                 and getattr(collective, "_island_rs", None) is not None)
             else (create_head_exchange(group, device, max_rows=channel_rows,
                 heads=shard.world_size,

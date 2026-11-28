@@ -609,14 +609,15 @@ class PreparedDecoder:
         )
         pipeline_chunk = None
         reduce_step = None
+        min_pipeline_tokens = 1024 if row_shard_prefill else 2048
         if (mode == "prefill" and rs_runtime is not None and prefill_route_runtime is not None
-                and workspace is not None and workspace.overlap and tokens >= 2048):
-            step = tokens
+                and workspace is not None and workspace.overlap and tokens >= min_pipeline_tokens):
+            half = tokens // 2
+            step = half
             while step > 1 and not _runtime_accepts_chunk(rs_runtime, source[:step]):
                 step = (step + 1) // 2
             max_route_rows = _route_max_rows(prefill_route_runtime, config, world)
             latent = config.text.get("routed_expert_hidden_size", hidden)
-            half = tokens // 2
             # Split prefill projections and collectives into two halves (up to 2048 rows).
             if (0 < step <= half <= 2048
                     and tokens % 2 == 0
