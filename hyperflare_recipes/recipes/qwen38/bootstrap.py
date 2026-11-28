@@ -27,12 +27,13 @@ from ignition.parameters import (
 from ignition.preparation.tuning_replicas import TuningReplica
 from ignition.preparation.tuning import with_autotune_effort
 
+from hyperflare_recipes.components import sm103
 from hyperflare_recipes.components.parallel import TensorParallelShard
 from ignition.preparation.collectives import CollectivePreparation, create_roce_runtime
 from hyperflare_recipes.components.collectives import create_all_gather_runtime, create_all_reduce_runtime, create_dma_all_reduce_runtime, create_result_broadcast_runtime
 from ignition.components.capacity import speculative_token_capacity, batch_capacities, request_capacity, serving_modes
 from ignition.components.sampling import AdmissionBuffers
-from hyperflare_recipes.recipes.qwen38.checkpoint import inspect_qwen38_checkpoint
+from hyperflare_recipes.recipes.qwen38.checkpoint import inspect_qwen38_checkpoint, serving_context
 from ignition.preparation.capture import capture_forwards
 from .contract import prepare as prepare_contract
 from ignition.preparation.contract import history_region
@@ -47,8 +48,10 @@ from ignition.preparation.model import PreparedModel
 from ignition.preparation.rank_group import minimum_across_ranks
 from .checkpoint_schema import (
     FRONTEND_SHA256,
+    MAX_SCALED_CONTEXT,
     MODEL_ID,
     REVISION,
+    TEXT_GEOMETRY,
 )
 from ignition.preparation.scratch import ScratchArena
 from ignition.progress import phase
@@ -180,8 +183,8 @@ class PreparationConfig(BasePreparationConfig):
         for name in ("device", "context", "prefill_chunk_size", "snapshot_budget_bytes", "headroom_bytes"):
             if type(getattr(self, name)) is not int:
                 raise TypeError(f"{name} must be an integer")
-        if self.device < 0 or not 64 <= self.context <= 262144 or self.context % 64:
-            raise ValueError("device must be nonnegative and context must be 64-aligned in [64,262144]")
+        if self.device < 0 or not 64 <= self.context <= MAX_SCALED_CONTEXT or self.context % 64:
+            raise ValueError(f"device must be nonnegative and context must be 64-aligned in [64,{MAX_SCALED_CONTEXT}]")
         if not 64 <= self.prefill_chunk_size <= self.context or self.prefill_chunk_size % 64:
             raise ValueError("prefill chunk size must be 64-aligned in [64,context]")
         if self.pages is not None and (type(self.pages) is not int or self.pages <= 0):
@@ -303,6 +306,17 @@ def prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, pr
     else:
         transient.close()
         return prepared
+
+
+def _validate_rotary_context(text_config, context: int, device: torch.device) -> None:
+    ceiling = serving_context({"rope_parameters": dict(text_config.rope_parameters)})
+    if context > ceiling:
+        raise ValueError(
+            f"context {context:,} exceeds the {ceiling:,} tokens the checkpoint's rotary configuration serves"
+        )
+    native = TEXT_GEOMETRY["max_position_embeddings"]
+    if (context > native or ceiling > native) and sm103.is_sm103(device):
+        raise ValueError("a rope-scaled context is not measured on SM103")
 
 
 @with_autotune_effort
@@ -479,7 +493,9 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                 world_size=shard.world_size,
                 hyperconnection_lowrank=320 // shard.world_size if config.shard_hyperconnections else 320)
             workspaces = ScratchArena(device, overlap=config.stream_overlap)
-            rotary = RotaryTables.allocate(weights.tree.config.text_config, config.context, device)
+            text_config = weights.tree.config.text_config
+            _validate_rotary_context(text_config, config.context, device)
+            rotary = RotaryTables.allocate(text_config, config.context, device)
             cache = {index: QSAState.allocate(pages=1, slots=slots + 1, device=device, draft_tokens=speculative_tokens, kv_heads=max(1, 2 // shard.world_size))
                      for index in (*range(3, 48, 4), *((48,) if has_mtp else ()))}
             page_bytes = sum(sum(getattr(value, name).nbytes for name in

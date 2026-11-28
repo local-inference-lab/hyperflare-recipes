@@ -56,6 +56,17 @@ TEXT_GEOMETRY = {
     "ple_embedding_dtype": "nvfp4",
     "mtp_num_hidden_layers": 1,
 }
+# Rotary geometry every configuration shares, and the keys a YaRN configuration adds to it.
+ROPE_GEOMETRY = {
+    "mrope_interleaved": True,
+    "mrope_section": [11, 11, 10],
+    "partial_rotary_factor": 0.25,
+    "rope_theta": 10000000,
+}
+YARN_KEYS = frozenset({"factor", "original_max_position_embeddings", "beta_fast", "beta_slow",
+                       "attention_factor", "mscale", "mscale_all_dim", "truncate"})
+# The longest YaRN-scaled context measured for this checkpoint.
+MAX_SCALED_CONTEXT = 1048576
 VISION_GEOMETRY = {
     "depth": 27,
     "hidden_size": 1152,

@@ -513,6 +513,40 @@ Export Qwen with up to five MTP draft tokens per round:
 .venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/qwen38-tp2-mtp5.safetensors
 ```
 
+The pinned checkpoint serves its trained context of 262144 tokens. A checkpoint
+directory whose `config.json` carries the YaRN rotary parameters from the
+[model card](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) serves `factor`
+times that context, up to 1048576 tokens at `factor` 4.0. Copy or link the
+pinned snapshot's files into a directory, set the block below under
+`text_config`, leave `max_position_embeddings` at 262144, and export the
+directory:
+
+```json
+"rope_parameters": {
+  "mrope_interleaved": true,
+  "mrope_section": [11, 11, 10],
+  "rope_type": "yarn",
+  "rope_theta": 10000000,
+  "partial_rotary_factor": 0.25,
+  "factor": 4.0,
+  "original_max_position_embeddings": 262144
+}
+```
+
+```sh
+.venv/bin/ignition export /path/to/qwen38-yarn --gpus 0 --max-concurrency 8
+```
+
+The rotary tables take their frequencies and attention factor from the
+installed Transformers YaRN implementation, and the plan report records the
+scaled context and the rotary parameters. YaRN is static: the same scaled
+frequencies apply to every prompt length, so a scaled core is a different
+serving configuration from the native core at short prompts as well. The
+recipe refuses a `rope_type` other than `default` or `yarn`, an
+`original_max_position_embeddings` other than 262144, and a `factor` whose
+context is not 64-aligned or exceeds 1048576. A scaled context is not
+measured on SM103 and planning rejects it there.
+
 Qwen defaults to 32 concurrent requests, five MTP draft tokens, and 128 target-token
 rows, with explicit flags and configuration taking precedence. Verification is
 rectangular: the default catalog covers five drafts per request through batch 16

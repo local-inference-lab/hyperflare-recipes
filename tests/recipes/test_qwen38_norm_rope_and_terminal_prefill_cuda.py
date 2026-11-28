@@ -36,7 +36,12 @@ def _requires_tp2():
 @pytest.mark.parametrize("q_heads,kv_heads", [(24, 2), (12, 1), (6, 1)])
 @pytest.mark.parametrize("tokens", [1, 7, 128, 512, 2048])
 @pytest.mark.parametrize("zero_centered", [True, False])
-def test_qk_head_norm_mrope_matches_canonical(q_heads, kv_heads, tokens, zero_centered):
+@pytest.mark.parametrize("scaling,capacity", [
+    ({}, 8192),
+    # YaRN tables carry the attention factor and cover positions beyond the trained 262,144.
+    ({"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 262144}, 1048576),
+])
+def test_qk_head_norm_mrope_matches_canonical(q_heads, kv_heads, tokens, zero_centered, scaling, capacity):
     """Fused Q/K RMSNorm + 3-axis interleaved MRoPE matches canonical PyTorch within BF16 rounding."""
     _requires_cuda()
     from transformers.models.qwen4_exp.modeling_qwen4_exp import (
@@ -53,9 +58,10 @@ def test_qk_head_norm_mrope_matches_canonical(q_heads, kv_heads, tokens, zero_ce
             "partial_rotary_factor": 0.25,
             "mrope_section": [11, 11, 10],
             "rope_theta": 10000000,
+            **scaling,
         },
     )
-    rotary = RotaryTables.allocate(cfg, 8192, device)
+    rotary = RotaryTables.allocate(cfg, capacity, device)
     gen = torch.Generator(device="cpu").manual_seed(1000 + tokens * 17 + q_heads + int(zero_centered))
     if zero_centered:
         q_norm = Qwen4ExpTextRMSNorm(256, eps=1e-6).to(device=device, dtype=torch.bfloat16).eval()
@@ -71,7 +77,7 @@ def test_qk_head_norm_mrope_matches_canonical(q_heads, kv_heads, tokens, zero_ce
     q_width = q_heads * 512
     kv_width = kv_heads * 256
     qkv = (torch.randn((tokens, q_width + 2 * kv_width), generator=gen) * 1.5).bfloat16().to(device)
-    positions = torch.randint(0, 8192, (tokens, 3), generator=gen, dtype=torch.int64).to(device)
+    positions = torch.randint(0, capacity, (tokens, 3), generator=gen, dtype=torch.int64).to(device)
     if tokens >= 4:
         positions[-2:] = -1
 
