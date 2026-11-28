@@ -614,7 +614,7 @@ def _checkpoint_pages(Pointers, Backing, Tables, Sources, Destinations, Operatio
         if DRAFT_PART == 1:
             active &= endpoint % 64 >= 2
     slot = tl.load(Requests + command)
-    page = tl.load(Tables + slot * TABLE_WIDTH + logical, active, other=-1)
+    page = tl.load(Tables + slot * TABLE_WIDTH + logical, active, other=-1).to(tl.int64)
     active &= page >= 0
     pointer = tl.load(Pointers + layer * 2).to(tl.pointer_type(tl.uint8))
     offset = tl.load(Pointers + layer * 2 + 1)
