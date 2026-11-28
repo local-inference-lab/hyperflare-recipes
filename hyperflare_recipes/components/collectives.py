@@ -350,6 +350,8 @@ class PreparedAllReduce:
         if runtime is None:
             if source.shape != output.shape or source.dtype != output.dtype:
                 raise ValueError("a single-rank reduction copies its source into a matching output")
+            self.handle = next(_HANDLES)
+            _OWNERS[self.handle] = self
             return
         if _roce(runtime):
             if (source.shape != output.shape or source.dtype != torch.bfloat16 or output.dtype != source.dtype
@@ -630,6 +632,8 @@ class PreparedReduceScatter:
         if runtime is None:
             if source.shape != output.shape or source.dtype != output.dtype:
                 raise ValueError("a single-rank reduction copies its source into a matching output")
+            self.handle = next(_HANDLES)
+            _OWNERS[self.handle] = self
             return
         if not self.fits(runtime, source, output):
             raise ValueError("row reductions require contiguous BF16 16-byte packs dividing into"
@@ -843,6 +847,8 @@ class PreparedGatherShards:
         if runtime is None:
             if source.shape != output.shape or source.dtype != output.dtype:
                 raise ValueError("a single-rank gather copies its shard into a matching output")
+            self.handle = next(_HANDLES)
+            _OWNERS[self.handle] = self
             return
         if not self.fits(runtime, source, output):
             raise ValueError("shard gathers require contiguous BF16 16-byte packs gathering into"
@@ -2128,3 +2134,196 @@ def prepare_sampling_broadcast(sampler, *, runtime, session, coordinator, name, 
     return sampler.attach_broadcast(PreparedBroadcast(
         sampler.broadcast_tensors, runtime=runtime, session=session,
         coordinator=coordinator, name=name, buffers=buffers))
+
+
+# ---------------------------------------------------------------------------
+# Ordered synchronous / auxiliary-stream collectives with per-op CUDA events
+# ---------------------------------------------------------------------------
+
+_EVENTS = weakref.WeakValueDictionary()
+_EVENT_HANDLES = itertools.count()
+
+
+class StreamEventSlot:
+    """Lazily created persistent CUDA event whose ``.handle`` is rebound per rank by AOT."""
+
+    def __init__(self):
+        self.event = None
+        self.handle = next(_EVENT_HANDLES)
+        _EVENTS[self.handle] = self
+
+    def get(self):
+        if self.event is None:
+            self.event = torch.cuda.Event()
+        return self.event
+
+
+class GatherSliceOp:
+    """Registry wrapper pairing a PreparedGatherShards with reshaped BF16 slice geometry."""
+
+    def __init__(self, gather: PreparedGatherShards, src_shape: tuple[int, ...], dst_shape: tuple[int, ...]):
+        self.gather = gather
+        self.src_shape = src_shape
+        self.dst_shape = dst_shape
+        self.handle = next(_HANDLES)
+        _OWNERS[self.handle] = self
+
+
+def _exec_ordered_gather(owner, source: torch.Tensor, output: torch.Tensor,
+                         row_start: int, row_end: int, col_row_bytes: int) -> None:
+    dst = output if row_end < 0 else output[row_start:row_end]
+    if isinstance(owner, GatherSliceOp):
+        src = source.view(torch.bfloat16).reshape(owner.src_shape)
+        dst = dst.view(torch.bfloat16).reshape(owner.dst_shape)
+        g = owner.gather
+    else:
+        src = source
+        g = owner
+    if g.single:
+        dst.copy_(src)
+    elif g.pcie:
+        if col_row_bytes:
+            raise ValueError("2D col_row_bytes gather is only supported on RoCE runtimes")
+        g.runtime.all_gather(src, out=dst.view(g.runtime.world_size, *src.shape), plan=g.plan)
+    elif col_row_bytes:
+        g.runtime.gather_shards(src, out=dst, plan=g.plan, col_row_bytes=col_row_bytes)
+    else:
+        g.runtime.gather_shards(src, out=dst, plan=g.plan)
+
+
+@torch.library.custom_op("flare::order_barrier", mutates_args=("anchor",))
+def order_barrier(anchor: torch.Tensor, dependencies: list[torch.Tensor]) -> None:
+    pass
+
+
+@order_barrier.register_fake
+def _fake_order_barrier(anchor, dependencies):
+    pass
+
+
+@torch.library.custom_op("flare::stream_event_wait", mutates_args=("outputs",))
+def stream_event_wait(outputs: list[torch.Tensor], dependencies: list[torch.Tensor], ev_handle: int) -> None:
+    """Wait on the main stream for an auxiliary-stream completion event."""
+    torch.cuda.current_stream(outputs[0].device).wait_event(_EVENTS[ev_handle].get())
+
+
+@stream_event_wait.register_fake
+def _fake_stream_event_wait(outputs, dependencies, ev_handle):
+    pass
+
+
+@torch.library.custom_op("flare::ordered_gather_shards", mutates_args=("output", "channel_token"))
+def ordered_gather_shards(source: torch.Tensor, output: torch.Tensor, channel_token: torch.Tensor,
+                          dependencies: list[torch.Tensor], row_start: int, row_end: int,
+                          handle: int, col_row_bytes: int) -> None:
+    _exec_ordered_gather(_OWNERS[handle], source, output, row_start, row_end, col_row_bytes)
+
+
+@ordered_gather_shards.register_fake
+def _fake_ordered_gather_shards(source, output, channel_token, dependencies,
+                                row_start, row_end, handle, col_row_bytes):
+    pass
+
+
+@torch.library.custom_op("flare::ordered_reduce_scatter", mutates_args=("output", "channel_token"))
+def ordered_reduce_scatter(source: torch.Tensor, output: torch.Tensor, channel_token: torch.Tensor,
+                           dependencies: list[torch.Tensor], handle: int) -> None:
+    op = _OWNERS[handle]
+    if op.single:
+        output.copy_(source)
+    else:
+        op.runtime.reduce_scatter(source, out=output, plan=op.plan)
+
+
+@ordered_reduce_scatter.register_fake
+def _fake_ordered_reduce_scatter(source, output, channel_token, dependencies, handle):
+    pass
+
+
+@torch.library.custom_op("flare::dma_gather_enqueue", mutates_args=("output", "channel_token"))
+def dma_gather_enqueue(source: torch.Tensor, output: torch.Tensor, channel_token: torch.Tensor,
+                       dependencies: list[torch.Tensor], row_start: int, row_end: int,
+                       handle: int, stream: int, handoff_ev: int, done_ev: int,
+                       col_row_bytes: int) -> None:
+    main = torch.cuda.current_stream(source.device)
+    aux = torch.cuda.ExternalStream(stream, device=source.device)
+    if handoff_ev >= 0:
+        ev = _EVENTS[handoff_ev].get()
+        ev.record(main)
+        aux.wait_event(ev)
+    with torch.cuda.stream(aux):
+        _exec_ordered_gather(_OWNERS[handle], source, output, row_start, row_end, col_row_bytes)
+        if done_ev >= 0:
+            _EVENTS[done_ev].get().record(aux)
+
+
+@dma_gather_enqueue.register_fake
+def _fake_dma_gather_enqueue(source, output, channel_token, dependencies, row_start, row_end,
+                             handle, stream, handoff_ev, done_ev, col_row_bytes):
+    pass
+
+
+@torch.library.custom_op("flare::dma_reduce_enqueue", mutates_args=("output", "channel_token"))
+def dma_reduce_enqueue(source: torch.Tensor, output: torch.Tensor, channel_token: torch.Tensor,
+                       dependencies: list[torch.Tensor], handle: int, stream: int,
+                       handoff_ev: int, done_ev: int) -> None:
+    main = torch.cuda.current_stream(source.device)
+    aux = torch.cuda.ExternalStream(stream, device=source.device)
+    if handoff_ev >= 0:
+        ev = _EVENTS[handoff_ev].get()
+        ev.record(main)
+        aux.wait_event(ev)
+    op = _OWNERS[handle]
+    with torch.cuda.stream(aux):
+        if op.single:
+            output.copy_(source)
+        else:
+            op.runtime.reduce_scatter(source, out=output, plan=op.plan)
+        if done_ev >= 0:
+            _EVENTS[done_ev].get().record(aux)
+
+
+@dma_reduce_enqueue.register_fake
+def _fake_dma_reduce_enqueue(source, output, channel_token, dependencies, handle, stream,
+                             handoff_ev, done_ev):
+    pass
+
+
+class AsyncOrderedCollective:
+    """Ordered asynchronous gather or reduce-scatter on an auxiliary CUDA stream.
+
+    Mutates a shared ``channel_token`` to enforce identical collective order across TP ranks,
+    records an atomic main->aux handoff event inside enqueue, and waits on its own per-op
+    completion event rather than ``wait_stream(aux)``.
+    """
+
+    def __init__(self, op, *, kind: str, stream_handle: int, handoff_ev: StreamEventSlot):
+        self.op = op
+        self.kind = kind
+        self.stream_handle = stream_handle
+        self.handoff_ev = handoff_ev
+        self.done_ev = StreamEventSlot()
+
+    def functional(self, *, session):
+        self.op.functional(session=session)
+        return self
+
+    def start(self, source: torch.Tensor, channel_token: torch.Tensor, *, dependencies=()):
+        if getattr(self.op, "output", None) is not None:
+            output = self.op.output
+        else:
+            shape, stride, dtype = self.op.output_layout
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
+        deps = [source, *dependencies]
+        if self.kind == "gather":
+            dma_gather_enqueue(source, output, channel_token, deps, 0, -1, self.op.handle,
+                               self.stream_handle, self.handoff_ev.handle, self.done_ev.handle, 0)
+        else:
+            dma_reduce_enqueue(source, output, channel_token, deps, self.op.handle,
+                               self.stream_handle, self.handoff_ev.handle, self.done_ev.handle)
+        return (source, output)
+
+    def finish(self, pending, dependency):
+        source, output = pending
+        stream_event_wait([output], [source, dependency], self.done_ev.handle)
+        return output

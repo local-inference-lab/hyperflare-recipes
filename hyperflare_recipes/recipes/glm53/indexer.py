@@ -15,6 +15,7 @@ from hyperflare_recipes.components import sm103
 from hyperflare_recipes.components.indexer import PreparedSparseIndexer
 from hyperflare_recipes.components.indexer_sm103 import Sm103SparseIndexer
 from hyperflare_recipes.components.linear import prepare_projection, UnquantizedProjection
+from ignition.preparation.persistent import persistent_copy
 from ignition.preparation.tuning import declare
 
 
@@ -87,6 +88,31 @@ class IndexScratch:
     candidates: torch.Tensor
     gathered: torch.Tensor
     global_pools: torch.Tensor
+    # Row-owned prefill selection: gathered global C4 index pages and variable-length gather staging.
+    global_cache: torch.Tensor | None = None
+    pool_records: torch.Tensor | None = None
+    pool_counts: torch.Tensor | None = None
+
+    @classmethod
+    def allocate_row_shard(cls, total_tokens, query_rows, blocks, device, *, context_ranks):
+        if total_tokens <= 0 or query_rows <= 0 or blocks <= 0 or context_ranks <= 1:
+            raise ValueError("row-sharded GLM index scratch requires positive capacities and DCP ranks > 1")
+        def tensor(rows, width, dtype=torch.bfloat16):
+            return torch.zeros((rows, width), dtype=dtype, device=device)
+        global_pages = blocks * context_ranks
+        return cls(
+            tensor(query_rows, 4096), tensor(query_rows, 4096, torch.float8_e4m3fn),
+            tensor(query_rows, 32, torch.float32),
+            tensor(total_tokens, 128), tensor(total_tokens, 128), tensor(query_rows, 32, torch.float32),
+            torch.zeros(query_rows, dtype=torch.int32, device=device),
+            tensor(query_rows, 512, torch.int32),
+            tensor(query_rows, 2051, torch.int32), torch.zeros(query_rows, dtype=torch.int32, device=device),
+            torch.zeros((1, global_pages), dtype=torch.int32, device=device),
+            *cls._context_selection(0, context_ranks, device),
+            global_cache=torch.zeros((global_pages, 64, 132), dtype=torch.uint8, device=device),
+            pool_records=torch.zeros((context_ranks, blocks * 64 * 132), dtype=torch.uint8, device=device),
+            pool_counts=torch.zeros(context_ranks, dtype=torch.int64, device=device),
+        )
 
     @classmethod
     def allocate(cls, tokens, blocks, mode, device, *, context_ranks=1):
@@ -108,6 +134,20 @@ class IndexScratch:
                 torch.zeros((tokens, 512, 2), dtype=torch.float32, device=device),
                 torch.zeros((tokens, ranks * 512, 2), dtype=torch.float32, device=device),
                 torch.full((tokens, 512), -1, dtype=torch.int32, device=device))
+
+    def rows_row_shard(self, total_tokens, query_rows):
+        if (type(total_tokens) is not int or type(query_rows) is not int
+                or not 0 < total_tokens <= self.normalized_key.shape[0]
+                or not 0 < query_rows <= self.query.shape[0]):
+            raise ValueError("row-sharded GLM index rows exceed scratch capacity")
+        return IndexScratch(
+            self.query[:query_rows], self.query_fp8[:query_rows], self.query_scales[:query_rows],
+            self.normalized_key[:total_tokens], self.gate[:total_tokens], self.weights[:query_rows],
+            self.pool_lengths[:query_rows], self.pools[:query_rows], self.physical[:query_rows],
+            self.selected_lengths[:query_rows], self.page_table,
+            self.scores, self.candidates, self.gathered, self.global_pools,
+            global_cache=self.global_cache, pool_records=self.pool_records, pool_counts=self.pool_counts,
+        )
 
     def rows(self, tokens, mode):
         if type(tokens) is not int or not 0 < tokens <= self.query.shape[0] or mode not in ("decode", "prefill"):
@@ -134,8 +174,14 @@ class PreparedGlmIndexer:
 
     def __init__(self, module, weights, source, query_residual, key_input, weight_input, scratch: IndexScratch,
                  state: IndexState, metadata: IndexMetadata, *, mode, session, name, workspace,
-                 max_cache_pages=None, context=None):
+                 max_cache_pages=None, context=None, row_shard_queries=None):
         rows = source.shape[0]
+        self.row_shard = row_shard_queries is not None
+        if self.row_shard:
+            if mode != "prefill" or context is None or context.records is None:
+                raise ValueError("row-sharded GLM indexer requires DCP prefill with a variable-length gather runtime")
+            if rows != row_shard_queries:
+                raise ValueError("row-sharded GLM indexer source rows must equal row_shard_queries")
         if (source.shape != (rows, 4096) or query_residual.shape != (rows, 1536)
                 or source.dtype != torch.bfloat16 or query_residual.dtype != source.dtype
                 or source.device != query_residual.device):
@@ -144,15 +190,18 @@ class PreparedGlmIndexer:
             raise ValueError("GLM indexing requires 32 heads, 128 channels, C4 pools and 2048 history tokens")
         if mode not in ("decode", "prefill") or (mode == "prefill" and metadata.state_slots.numel() != 1):
             raise ValueError("GLM index prefill requires one request")
-        if (scratch.query.shape != (rows, 4096) or metadata.positions.shape != (rows,)
-                or metadata.block_table.shape[1] != scratch.page_table.shape[1]
+        expected_table_cols = (metadata.block_table.shape[1] * context.shards.world
+                               if self.row_shard else metadata.block_table.shape[1])
+        if (scratch.query.shape != (rows, 4096)
+                or (not self.row_shard and metadata.positions.shape != (rows,))
+                or expected_table_cols != scratch.page_table.shape[1]
                 or scratch.page_table.shape[0] != (1 if mode == "prefill" else rows)):
             raise ValueError("GLM index scratch and metadata capacities differ")
         self.module, self.scratch, self.state, self.cache, self.metadata, self.mode = (
             module, scratch, state, state.cache, metadata, mode)
         self.blocks = metadata.block_table.shape[1]
         self.context = context
-        if context is not None and scratch.gathered.shape != (rows, context.shards.world * 512, 2):
+        if context is not None and not self.row_shard and scratch.gathered.shape != (rows, context.shards.world * 512, 2):
             raise ValueError("GLM context-parallel selection requires candidate scratch for every row")
         # The index key and head weights arrive as columns of the layer's fused input projection.
         if key_input.shape != (rows, 128) or weight_input.shape != (rows, 32):
@@ -164,8 +213,8 @@ class PreparedGlmIndexer:
         self.ape = weights["indexer.index_kpool_compress_ape"]
         self.query_projection = prepare_projection(query_residual, weights["indexer.wq_b"], scratch.query,
             session=session, name=f"{name}.query", workspace=workspace, activation_mode="auto")
-        self.gate_projection = UnquantizedProjection(source, weights["indexer.index_kpool_compress_gate"], scratch.gate,
-            session=session, name=f"{name}.gate")
+        self.gate_projection = UnquantizedProjection(source, weights["indexer.index_kpool_compress_gate"],
+            scratch.gate[:rows], session=session, name=f"{name}.gate")
         self.query_arguments = (scratch.query.view(-1, 128), scratch.query_fp8.view(-1, 128),
                                 scratch.query_scales.view(-1), scratch.weights.view(-1))
         self.query_plan = glm_pool.plan_queries(*self.query_arguments)
@@ -179,25 +228,40 @@ class PreparedGlmIndexer:
             self.pool_plan.request(name=f"{name}.pool", prepare_call=lambda state:
                 PreparedCall(run=lambda: state.update(*pool_arguments))),
         ))
-        page_table = scratch.page_table.expand(rows, -1) if mode == "prefill" else scratch.page_table
+        self.pool_gather = None
+        self.global_page_table = None
+        if self.row_shard:
+            from .dcp import PreparedPoolGather
+
+            self.pool_gather = PreparedPoolGather(state, scratch.pool_records, scratch.pool_counts,
+                scratch.global_cache, context, session=session, name=name)
+            global_pages = self.blocks * context.shards.world
+            self.global_pages = global_pages
+            self.global_page_table = persistent_copy(
+                torch.arange(global_pages, dtype=torch.int32, device=source.device).unsqueeze(0))
+            page_table = self.global_page_table.expand(rows, -1)
+            cache = scratch.global_cache.view(global_pages, -1)
+        else:
+            page_table = scratch.page_table.expand(rows, -1) if mode == "prefill" else scratch.page_table
+            cache = state.cache.view(state.cache.shape[0], -1)
         # Prefill selection scratch grows with query rows (about 140 KB each), so long chunks select in slices.
         step = _SELECT_ROWS if mode == "prefill" else rows
         # SM103 selects through FlashInfer's paged FP8 logits and top-k; b12x's indexer serves SM120/SM121.
         selector = Sm103SparseIndexer if sm103.is_sm103(source.device) else PreparedSparseIndexer
-        caps = None if selector is Sm103SparseIndexer else dsa_indexer.Caps(device=source.device, num_q_heads=32,
-            max_q_rows=min(rows, step),
-            max_page_table_width=page_table.shape[1], topk=512, mode=mode)
-        cache = state.cache.view(state.cache.shape[0], -1)
         self.selectors = tuple(selector(scratch.query_fp8[start:end].view(end - start, 32, 128),
             scratch.weights[start:end], cache, page_table[start:end], scratch.pool_lengths[start:end],
-            None, scratch.pools[start:end], caps=caps, session=session,
+            None, scratch.pools[start:end],
+            caps=None if selector is Sm103SparseIndexer else dsa_indexer.Caps(
+                device=source.device, num_q_heads=32, max_q_rows=end - start,
+                max_page_table_width=page_table.shape[1], topk=512, mode=mode),
+            session=session,
             name=f"{name}.select" if end - start == rows else f"{name}.select{start}", workspace=workspace,
-            scores=None if context is None else scratch.scores[start:end])
+            scores=None if (context is None or self.row_shard) else scratch.scores[start:end])
             for start in range(0, rows, step) for end in (min(start + step, rows),))
         self.scratch_plans = (self.query_projection.plan,
             *(selector.plan for selector in self.selectors if isinstance(selector, PreparedSparseIndexer)))
         self.gathers = ()
-        if context is not None:
+        if context is not None and not self.row_shard:
             from hyperflare_recipes.components.collectives import PreparedAllGather
 
             columns, world = 1024, context.shards.world
@@ -205,8 +269,8 @@ class PreparedGlmIndexer:
                 scratch.gathered[start:end].view(torch.bfloat16).view(-1, 2 * columns * world),
                 runtime=context.candidates, session=session, coordinator=context.coordinator,
                 name=f"{name}.candidates{start}") for start, end in context.slices(rows))
-        # SM103 prefill attends over a slab of the request's context, so it selects positions, not records.
-        self.logical = context is None and mode == "prefill" and sm103.is_sm103(source.device)
+        # SM103 prefill and row-sharded DCP prefill attend over a global slab, so they select global positions.
+        self.logical = self.row_shard or (context is None and mode == "prefill" and sm103.is_sm103(source.device))
         self.expand_arguments = (scratch.pools, metadata.positions, metadata.requests,
                                  metadata.block_table, scratch.physical, scratch.selected_lengths)
         if self.logical:
@@ -224,8 +288,9 @@ class PreparedGlmIndexer:
         """Address the state's current index cache; plans bound its page count from above."""
         cache = self.state.cache
         self.cache = cache
-        for selector in self.selectors:
-            selector.rebind_cache(cache.view(cache.shape[0], -1))
+        if not getattr(self, "row_shard", False):
+            for selector in self.selectors:
+                selector.rebind_cache(cache.view(cache.shape[0], -1))
         if not self.logical:
             self.expand_options["num_cache_blocks"] = cache.shape[0]
 
@@ -236,6 +301,8 @@ class PreparedGlmIndexer:
             selector.functional(session=session)
         for gather in self.gathers:
             gather.functional(session=session)
+        if self.pool_gather is not None:
+            self.pool_gather.functional(session=session)
         self.scratch = self.metadata = self.query_arguments = self.pool_arguments = None
         self.expand_arguments = None
         self.source = self.query_residual = self.key_input = self.weight_input = None
@@ -301,3 +368,77 @@ class PreparedGlmIndexer:
                                metadata.block_table, s.physical,
                                s.selected_lengths, self.context.shards)
         return (s.physical, s.selected_lengths, page_table), s
+
+
+    def project_shard(self, source_sh, query_res_sh, key_in_sh):
+        """Project this rank's owned rows for C4 index queries, normalized keys and pooling gates."""
+        idx_query = self.query_projection(query_res_sh)
+        norm_key = self.module.k_norm(key_in_sh)
+        gate = self.gate_projection(source_sh)
+        return idx_query, norm_key, gate
+
+    def update_cache(self, norm_key_all, gate_all, metadata):
+        """Update this rank's striped DCP C4 index cache and replicated tail from gathered chunk rows."""
+        glm_pool.update_pools(self.cache, self.state.tail, metadata.state_slots, metadata.query_start_loc,
+            norm_key_all, gate_all, self.ape, metadata.token_slots, metadata.positions, plan=self.pool_plan)
+
+    def gather_pools(self, table, end):
+        """Gather every rank's visible C4 pools into contiguous global 64-pool index pages."""
+        return self.pool_gather(table, end)
+
+    def select_shard(self, idx_query_sh, weight_in_sh, positions_sh, global_cache):
+        """Score this rank's owned queries against gathered global C4 pools and expand to global positions."""
+        from .dcp import expand_tokens
+
+        rows = idx_query_sh.shape[0]
+        device = idx_query_sh.device
+        query_fp8 = torch.empty((rows, 4096), dtype=torch.float8_e4m3fn, device=device)
+        query_scales = torch.empty((rows, 32), dtype=torch.float32, device=device)
+        weights = weight_in_sh.to(torch.float32).contiguous()
+        glm_pool.quantize_queries(idx_query_sh.view(-1, 128), query_fp8.view(-1, 128),
+            query_scales.view(-1), weights.view(-1), plan=self.query_plan)
+        pool_lengths = ((positions_sh + 1) // 4).clamp_min(0).to(torch.int32)
+        page_table = self.global_page_table.expand(rows, -1)
+        flat_cache = global_cache.view(self.global_pages, -1)
+        pools = torch.empty((rows, 512), dtype=torch.int32, device=device)
+        for selector, start in zip(self.selectors, range(0, rows, _SELECT_ROWS), strict=True):
+            end = min(rows, start + _SELECT_ROWS)
+            selected = selector(query_fp8[start:end].view(end - start, 32, 128), weights[start:end],
+                page_table[start:end], pool_lengths[start:end], None, cache=flat_cache)
+            pools[start:end].copy_(selected)
+        physical = torch.empty((rows, 2051), dtype=torch.int32, device=device)
+        selected_lengths = torch.empty(rows, dtype=torch.int32, device=device)
+        expand_tokens(pools, positions_sh, physical, selected_lengths)
+        return physical, selected_lengths
+
+    def select_shard_into(self, idx_query_sh, weights_sh, pool_lengths_sh, positions_sh, global_cache,
+                          query_fp8, query_scales, pools, physical, selected_lengths, scratches):
+        """Run C4 selection on the active stream into caller-owned buffers (zero internal allocations)."""
+        from .dcp import expand_tokens
+
+        rows = idx_query_sh.shape[0]
+        glm_pool.quantize_queries(idx_query_sh.view(-1, 128), query_fp8.view(-1, 128),
+            query_scales.view(-1), weights_sh.view(-1), plan=self.query_plan)
+        page_table = self.global_page_table.expand(rows, -1)
+        flat_cache = global_cache.view(self.global_pages, -1)
+        shared = scratches[0] if len(scratches) == 1 else None
+        for idx, (selector, start) in enumerate(zip(self.selectors, range(0, rows, _SELECT_ROWS), strict=True)):
+            end = min(rows, start + _SELECT_ROWS)
+            if shared is not None:
+                shape, dtype = selector.scratch_layout[0]
+                nbytes = 1
+                for dim in shape:
+                    nbytes *= dim
+                nbytes *= dtype.itemsize
+                scratch = shared[:nbytes].view(dtype).view(shape)
+            else:
+                scratch = scratches[idx]
+            binding = dsa_indexer.bind(
+                selector.plan, scratch=scratch,
+                q_fp8=query_fp8[start:end].view(end - start, 32, 128),
+                query_weights=weights_sh[start:end], index_k_cache=flat_cache,
+                page_table=page_table[start:end], cache_lengths=pool_lengths_sh[start:end],
+                active_width=None, output_indices=pools[start:end], output_scores=None,
+            )
+            dsa_indexer.run(binding)
+        expand_tokens(pools, positions_sh, physical, selected_lengths)

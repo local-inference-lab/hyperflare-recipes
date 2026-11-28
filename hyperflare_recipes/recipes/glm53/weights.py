@@ -208,8 +208,8 @@ class GlmWeightLoader(DirectWeightLoader):
         result["dt_bias"] = self.load_tensor(f"{prefix}.dt_bias", extent=slice(*channels))
         result["o_norm.weight"] = self.load_tensor(f"{prefix}.o_norm.weight")
         result["conv1d.weight"] = persistent_cat([
-            self.load_tensor(f"{prefix}.{name}_conv1d.weight",
-                             extent=slice(*channels), temporary=True) for name in ("q", "k", "v")
+            self.load_tensor(f"{prefix}.{name}_conv1d.weight", extent=slice(*channels), temporary=True)
+            for name in ("q", "k", "v")
         ]).squeeze(1)
         return result
 

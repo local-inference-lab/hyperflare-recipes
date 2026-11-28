@@ -67,26 +67,44 @@ class PreparedProjectionGroup:
             self.copies.append(None if destination is target else target)
         self.plans = tuple(projection.plan for projection in self.projections)
 
-    def functional(self, *, session):
+    def functional(self, *, session, release_weight=False):
         """Keep grouped weight formats while allocating projection results locally."""
         if self.output is not None:
             self.output_layout = (tuple(self.output.shape), self.output.stride(), self.output.dtype)
             self.output = self.copies = None
             for projection in self.projections:
-                projection.functional(session=session)
+                projection.functional(session=session, release_weight=release_weight)
         return self
 
-    def __call__(self, source):
+    def __call__(self, source, output=None, *, weight=None):
+        parts = None if weight is None else (weight.parts if hasattr(weight, "parts") else weight)
         if self.output is None:
             shape, stride, dtype = self.output_layout
-            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
-            for projection, target in zip(self.projections, output.split(self.widths, dim=-1), strict=True):
-                target.copy_(projection(source))
+            if output is not None:
+                if (tuple(output.shape) != shape or output.stride() != stride
+                        or output.dtype != dtype or output.device != source.device):
+                    raise ValueError("projection output must preserve the prepared shape, strides, dtype, and device")
+            else:
+                output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
+            if parts is None:
+                for projection, target in zip(self.projections, output.split(self.widths, dim=-1), strict=True):
+                    target.copy_(projection(source))
+            else:
+                for projection, part, target in zip(self.projections, parts, output.split(self.widths, dim=-1), strict=True):
+                    target.copy_(projection(source, weight=part))
             return output
-        for projection, destination in zip(self.projections, self.copies, strict=True):
-            value = projection(source)
-            if destination is not None:
-                destination.copy_(value)
+        if output is not None and output is not self.output:
+            raise ValueError("bound projection group output cannot be overridden")
+        if parts is None:
+            for projection, destination in zip(self.projections, self.copies, strict=True):
+                value = projection(source)
+                if destination is not None:
+                    destination.copy_(value)
+        else:
+            for projection, part, destination in zip(self.projections, parts, self.copies, strict=True):
+                value = projection(source, weight=part)
+                if destination is not None:
+                    destination.copy_(value)
         return self.output
 
 
@@ -97,6 +115,7 @@ class BatchedUnquantizedProjection:
         del session, name
         if major not in ("n", "k"):
             raise ValueError("batched projections take an n-major or k-major RHS")
+        self.major = major
         self.weight = weight if major == "n" else weight.transpose(1, 2)
         if (source.ndim != 3 or output.shape[:2] != source.shape[:2]
                 or self.weight.shape != (source.shape[0], source.shape[2], output.shape[2])
@@ -106,15 +125,16 @@ class BatchedUnquantizedProjection:
         record_numeric_tensor(weight)
         self.output = output
 
-    def functional(self, *, session):
+    def functional(self, *, session, release_weight=False):
         """Allocate each batched result with the prepared output layout."""
-        del session
         if self.output is not None:
             self.output_layout = (tuple(self.output.shape), self.output.stride(), self.output.dtype)
             self.output = None
+        if release_weight:
+            register_finalizer(session, lambda: setattr(self, "weight", None))
         return self
 
-    def __call__(self, source, output=None):
+    def __call__(self, source, output=None, *, weight=None):
         if output is not None:
             template = self.output
             shape, stride, dtype = (self.output_layout if template is None else
@@ -127,7 +147,8 @@ class BatchedUnquantizedProjection:
         if output is None:
             shape, stride, dtype = self.output_layout
             output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
-        _bmm_out(source, self.weight, output)
+        rhs = self.weight if weight is None else (weight if self.major == "n" else weight.transpose(1, 2))
+        _bmm_out(source, rhs, output)
         return output
 
 
@@ -189,23 +210,34 @@ class UnquantizedProjection:
                                    weight=weight, bias=bias),
         ),))
 
-    def functional(self, *, session):
+    def functional(self, *, session, release_weight=False):
         """Allocate the selected projection's output inside each forward."""
-        del session
         if self.output is not None:
             self.output_layout = (tuple(self.output.shape), self.output.stride(), self.output.dtype)
             self.output = None
+        if release_weight:
+            register_finalizer(session, lambda: setattr(self, "weight", None))
         return self
 
-    def __call__(self, source: torch.Tensor) -> torch.Tensor:
-        output = self.output
+    def __call__(self, source: torch.Tensor, output: torch.Tensor | None = None,
+                 *, weight: torch.Tensor | None = None) -> torch.Tensor:
+        if output is not None:
+            template = self.output
+            shape, stride, dtype = (self.output_layout if template is None else
+                (tuple(template.shape), template.stride(), template.dtype))
+            if (tuple(output.shape) != shape or output.stride() != stride
+                    or output.dtype != dtype or output.device != source.device):
+                raise ValueError("projection output must preserve the prepared shape, strides, dtype, and device")
+        else:
+            output = self.output
         if output is None:
             shape, stride, dtype = self.output_layout
             output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
+        rhs = self.weight if weight is None else weight
         if self.dense:
-            sm103_projection.bf16_out(source, self.weight, output, self.plan.handle)
+            sm103_projection.bf16_out(source, rhs, output, self.plan.handle)
             return output
-        return bf16_gemv.mm(source, self.weight, out=output, plan=self.plan, bias=self.bias)
+        return bf16_gemv.mm(source, rhs, out=output, plan=self.plan, bias=self.bias)
 
 
 class QuantizedProjection:
@@ -424,12 +456,13 @@ class QuantizedProjection:
         ),))
         register_finalizer(session, lambda: setattr(self, "workspace", selected_workspace()), workspace=workspace)
 
-    def functional(self, *, session):
+    def functional(self, *, session, release_weight=False):
         """Keep selected plans while moving private storage into the forward.
 
         Preencoded activations must be supplied through ``encoded_bases`` on each
         call. Projection-owned quantization allocates and fills its own bases.
         """
+        self._release_weight = bool(release_weight)
         if self.output is not None:
             self.output_layout = (tuple(self.output.shape), self.output.stride(), self.output.dtype)
             self.output = None
@@ -445,8 +478,11 @@ class QuantizedProjection:
         self.workspace_nbytes = self.plan.memory_requirements().scratch_nbytes
         self.workspace = None
         self.preparation_arena = None
+        if getattr(self, "_release_weight", False):
+            self.weight = None
+            self.parts = None
 
-    def __call__(self, source: torch.Tensor, *, encoded_bases=None) -> torch.Tensor:
+    def __call__(self, source: torch.Tensor, *, encoded_bases=None, weight=None) -> torch.Tensor:
         output, workspace = self.output, self.workspace
         if output is None:
             if self.workspace_nbytes is None:
@@ -468,17 +504,30 @@ class QuantizedProjection:
                     raise ValueError("functional preencoded projection requires encoded_bases")
             if self.quantizer_plan is not None:
                 mxfp8.quantize_dense_rows(source, *encoded_bases, plan=self.quantizer_plan)
+            if weight is None:
+                w_values, w_scales = self.parts[0], self.parts[1]
+            else:
+                packed = weight.weight
+                w_values, w_scales = packed.values, mxfp8.dense_scale_storage(packed.scale_mma)
             gemm.mxfp8_mm_bases(encoded_bases[0], encoded_bases[2],
-                self.parts[0], self.parts[1], output, workspace, plan=self.plan)
+                w_values, w_scales, output, workspace, plan=self.plan)
             return output
         if encoded_bases is not None:
             raise ValueError("encoded_bases requires a prepared MXFP8 activation projection")
         if self.sm103:
-            values, scales, gain = self.parts
+            if weight is None:
+                values, scales, gain = self.parts
+            else:
+                from b12x.gemm.blockscaled._a16 import _weight_parts
+
+                values, scales, gain, _ = _weight_parts(weight)
+                if scales.dtype == torch.float8_e8m0fnu:
+                    scales = scales.view(torch.uint8)
             torch.ops.flare.sm103_packed_out(source, values, scales, gain, output, workspace,
                                              self.plan.handle)
         else:
-            blockscaled.mm(source, self.weight, out=output, plan=self.plan, workspace=workspace)
+            blockscaled.mm(source, self.weight if weight is None else weight,
+                           out=output, plan=self.plan, workspace=workspace)
         if self.bias is not None:
             output.add_(self.bias)
         return output
@@ -550,15 +599,16 @@ class BatchedQuantizedProjection:
                     run=lambda: state.run(rows_in, weight, rows_out, b_major=major, sf_axis=major))),))
             self.plans.append(plan)
 
-    def functional(self, *, session):
+    def functional(self, *, session, release_weight=False):
         """Allocate each batched result with the prepared output layout."""
-        del session
         if self.output is not None:
             self.output_layout = (tuple(self.output.shape), self.output.stride(), self.output.dtype)
             self.output = None
+        if release_weight:
+            register_finalizer(session, lambda: setattr(self, "weight", None))
         return self
 
-    def __call__(self, source, output=None):
+    def __call__(self, source, output=None, *, weight=None):
         from b12x import gemm
 
         if output is not None:
@@ -574,10 +624,14 @@ class BatchedQuantizedProjection:
             shape, stride, dtype = self.output_layout
             output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
         if self.expanded is not None:
-            torch.ops.flare.sm103_bmm_out(source, self.expanded, output)
+            rhs = self.expanded if weight is None else _expanded_bmm_weight(weight)
+            if weight is not None and self.major != "n":
+                rhs = rhs.transpose(1, 2)
+            torch.ops.flare.sm103_bmm_out(source, rhs, output)
             return output
+        rhs = self.weight if weight is None else weight
         for (start, end), plan in zip(self.slices, self.plans, strict=True):
-            gemm.bmm(source[:, start:end], self.weight, output[:, start:end], plan=plan,
+            gemm.bmm(source[:, start:end], rhs, output[:, start:end], plan=plan,
                 a_dtype="bfloat16", b_dtype="float8_e4m3fn", sf_dtype="float8_e8m0fnu",
                 c_dtype="bfloat16", sf_vec_size=32, b_major=self.major, sf_axis=self.major)
         return output

@@ -105,6 +105,7 @@ class BlockFP8Projection:
                 or not weight.values.is_contiguous() or not weight.scales.is_contiguous()):
             raise ValueError("block-FP8 projection requires BF16 activations, E4M3 weights and FP32 block-128 scales")
         self.weight = weight
+        self.in_features = k
         self.bias = None
         for tensor in (weight.values, weight.scales):
             record_numeric_tensor(tensor)
@@ -149,16 +150,18 @@ class BlockFP8Projection:
     def _finalize_workspace(self):
         self.workspace_nbytes = _workspace_bytes(self.plan)
 
-    def functional(self, *, session):
+    def functional(self, *, session, release_weight=False):
         """Allocate projection outputs inside the forward with the prepared layout."""
-        del session
         if self.output is not None:
             self.output_layout = (tuple(self.output.shape), self.output.stride(), self.output.dtype)
         self.output = None
+        if release_weight:
+            register_finalizer(session, lambda: setattr(self, "weight", None))
         return self
 
-    def __call__(self, source):
-        result = _project(source, self.weight.values, self.weight.scales, self.plan,
+    def __call__(self, source, *, weight=None):
+        rhs = self.weight if weight is None else weight
+        result = _project(source, rhs.values, rhs.scales, self.plan,
                           workspace_nbytes=self.workspace_nbytes)
         if self.output is None and self.output_layout is not None:
             shape, stride, dtype = self.output_layout

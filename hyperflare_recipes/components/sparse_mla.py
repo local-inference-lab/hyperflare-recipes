@@ -32,6 +32,24 @@ def _fake_attend(query, cache, selected, lengths, selected_lengths, sink, output
     pass
 
 
+@torch.library.custom_op("flare::sparse_mla_expand", mutates_args=("expanded", "scratch"))
+def _attend_and_expand(query: torch.Tensor, cache: torch.Tensor, selected: torch.Tensor,
+                       lengths: torch.Tensor, selected_lengths: torch.Tensor,
+                       sink: torch.Tensor | None, expand_weight: torch.Tensor,
+                       expanded: torch.Tensor, scratch: torch.Tensor, handle: int) -> None:
+    binding = sparse_mla.bind(plan_from_handle(handle), scratch=scratch, q=query, kv_cache=cache,
+        selected_indices=selected, cache_lengths=lengths, selected_lengths=selected_lengths, attention_sink=sink)
+    result = sparse_mla.run(binding)
+    attended = result[0] if isinstance(result, tuple) else result
+    torch.bmm(attended.transpose(0, 1), expand_weight, out=expanded.transpose(0, 1))
+
+
+@_attend_and_expand.register_fake
+def _fake_attend_and_expand(query, cache, selected, lengths, selected_lengths, sink,
+                            expand_weight, expanded, scratch, handle):
+    pass
+
+
 class PreparedLatentCacheWriter:
     """Write GLM_NEXT latent records into fixed paged storage.
 
@@ -136,6 +154,18 @@ class PreparedSparseMLA:
         else:
             self.output.copy_(result)
         return self.output
+
+    def attend_and_expand(self, query, selected, cache_lengths, selected_lengths, expand_weight, *, cache=None):
+        """Attend and immediately project V heads from scratch without zeroing or copying the latent output."""
+        if self.output is not None or self.return_lse:
+            raise RuntimeError("attend_and_expand requires functional sparse MLA without LSE")
+        rows, heads, _ = self.output_layout[0]
+        expanded = torch.empty((rows, heads, expand_weight.shape[2]), dtype=self.output_layout[2], device=query.device)
+        scratch, = (torch.empty(shape, dtype=dtype, device=query.device) for shape, dtype in self.scratch_layout)
+        _attend_and_expand(query, self.inputs["kv_cache"] if cache is None else cache, selected, cache_lengths,
+                           selected_lengths, self.inputs["attention_sink"], expand_weight, expanded, scratch,
+                           self.plan.handle)
+        return expanded
 
     def attend_in_scratch(self):
         """Attend without copying out: the output (and LSE) alias arena scratch at fixed addresses.
