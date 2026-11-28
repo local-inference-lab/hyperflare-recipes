@@ -38,7 +38,7 @@ from .attention import PreparedMLA
 from .kda import PreparedKDA
 from .pointwise import rms_norm_columns, rms_norm_rows, scale_columns, situ
 from .projections import prepare_projection
-from .residual import ADD, REPLACE, ResidualStream
+from .residual import ADD, REPLACE, TILES, ResidualStream, _mix
 from .routing import MAX_ROWS as ROUTE_ROWS, PreparedRouteGather
 
 
@@ -129,6 +129,48 @@ def _join_shared_expert(source: torch.Tensor, routed: torch.Tensor, outputs: lis
 
 @_join_shared_expert.register_fake
 def _fake_join_shared_expert(source, routed, outputs, workspace, auxiliary_stream) -> None:
+    pass
+
+
+# Chain a row-sharded residual mix on the auxiliary stream between an auxiliary reduce-scatter
+# and the following auxiliary all-gather so both collectives overlap the main-stream MoE kernel.
+@torch.library.custom_op(
+    "flare::kimi3_aux_residual_mix",
+    mutates_args=("prefix", "blocks", "output"),
+)
+def _aux_residual_mix(
+    prefix: torch.Tensor,
+    delta: torch.Tensor,
+    blocks: torch.Tensor,
+    score: torch.Tensor,
+    norm: torch.Tensor,
+    output: torch.Tensor,
+    eps: float,
+    output_eps: float,
+    sources: int,
+    write: int,
+    mode: int,
+    auxiliary_stream: int,
+) -> None:
+    main = torch.cuda.current_stream(prefix.device)
+    auxiliary = torch.cuda.ExternalStream(auxiliary_stream, device=prefix.device)
+    auxiliary.wait_stream(main)
+    rows, hidden = prefix.shape
+    tile, warps = TILES[min(sources, len(TILES) - 1)]
+    with torch.cuda.stream(auxiliary):
+        _mix[(rows,)](
+            prefix, delta, blocks, score, norm, output, output,
+            prefix.stride(0), delta.stride(0), blocks.stride(0), blocks.stride(1),
+            output.stride(0), output.stride(0), float(eps), float(output_eps),
+            hidden, sources, write, mode, False, triton.next_power_of_2(hidden),
+            tile, num_warps=warps,
+        )
+
+
+@_aux_residual_mix.register_fake
+def _fake_aux_residual_mix(
+    prefix, delta, blocks, score, norm, output, eps, output_eps, sources, write, mode, auxiliary_stream
+) -> None:
     pass
 
 
@@ -685,6 +727,13 @@ class PreparedDecoder:
                 ).functional(session=session)
         use_split_moe = self.row_shard_prefill
         self.split_kda = self.row_shard_prefill and self.sequences == 1 and use_split_moe
+        aux_stream = (
+            getattr(workspace, "auxiliary_stream", None)
+            if (self.row_shard_prefill and workspace is not None and workspace.overlap)
+            else None
+        )
+        self._has_aux_stream = aux_stream is not None
+        self.stream_handle = 0 if aux_stream is None else aux_stream.cuda_stream
         for index, w in enumerate(weights.layers):
             prefix, kind = f"{name}.layer{index}", config.layers[index]
             kwargs = dict(mode=mode, session=session, name=prefix + ".attention", workspace=workspace,
@@ -812,7 +861,7 @@ class PreparedDecoder:
             )
             if prev_rs_ops is not None and next_rs_ops is not None:
                 _, _, prev_crs, _, prev_crs_sm, _ = prev_rs_ops
-                _, _, _, next_cag, _, next_cag_sm = next_rs_ops
+                _, _, next_crs, next_cag, next_crs_sm, next_cag_sm = next_rs_ops
                 for crs in (*prev_crs, *prev_crs_sm):
                     for local_plan in next_in_plans:
                         workspace.register_parallel(crs.reduce.plan, local_plan)
@@ -822,6 +871,9 @@ class PreparedDecoder:
                 for cag in (*next_cag, *next_cag_sm):
                     for local_plan in prev_mlp.all_plans:
                         workspace.register_parallel(cag.gather.plan, local_plan)
+                for crs in (*next_crs, *next_crs_sm):
+                    for local_plan in prev_mlp.all_plans:
+                        workspace.register_parallel(crs.reduce.plan, local_plan)
                 continue
             if prev_cr is None or next_cr is None or not next_in_plans:
                 continue
@@ -1053,35 +1105,73 @@ class PreparedDecoder:
                         att_sh_half, att_mode, sources=att_sources, write=-1,
                         score=w["mlp_res_score"], norm=w["post_attention_layernorm"], eps=eps, output_eps=eps)
 
+                has_aux_stream = bool(getattr(self, "_has_aux_stream", False))
+
+                def aux_mix_sh(half_idx, delta_sh_half, *, mix_mode, sources, write, score, norm):
+                    begin, end = half_idx * half_st, (half_idx + 1) * half_st
+                    out = torch.empty((half_st, self.hidden), dtype=delta_sh_half.dtype, device=delta_sh_half.device)
+                    if not has_aux_stream:
+                        return ResidualStream(residual.prefix[begin:end], residual.blocks[begin:end], out).mix(
+                            delta_sh_half, mix_mode, sources=sources, write=write,
+                            score=score, norm=norm, eps=eps, output_eps=eps)
+                    _aux_residual_mix(
+                        residual.prefix[begin:end], delta_sh_half, residual.blocks[begin:end],
+                        score, norm, out, float(eps), float(eps), sources, write, mix_mode,
+                        self.stream_handle,
+                    )
+                    return out
+
                 # Steady-state two-microbatch split-KDA + MoE pipeline:
-                # overlaps prev mlp_rs(1) || KDA(0), att_ag(1) || r+d+s(0), rg(0) || KDA(1),
-                # att_rs(1) || MoE(0), er(0) || r+d+s(1), rg(1) || post_moe(0), mlp_rs(0) || MoE(1),
-                # and next att_ag(0) || post_moe(1).
+                # chains att_rs(1)->mix->mlp_ag(1) during MoE(0) and mlp_rs(0)->mix->next att_ag(0)
+                # during MoE(1) on the auxiliary stream when transitioning into split-KDA, while
+                # keeping ce_local gathers over compute-heavy GEMM/KDA windows.
                 if (
                     split_kda
                     and kind == "kda"
                     and not isinstance(mlp, PreparedMLP)
                     and pending_tail is not None
                 ):
-                    _, prev_delta_sh_0, prev_col_1, prev_shared_1, prev_mlp, prev_crs_1, prev_rs_1, prev_last_comm = pending_tail
-                    sharded_deltas, pending_tail = None, None
                     rg = mlp.prefill_route_gather
                     rg_sm = getattr(mlp, "prefill_route_gather_sm", None) or rg
                     er_rs = mlp.concurrent_expert_rs
+                    tail_kind = pending_tail[0]
+                    sharded_deltas = None
+                    if tail_kind == "precomputed_hidden_0":
+                        _, hidden_0, prev_partial_1, prev_shared_1, prev_mlp, prev_crs_1, prev_rs_1, prev_last_comm = pending_tail
+                        pending_tail = None
+                        p_prev_er_1 = prev_mlp.concurrent_expert_rs.start(
+                            prev_partial_1, dependencies=(prev_last_comm,), clone=False
+                        )
+                        att_out_0 = attention(hidden_0, d0)
+                        prev_normed_1_raw = prev_mlp.concurrent_expert_rs.finish(p_prev_er_1, att_out_0)
+                        prev_normed_1 = prev_mlp.norm_expert_shard(prev_normed_1_raw)
+                        prev_col_1 = prev_mlp.expert_a2a(prev_normed_1, dependencies=(prev_normed_1_raw,))
 
-                    h_sh_0 = pre_attn_mix_sh(0, prev_delta_sh_0)
-                    p_ag_0 = start_ag_half(cag_sm_halves[0], h_sh_0, dependencies=(prev_last_comm,))
-                    out_1_prev = prev_mlp.post_moe_sharded(prev_col_1, prev_shared_1)
-                    hidden_0 = finish_ag_half(cag_sm_halves[0], p_ag_0, out_1_prev)
+                        p_att_rs_0 = start_rs_half(crs_sm_halves[0], att_out_0, dependencies=(prev_col_1,))
+                        out_1_prev = prev_mlp.post_moe_sharded(prev_col_1, prev_shared_1)
+                        att_sh_0 = finish_rs_half(crs_sm_halves[0], p_att_rs_0, out_1_prev)
 
-                    p_prev_rs_1 = start_rs_half(prev_crs_1, out_1_prev, dependencies=(hidden_0,))
-                    att_out_0 = attention(hidden_0, d0)
-                    delta_sh_1 = finish_rs_half(prev_crs_1, p_prev_rs_1, att_out_0)
+                        m_sh_0 = post_attn_mix_sh(0, att_sh_0)
+                        delta_sh_1 = run_rs_half_sync(prev_rs_1, out_1_prev, dependencies=(att_sh_0,))
+                        h_sh_1 = pre_attn_mix_sh(1, delta_sh_1)
+                        mlp_in_0 = run_ag_half_sync(ag_halves[0], m_sh_0, dependencies=(delta_sh_1,))
+                    else:
+                        _, prev_delta_sh_0, prev_col_1, prev_shared_1, prev_mlp, prev_crs_1, prev_rs_1, prev_last_comm = pending_tail
+                        pending_tail = None
 
-                    h_sh_1 = pre_attn_mix_sh(1, delta_sh_1)
-                    att_sh_0 = run_rs_half_sync(rs_halves[0], att_out_0, dependencies=(delta_sh_1,))
-                    m_sh_0 = post_attn_mix_sh(0, att_sh_0)
-                    mlp_in_0 = run_ag_half_sync(ag_halves[0], m_sh_0, dependencies=(att_sh_0,))
+                        h_sh_0 = pre_attn_mix_sh(0, prev_delta_sh_0)
+                        p_ag_0 = start_ag_half(cag_sm_halves[0], h_sh_0, dependencies=(prev_last_comm,))
+                        out_1_prev = prev_mlp.post_moe_sharded(prev_col_1, prev_shared_1)
+                        hidden_0 = finish_ag_half(cag_sm_halves[0], p_ag_0, out_1_prev)
+
+                        p_prev_rs_1 = start_rs_half(prev_crs_1, out_1_prev, dependencies=(hidden_0,))
+                        att_out_0 = attention(hidden_0, d0)
+                        delta_sh_1 = finish_rs_half(prev_crs_1, p_prev_rs_1, att_out_0)
+
+                        h_sh_1 = pre_attn_mix_sh(1, delta_sh_1)
+                        att_sh_0 = run_rs_half_sync(rs_halves[0], att_out_0, dependencies=(delta_sh_1,))
+                        m_sh_0 = post_attn_mix_sh(0, att_sh_0)
+                        mlp_in_0 = run_ag_half_sync(ag_halves[0], m_sh_0, dependencies=(att_sh_0,))
 
                     p_ag_1 = start_ag_half(cag_halves[1], h_sh_1, dependencies=(mlp_in_0,))
                     logits_0 = mlp.router_projection(mlp_in_0)
@@ -1093,13 +1183,25 @@ class PreparedDecoder:
                     att_out_1 = attention(hidden_1, d1)
                     latent_0, full_logits_0 = rg.finish(p_rg_0, att_out_1)
 
-                    p_att_rs_1 = start_rs_half(crs_halves[1], att_out_1, dependencies=(latent_0,))
-                    routes_0 = mlp.router(full_logits_0)
-                    partial_0 = mlp.experts(latent_0, routes_0.ids, routes_0.weights)
-                    att_sh_1 = finish_rs_half(crs_halves[1], p_att_rs_1, partial_0)
+                    if sc == 1:
+                        p_att_rs_1 = start_rs_half(crs_halves[1], att_out_1, dependencies=(latent_0,))
+                        m_sh_1 = aux_mix_sh(
+                            1, p_att_rs_1[0].output, mix_mode=att_mode, sources=att_sources,
+                            write=-1, score=w["mlp_res_score"], norm=w["post_attention_layernorm"],
+                        )
+                        p_mlp_ag_1 = start_ag_half(cag_sm_halves[1], m_sh_1, dependencies=(p_att_rs_1[0].output,))
+                        routes_0 = mlp.router(full_logits_0)
+                        partial_0 = mlp.experts(latent_0, routes_0.ids, routes_0.weights)
+                        _ = finish_rs_half(crs_halves[1], p_att_rs_1, partial_0)
+                        mlp_in_1 = finish_ag_half(cag_sm_halves[1], p_mlp_ag_1, partial_0)
+                    else:
+                        p_att_rs_1 = start_rs_half(crs_halves[1], att_out_1, dependencies=(latent_0,))
+                        routes_0 = mlp.router(full_logits_0)
+                        partial_0 = mlp.experts(latent_0, routes_0.ids, routes_0.weights)
+                        att_sh_1 = finish_rs_half(crs_halves[1], p_att_rs_1, partial_0)
 
-                    m_sh_1 = post_attn_mix_sh(1, att_sh_1)
-                    mlp_in_1 = run_ag_half_sync(ag_halves[1], m_sh_1, dependencies=(att_sh_1,))
+                        m_sh_1 = post_attn_mix_sh(1, att_sh_1)
+                        mlp_in_1 = run_ag_half_sync(ag_halves[1], m_sh_1, dependencies=(att_sh_1,))
 
                     p_er_0 = er_rs.start(partial_0, dependencies=(mlp_in_1,), clone=False)
                     logits_1 = mlp.router_projection(mlp_in_1)
@@ -1114,21 +1216,52 @@ class PreparedDecoder:
                     out_0 = mlp.post_moe_sharded(col_0, shared_0)
                     latent_1, full_logits_1 = rg_sm.finish(p_rg_1, out_0)
 
-                    p_mlp_rs_0 = start_rs_half(crs_halves[0], out_0, dependencies=(latent_1,))
-                    routes_1 = mlp.router(full_logits_1)
-                    partial_1 = mlp.experts(latent_1, routes_1.ids, routes_1.weights)
-                    delta_sh_0 = finish_rs_half(crs_halves[0], p_mlp_rs_0, partial_1)
-
-                    normed_1_raw = mlp.expert_rs(partial_1, dependencies=(delta_sh_0,))
-                    normed_1 = mlp.norm_expert_shard(normed_1_raw)
-                    col_1 = mlp.expert_a2a(normed_1, dependencies=(normed_1_raw,))
-
-                    if defer_to_next:
-                        pending_tail = ("post_moe_1", delta_sh_0, col_1, shared_1, mlp, crs_halves[1], rs_halves[1], col_1)
+                    can_chain_next = (
+                        defer_to_next
+                        and sc == 1
+                        and split_kda
+                        and self.weights.config.layers[index + 1] == "kda"
+                        and not isinstance(self.layers[index + 1][2], PreparedMLP)
+                        and (index + 1) not in self.auxiliary_layers
+                        and er_rs is not None
+                    )
+                    if can_chain_next:
+                        next_w, _, _, _, _, next_rs_ops = self.layers[index + 1]
+                        next_cag_sm_0 = (next_rs_ops[5] if len(next_rs_ops) == 6 else next_rs_ops[3])[:sc]
+                        next_committed = -(-(index + 1) // size)
+                        next_boundary = (index + 1) % size == 0
+                        next_write_block = (index + 1) // size if next_boundary else -1
+                        p_mlp_rs_0 = start_rs_half(crs_halves[0], out_0, dependencies=(latent_1,))
+                        next_h_sh_0 = aux_mix_sh(
+                            0, p_mlp_rs_0[0].output, mix_mode=ADD, sources=next_committed,
+                            write=next_write_block, score=next_w["attention_res_score"],
+                            norm=next_w["input_layernorm"],
+                        )
+                        p_next_ag_0 = start_ag_half(next_cag_sm_0, next_h_sh_0, dependencies=(p_mlp_rs_0[0].output,))
+                        routes_1 = mlp.router(full_logits_1)
+                        partial_1 = mlp.experts(latent_1, routes_1.ids, routes_1.weights)
+                        _ = finish_rs_half(crs_halves[0], p_mlp_rs_0, partial_1)
+                        next_hidden_0 = finish_ag_half(next_cag_sm_0, p_next_ag_0, partial_1)
+                        pending_tail = (
+                            "precomputed_hidden_0", next_hidden_0, partial_1, shared_1,
+                            mlp, crs_halves[1], rs_halves[1], next_hidden_0,
+                        )
                     else:
-                        out_1 = mlp.post_moe_sharded(col_1, shared_1)
-                        delta_sh_1 = run_rs_half_sync(rs_halves[1], out_1, dependencies=(col_1,))
-                        sharded_deltas = [delta_sh_0, delta_sh_1]
+                        p_mlp_rs_0 = start_rs_half(crs_halves[0], out_0, dependencies=(latent_1,))
+                        routes_1 = mlp.router(full_logits_1)
+                        partial_1 = mlp.experts(latent_1, routes_1.ids, routes_1.weights)
+                        delta_sh_0 = finish_rs_half(crs_halves[0], p_mlp_rs_0, partial_1)
+
+                        normed_1_raw = mlp.expert_rs(partial_1, dependencies=(delta_sh_0,))
+                        normed_1 = mlp.norm_expert_shard(normed_1_raw)
+                        col_1 = mlp.expert_a2a(normed_1, dependencies=(normed_1_raw,))
+
+                        if defer_to_next:
+                            pending_tail = ("post_moe_1", delta_sh_0, col_1, shared_1, mlp, crs_halves[1], rs_halves[1], col_1)
+                        else:
+                            out_1 = mlp.post_moe_sharded(col_1, shared_1)
+                            delta_sh_1 = run_rs_half_sync(rs_halves[1], out_1, dependencies=(col_1,))
+                            sharded_deltas = [delta_sh_0, delta_sh_1]
                     preceding, preceding_addend = None, None
                     mode = ADD
                     continue
@@ -1236,21 +1369,52 @@ class PreparedDecoder:
                     out_0 = mlp.post_moe_sharded(col_0, shared_0)
                     latent_1, full_logits_1 = rg_sm.finish(p_rg_1, out_0)
 
-                    p_mlp_rs_0 = start_rs_half(crs_halves[0], out_0, dependencies=(latent_1,))
-                    routes_1 = mlp.router(full_logits_1)
-                    partial_1 = mlp.experts(latent_1, routes_1.ids, routes_1.weights)
-                    delta_sh_0 = finish_rs_half(crs_halves[0], p_mlp_rs_0, partial_1)
-
-                    normed_1_raw = mlp.expert_rs(partial_1, dependencies=(delta_sh_0,))
-                    normed_1 = mlp.norm_expert_shard(normed_1_raw)
-                    col_1 = mlp.expert_a2a(normed_1, dependencies=(normed_1_raw,))
-
-                    if defer_to_next:
-                        pending_tail = ("post_moe_1", delta_sh_0, col_1, shared_1, mlp, crs_halves[1], rs_halves[1], col_1)
+                    can_chain_next = (
+                        defer_to_next
+                        and sc == 1
+                        and split_kda
+                        and self.weights.config.layers[index + 1] == "kda"
+                        and not isinstance(self.layers[index + 1][2], PreparedMLP)
+                        and (index + 1) not in self.auxiliary_layers
+                        and er_rs is not None
+                    )
+                    if can_chain_next:
+                        next_w, _, _, _, _, next_rs_ops = self.layers[index + 1]
+                        next_cag_sm_0 = (next_rs_ops[5] if len(next_rs_ops) == 6 else next_rs_ops[3])[:sc]
+                        next_committed = -(-(index + 1) // size)
+                        next_boundary = (index + 1) % size == 0
+                        next_write_block = (index + 1) // size if next_boundary else -1
+                        p_mlp_rs_0 = start_rs_half(crs_halves[0], out_0, dependencies=(latent_1,))
+                        next_h_sh_0 = aux_mix_sh(
+                            0, p_mlp_rs_0[0].output, mix_mode=ADD, sources=next_committed,
+                            write=next_write_block, score=next_w["attention_res_score"],
+                            norm=next_w["input_layernorm"],
+                        )
+                        p_next_ag_0 = start_ag_half(next_cag_sm_0, next_h_sh_0, dependencies=(p_mlp_rs_0[0].output,))
+                        routes_1 = mlp.router(full_logits_1)
+                        partial_1 = mlp.experts(latent_1, routes_1.ids, routes_1.weights)
+                        _ = finish_rs_half(crs_halves[0], p_mlp_rs_0, partial_1)
+                        next_hidden_0 = finish_ag_half(next_cag_sm_0, p_next_ag_0, partial_1)
+                        pending_tail = (
+                            "precomputed_hidden_0", next_hidden_0, partial_1, shared_1,
+                            mlp, crs_halves[1], rs_halves[1], next_hidden_0,
+                        )
                     else:
-                        out_1 = mlp.post_moe_sharded(col_1, shared_1)
-                        delta_sh_1 = run_rs_half_sync(rs_halves[1], out_1, dependencies=(col_1,))
-                        sharded_deltas = [delta_sh_0, delta_sh_1]
+                        p_mlp_rs_0 = start_rs_half(crs_halves[0], out_0, dependencies=(latent_1,))
+                        routes_1 = mlp.router(full_logits_1)
+                        partial_1 = mlp.experts(latent_1, routes_1.ids, routes_1.weights)
+                        delta_sh_0 = finish_rs_half(crs_halves[0], p_mlp_rs_0, partial_1)
+
+                        normed_1_raw = mlp.expert_rs(partial_1, dependencies=(delta_sh_0,))
+                        normed_1 = mlp.norm_expert_shard(normed_1_raw)
+                        col_1 = mlp.expert_a2a(normed_1, dependencies=(normed_1_raw,))
+
+                        if defer_to_next:
+                            pending_tail = ("post_moe_1", delta_sh_0, col_1, shared_1, mlp, crs_halves[1], rs_halves[1], col_1)
+                        else:
+                            out_1 = mlp.post_moe_sharded(col_1, shared_1)
+                            delta_sh_1 = run_rs_half_sync(rs_halves[1], out_1, dependencies=(col_1,))
+                            sharded_deltas = [delta_sh_0, delta_sh_1]
                 else:
                     rg = mlp.prefill_route_gather
                     er_rs = mlp.concurrent_expert_rs
