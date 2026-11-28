@@ -3,7 +3,9 @@
 
 """Paged global-layer histories and continuation rows of one Inkling 2 rank.
 
-Global layers keep FP8 K/V in 128-token pages. Each continuation row holds, for
+Global layers keep K/V in 128-token pages stored as FP8 (`fp8`, default) or
+block-16 NVFP4 (`nvfp4_4o6k`: 4-or-6 MAE block-scaled K and max/6 block-scaled
+V, cutting global KV page bytes by 43.75%). Each continuation row holds, for
 every local layer, FP8 K and V rings of `window + PAGE_TOKENS` positions;
 position `p` occupies slot `p mod ring`. A ring of one extra page lets decode
 read the window through a rotated page table: the pages from the one holding
@@ -28,6 +30,8 @@ from ignition.components.state import StateLayout
 
 PAGE_TOKENS = 128
 KV_DTYPE = torch.float8_e4m3fn
+KV_FORMATS = ("fp8", "nvfp4_4o6k")
+NVFP4_GROUP = 16
 
 
 @dataclass(frozen=True)
@@ -40,13 +44,18 @@ class RankGeometry:
     hidden: int
     window: int
     convolution_width: int
+    kv_format: str = "fp8"
+
+    def __post_init__(self):
+        if self.kv_format not in KV_FORMATS:
+            raise ValueError(f"unsupported Inkling KV cache format: {self.kv_format!r}")
 
     @classmethod
-    def of(cls, text, world_size):
+    def of(cls, text, world_size, *, kv_format: str = "fp8"):
         if text.heads % world_size or text.kv_heads % world_size:
             raise ValueError("query and KV heads must divide evenly among ranks")
         return cls(text.heads // world_size, text.kv_heads // world_size, text.head_dim, text.hidden, text.window,
-                   text.convolution_width)
+                   text.convolution_width, kv_format=kv_format)
 
     @property
     def ring(self):
@@ -56,11 +65,21 @@ class RankGeometry:
     def page_bytes(self):
         return PAGE_TOKENS * self.kv_heads * self.head_dim * KV_DTYPE.itemsize
 
+    @property
+    def global_data_bytes(self):
+        return self.page_bytes // 2 if self.kv_format == "nvfp4_4o6k" else self.page_bytes
+
+    @property
+    def global_scale_bytes(self):
+        return self.page_bytes // NVFP4_GROUP if self.kv_format == "nvfp4_4o6k" else 0
+
 
 def page_specs(text, geometry: RankGeometry, draft=None):
     for layer in text.global_layers:
         for kind in ("key", "value"):
-            yield f"layer{layer}.{kind}", (geometry.page_bytes,)
+            yield f"layer{layer}.{kind}", (geometry.global_data_bytes,)
+            if geometry.global_scale_bytes:
+                yield f"layer{layer}.{kind}_scales", (geometry.global_scale_bytes,)
     if draft is not None:
         for layer in range(draft.layers):
             if layer not in draft.local_layers:
@@ -127,11 +146,22 @@ class ContinuationPool(PagedStateStorage):
             -1, PAGE_TOKENS, g.kv_heads, g.head_dim)
 
     def cache(self, layer, kind):
-        """Paged K or V of a global layer, `[pages, PAGE_TOKENS, kv_heads, head_dim]`."""
+        """Paged K or V of a global layer (`fp8` or packed `uint8` for `nvfp4_4o6k`)."""
         if self.text.local(layer):
             raise ValueError(f"layer {layer} keeps its keys in continuation rings")
         g = self.geometry
+        if g.kv_format == "nvfp4_4o6k":
+            return self.pages[f"layer{layer}.{kind}"].view(-1, PAGE_TOKENS, g.kv_heads, g.head_dim // 2)
         return self.pages[f"layer{layer}.{kind}"].view(KV_DTYPE).view(-1, PAGE_TOKENS, g.kv_heads, g.head_dim)
+
+    def cache_scales(self, layer, kind):
+        """Block-16 E4M3 scale bytes of a global NVFP4 layer, or None for FP8."""
+        if self.text.local(layer):
+            raise ValueError(f"layer {layer} keeps its keys in continuation rings")
+        g = self.geometry
+        if g.kv_format != "nvfp4_4o6k":
+            return None
+        return self.pages[f"layer{layer}.{kind}_scales"].view(-1, PAGE_TOKENS, g.kv_heads, g.head_dim // NVFP4_GROUP)
 
     def history(self, layer, kind):
         """`[rows, W - 1, channels]` raw inputs of a short convolution, oldest first."""

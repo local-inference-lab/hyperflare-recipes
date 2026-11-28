@@ -155,3 +155,30 @@ def test_mini_rejects_undeclared_proposal_head_quantization():
                 ),
             ),
         )
+
+
+def test_mini_kv_cache_format_nvfp4_4o6k_plans_and_prepares(monkeypatch, tmp_path):
+    from hyperflare_recipes.recipes.inkling2 import bootstrap
+
+    model = ResolvedModel(MINI_RECIPE, MINI_RECIPE.checkpoints[0])
+    fp8_args = parse_args(["export", model.checkpoint.alias, "--no-mtp"], recipes=recipes())
+    nvfp4_args = parse_args(["export", model.checkpoint.alias, "--no-mtp", "--kv-cache-format", "nvfp4_4o6k"], recipes=recipes())
+    fp8_plan = derive(model=MINI_RECIPE, gpus=(gpu(0, 31),), selected=(0,),
+                      parameters=preparation.resolve_parameters(model, fp8_args))
+    nvfp4_plan = derive(model=MINI_RECIPE, gpus=(gpu(0, 31),), selected=(0,),
+                        parameters=preparation.resolve_parameters(model, nvfp4_args))
+    assert nvfp4_plan.costs.page_bytes == 1_179_648
+    assert fp8_plan.costs.page_bytes == 2_097_152
+    assert nvfp4_plan.pages > fp8_plan.pages
+
+    captured = []
+    configuration = bootstrap.PreparationConfig
+    class ConfigurationCaptured(Exception):
+        pass
+    def capture_config(**kwargs):
+        captured.append(configuration(**kwargs))
+        raise ConfigurationCaptured
+    monkeypatch.setattr(bootstrap, "PreparationConfig", capture_config)
+    with pytest.raises(ConfigurationCaptured):
+        MINI_RECIPE.prepare(tmp_path, nvfp4_plan, compile_forwards=False, kernel_cache=None, progress=None)
+    assert captured.pop().kv_cache_format == "nvfp4_4o6k"

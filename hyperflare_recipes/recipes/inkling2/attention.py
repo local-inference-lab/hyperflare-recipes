@@ -140,6 +140,9 @@ class LayerCache:
     ring_row_pages: int = 0
     key_rings: torch.Tensor | None = None
     value_rings: torch.Tensor | None = None
+    key_scales: torch.Tensor | None = None
+    value_scales: torch.Tensor | None = None
+    kv_format: str = "fp8"
 
     @classmethod
     def of(cls, pool, layer):
@@ -148,7 +151,9 @@ class LayerCache:
                        pool.history(layer, "key_convolution"), pool.history(layer, "value_convolution"),
                        pool.ring_row_pages, pool.ring_rows(layer, "key"), pool.ring_rows(layer, "value"))
         return cls(pool.cache(layer, "key"), pool.cache(layer, "value"), pool.history(layer, "key_convolution"),
-                   pool.history(layer, "value_convolution"))
+                   pool.history(layer, "value_convolution"),
+                   key_scales=pool.cache_scales(layer, "key"), value_scales=pool.cache_scales(layer, "value"),
+                   kv_format=pool.geometry.kv_format)
 
 
 def ring_slots(positions, rows, ring, row_pages):
@@ -275,8 +280,6 @@ class PreparedAttention(torch.nn.Module):
             cache_key, cache_value = cache.key, cache.value
             pages = (example("inkling.attention.ring_table", (requests, self.ring // PAGE_TOKENS), torch.int32)
                      if self.local else metadata.page_table)
-            self.writer = PreparedPagedKVWriter(key, value, cache_key, cache_value, slots,
-                session=session, name=f"{name}.cache_write").functional()
         lengths = example("inkling.attention.lengths", (requests,), torch.int32)
         if mode == "prefill":
             bias_arguments = dict(relative_bias_factors=example("inkling.attention.relative_factor",
@@ -284,15 +287,24 @@ class PreparedAttention(torch.nn.Module):
         else:
             bias_arguments = dict(relative_bias=example("inkling.attention.relative_bias",
                 (tokens, self.heads, weights.relative_projection.shape[1])))
-        self.attention = PreparedPagedAttention(query, cache_key, cache_value, pages, lengths,
+        kv_format = "fp8" if self.local else cache.kv_format
+        scale_arguments = (dict(k_scales=cache.key_scales, v_scales=cache.value_scales)
+                           if kv_format != "fp8" else {})
+        prepared_attention = PreparedPagedAttention(query, cache_key, cache_value, pages, lengths,
             metadata.query_start_loc, output, sink=sink, mode="extend" if mode == "prefill" else mode,
             width=metadata.max_query_tokens, window=self.window - 1 if self.local else -1,
+            kv_format=kv_format,
             tuning_page_count=min(tuning_page_count or cache_key.shape[0], cache_key.shape[0]),
-            session=session, workspace=workspace, name=f"{name}.attention", **bias_arguments)
-        self.attention = self.attention.functional(session=session,
+            session=session, workspace=workspace, name=f"{name}.attention", **scale_arguments, **bias_arguments)
+        if not (self.local and mode in ("prefill", "verify")):
+            self.writer = PreparedPagedKVWriter(key, value, cache_key, cache_value, slots,
+                kv_format=kv_format, attention_plan=prepared_attention.plan if kv_format != "fp8" else None,
+                session=session, name=f"{name}.cache_write", **scale_arguments).functional()
+        self.attention = prepared_attention.functional(session=session,
             k_cache=None if self.local and mode in ("prefill", "verify") else cache.key,
             v_cache=None if self.local and mode in ("prefill", "verify") else cache.value,
             cache_seqlens=None, page_table=None, cu_seqlens_q=None, sink=None,
+            **scale_arguments,
             **({"relative_bias_factors": None, "relative_bias_projection": None} if mode == "prefill"
                else {"relative_bias": None}))
 

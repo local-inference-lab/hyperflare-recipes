@@ -10,7 +10,7 @@ from ignition.declaration import Checkpoint, RankCosts, RankUsage, Recipe, Sampl
 from ignition.parameters import RecipeParameters, SpeculationParameters, VisionParameters
 from ignition.preparation.bootstrap import common_preparation_kwargs
 
-from hyperflare_recipes.parameters import DraftQuantizationParameters, NativeDenseActivationsParameters
+from hyperflare_recipes.parameters import DraftQuantizationParameters, KvCacheFormatParameters, NativeDenseActivationsParameters
 
 from .frontend import SAMPLING_DEFAULTS
 
@@ -21,6 +21,7 @@ class Inkling2Parameters(RecipeParameters):
 
     native_dense_activations: NativeDenseActivationsParameters = NativeDenseActivationsParameters()
     draft_quantization: DraftQuantizationParameters | None = None
+    kv_cache_format: KvCacheFormatParameters | None = None
 
 
 def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False,
@@ -80,6 +81,11 @@ MINI_RECIPE = replace(RECIPE, name="inkling2_mini", served_model_name="inkling-2
         draft_quantization=DraftQuantizationParameters(
             draft_head_choices=("nvfp4", "mxfp8"),
             markov_head_choices=("nvfp4",),
+        ),
+        kv_cache_format=KvCacheFormatParameters(
+            supported_formats=("fp8", "nvfp4_4o6k"),
+            page_bytes_by_format=MappingProxyType({"nvfp4_4o6k": MappingProxyType({1: 1_703_936})}),
+            plain_page_bytes_by_format=MappingProxyType({"nvfp4_4o6k": MappingProxyType({1: 1_179_648})}),
         )),
     checkpoints=(Checkpoint(alias="inkling-2-mini", repository="thinkingmachines/Inkling-2-Mini",
         revision="ed40e7da625f594fc9c4990f5f66be24873c22d7", architecture="Inkling2LoopForConditionalGeneration",
