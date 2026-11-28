@@ -53,6 +53,243 @@ def _unpack(Addresses, End, Ready, Output, Signal,
         tl.store(Signal + tl.arange(0, 8), 0)
 
 
+@triton.jit
+def _push_direct_or_pack(Cache, Table, End, Rank, Completed, Stage, Addresses, Output, Signal,
+                         COLUMNS: tl.constexpr, CACHE_PAGES: tl.constexpr, PAGE: tl.constexpr,
+                         WORLD: tl.constexpr, MAXIMUM: tl.constexpr, FAST_LIMIT: tl.constexpr,
+                         SLOT_ROWS: tl.constexpr, WORDS: tl.constexpr, BLOCK: tl.constexpr):
+    """Single-switch (DCP4) posted-write all-push for active lengths <= FAST_LIMIT, else local pack."""
+    words = tl.arange(0, BLOCK)
+    end = tl.minimum(tl.maximum(tl.load(End), 0), MAXIMUM).to(tl.int64)
+    rank = tl.load(Rank).to(tl.int64)
+    local_end = tl.maximum(end - rank + WORLD - 1, 0) // WORLD
+    target_idx = tl.program_id(1)
+    if tl.load(Completed) == 0:
+        if end <= FAST_LIMIT:
+            peer = rank ^ (target_idx + 1)
+            dst_base = tl.load(Addresses + peer).to(tl.pointer_type(tl.int32))
+            slot_off = rank * SLOT_ROWS * WORDS
+            first = tl.program_id(0).to(tl.int64) * 4
+            while first < local_end:
+                row = (first + tl.arange(0, 4)).to(tl.int64)
+                live = row < local_end
+                column = row // PAGE
+                page = tl.load(Table + column, mask=live & (column < COLUMNS), other=-1).to(tl.int64)
+                valid = live & (page >= 0) & (page < CACHE_PAGES)
+                data = tl.load(Cache + (page[:, None] * PAGE + row[:, None] % PAGE) * WORDS + words[None, :],
+                               mask=valid[:, None] & (words[None, :] < WORDS), other=0)
+                tl.store(dst_base + slot_off + row[:, None] * WORDS + words[None, :], data,
+                         mask=live[:, None] & (words[None, :] < WORDS))
+                if target_idx == 0:
+                    grow = row * WORLD + rank
+                    tl.store(Output + grow[:, None] * WORDS + words[None, :], data,
+                             mask=live[:, None] & (words[None, :] < WORDS))
+                first += tl.num_programs(0) * 4
+        elif target_idx == 0:
+            first = tl.program_id(0).to(tl.int64) * 4
+            while first < local_end:
+                row = (first + tl.arange(0, 4)).to(tl.int64)
+                live = row < local_end
+                column = row // PAGE
+                page = tl.load(Table + column, mask=live & (column < COLUMNS), other=-1).to(tl.int64)
+                valid = live & (page >= 0) & (page < CACHE_PAGES)
+                data = tl.load(Cache + (page[:, None] * PAGE + row[:, None] % PAGE) * WORDS + words[None, :],
+                               mask=valid[:, None] & (words[None, :] < WORDS), other=0)
+                tl.store(Stage + row[:, None] * WORDS + words[None, :], data,
+                         mask=live[:, None] & (words[None, :] < WORDS))
+                first += tl.num_programs(0) * 4
+    if tl.program_id(0) == 0 and target_idx == 0:
+        tl.store(Signal + tl.arange(0, 8), 0)
+
+
+@triton.jit
+def _unpack_direct_or_mrd(Stage, Addresses, End, Rank, Ready, Output, Signal,
+                          WORLD: tl.constexpr, MAXIMUM: tl.constexpr, FAST_LIMIT: tl.constexpr,
+                          SLOT_ROWS: tl.constexpr, WORDS: tl.constexpr, BLOCK: tl.constexpr):
+    words = tl.arange(0, BLOCK)
+    end = tl.minimum(tl.maximum(tl.load(End), 0), MAXIMUM).to(tl.int64)
+    rank = tl.load(Rank).to(tl.int64)
+    target_idx = tl.program_id(1)
+    if tl.load(Ready) == 0:
+        if end <= FAST_LIMIT:
+            owner = rank ^ (target_idx + 1)
+            owner_end = tl.maximum(end - owner + WORLD - 1, 0) // WORLD
+            slot_off = owner * SLOT_ROWS * WORDS
+            first = tl.program_id(0).to(tl.int64) * 4
+            while first < owner_end:
+                row = (first + tl.arange(0, 4)).to(tl.int64)
+                live = row < owner_end
+                data = tl.load(Stage + slot_off + row[:, None] * WORDS + words[None, :],
+                               mask=live[:, None] & (words[None, :] < WORDS), other=0)
+                grow = row * WORLD + owner
+                tl.store(Output + grow[:, None] * WORDS + words[None, :], data,
+                         mask=live[:, None] & (words[None, :] < WORDS))
+                first += tl.num_programs(0) * 4
+        else:
+            gid = tl.program_id(0).to(tl.int64) + target_idx.to(tl.int64) * tl.num_programs(0).to(tl.int64)
+            stride = tl.num_programs(0).to(tl.int64) * (WORLD - 1)
+            first = gid * 8
+            while first < end:
+                row = (first + tl.arange(0, 8)).to(tl.int64)
+                live = row < end
+                source = tl.load(Addresses + row % WORLD).to(tl.pointer_type(tl.int32))
+                data = tl.load(source[:, None] + (row[:, None] // WORLD) * WORDS + words[None, :],
+                               mask=live[:, None] & (words[None, :] < WORDS), other=0)
+                tl.store(Output + row[:, None] * WORDS + words[None, :], data,
+                         mask=live[:, None] & (words[None, :] < WORDS))
+                first += stride * 8
+    if tl.program_id(0) == 0 and target_idx == 0:
+        tl.store(Signal + tl.arange(0, 8), 0)
+
+
+@triton.jit
+def _twohop_hop1_or_pack(Cache, Table, End, Rank, Completed, Stage, Addresses, Output, Signal,
+                         COLUMNS: tl.constexpr, CACHE_PAGES: tl.constexpr, PAGE: tl.constexpr,
+                         WORLD: tl.constexpr, ISLANDS: tl.constexpr, MAXIMUM: tl.constexpr,
+                         FAST_LIMIT: tl.constexpr, SLOT_ROWS: tl.constexpr,
+                         WORDS: tl.constexpr, BLOCK: tl.constexpr):
+    """Switch-aware 2-hop posted-write all-push (Hop 1) for active lengths <= FAST_LIMIT.
+
+    Each rank writes its own slice to Output and pushes one copy to each cross-switch twin
+    (rank ^ (c * 4)) and each intra-switch peer (rank ^ {1,2,3}), cutting cross-switch traffic 4x.
+    When end > FAST_LIMIT, falls back to packing local records into Stage for full-context unpack.
+    """
+    words = tl.arange(0, BLOCK)
+    end = tl.minimum(tl.maximum(tl.load(End), 0), MAXIMUM).to(tl.int64)
+    rank = tl.load(Rank).to(tl.int64)
+    local_end = tl.maximum(end - rank + WORLD - 1, 0) // WORLD
+    target_idx = tl.program_id(1)
+    cross_targets: tl.constexpr = ISLANDS - 1
+    if tl.load(Completed) == 0:
+        if end <= FAST_LIMIT:
+            d = tl.where(target_idx < cross_targets, (target_idx + 1) * 4, target_idx - cross_targets + 1)
+            peer = rank ^ d
+            dst_base = tl.load(Addresses + peer).to(tl.pointer_type(tl.int32))
+            slot_off = rank * SLOT_ROWS * WORDS
+            first = tl.program_id(0).to(tl.int64) * 4
+            while first < local_end:
+                row = (first + tl.arange(0, 4)).to(tl.int64)
+                live = row < local_end
+                column = row // PAGE
+                page = tl.load(Table + column, mask=live & (column < COLUMNS), other=-1).to(tl.int64)
+                valid = live & (page >= 0) & (page < CACHE_PAGES)
+                data = tl.load(Cache + (page[:, None] * PAGE + row[:, None] % PAGE) * WORDS + words[None, :],
+                               mask=valid[:, None] & (words[None, :] < WORDS), other=0)
+                tl.store(dst_base + slot_off + row[:, None] * WORDS + words[None, :], data,
+                         mask=live[:, None] & (words[None, :] < WORDS))
+                if target_idx == 0:
+                    grow = row * WORLD + rank
+                    tl.store(Output + grow[:, None] * WORDS + words[None, :], data,
+                             mask=live[:, None] & (words[None, :] < WORDS))
+                first += tl.num_programs(0) * 4
+        elif target_idx == 0:
+            first = tl.program_id(0).to(tl.int64) * 4
+            while first < local_end:
+                row = (first + tl.arange(0, 4)).to(tl.int64)
+                live = row < local_end
+                column = row // PAGE
+                page = tl.load(Table + column, mask=live & (column < COLUMNS), other=-1).to(tl.int64)
+                valid = live & (page >= 0) & (page < CACHE_PAGES)
+                data = tl.load(Cache + (page[:, None] * PAGE + row[:, None] % PAGE) * WORDS + words[None, :],
+                               mask=valid[:, None] & (words[None, :] < WORDS), other=0)
+                tl.store(Stage + row[:, None] * WORDS + words[None, :], data,
+                         mask=live[:, None] & (words[None, :] < WORDS))
+                first += tl.num_programs(0) * 4
+    if tl.program_id(0) == 0 and target_idx == 0:
+        tl.store(Signal + tl.arange(0, 8), 0)
+
+
+@triton.jit
+def _twohop_hop2_or_unpack(Stage, Addresses, End, Rank, Ready, Output, Signal,
+                           WORLD: tl.constexpr, ISLANDS: tl.constexpr, MAXIMUM: tl.constexpr,
+                           FAST_LIMIT: tl.constexpr, SLOT_ROWS: tl.constexpr,
+                           WORDS: tl.constexpr, BLOCK: tl.constexpr):
+    """Hop 2 (intra-switch only): forward received cross-switch twin slices to local peers and unpack local/twin slots."""
+    words = tl.arange(0, BLOCK)
+    end = tl.minimum(tl.maximum(tl.load(End), 0), MAXIMUM).to(tl.int64)
+    rank = tl.load(Rank).to(tl.int64)
+    target_idx = tl.program_id(1)
+    if tl.load(Ready) == 0:
+        if end <= FAST_LIMIT:
+            d_local = target_idx + 1
+            local_peer = rank ^ d_local
+            dst_base = tl.load(Addresses + local_peer).to(tl.pointer_type(tl.int32))
+            for c in tl.static_range(1, ISLANDS):
+                twin = rank ^ (c * 4)
+                twin_end = tl.maximum(end - twin + WORLD - 1, 0) // WORLD
+                twin_off = twin * SLOT_ROWS * WORDS
+                first = tl.program_id(0).to(tl.int64) * 4
+                while first < twin_end:
+                    row = (first + tl.arange(0, 4)).to(tl.int64)
+                    live = row < twin_end
+                    data = tl.load(Stage + twin_off + row[:, None] * WORDS + words[None, :],
+                                   mask=live[:, None] & (words[None, :] < WORDS), other=0)
+                    tl.store(dst_base + twin_off + row[:, None] * WORDS + words[None, :], data,
+                             mask=live[:, None] & (words[None, :] < WORDS))
+                    if target_idx == 0:
+                        grow = row * WORLD + twin
+                        tl.store(Output + grow[:, None] * WORDS + words[None, :], data,
+                                 mask=live[:, None] & (words[None, :] < WORDS))
+                    first += tl.num_programs(0) * 4
+            peer_end = tl.maximum(end - local_peer + WORLD - 1, 0) // WORLD
+            peer_off = local_peer * SLOT_ROWS * WORDS
+            first = tl.program_id(0).to(tl.int64) * 4
+            while first < peer_end:
+                row = (first + tl.arange(0, 4)).to(tl.int64)
+                live = row < peer_end
+                data = tl.load(Stage + peer_off + row[:, None] * WORDS + words[None, :],
+                               mask=live[:, None] & (words[None, :] < WORDS), other=0)
+                grow = row * WORLD + local_peer
+                tl.store(Output + grow[:, None] * WORDS + words[None, :], data,
+                         mask=live[:, None] & (words[None, :] < WORDS))
+                first += tl.num_programs(0) * 4
+        else:
+            gid = tl.program_id(0).to(tl.int64) + target_idx.to(tl.int64) * tl.num_programs(0).to(tl.int64)
+            stride = tl.num_programs(0).to(tl.int64) * 3
+            first = gid * 8
+            while first < end:
+                row = (first + tl.arange(0, 8)).to(tl.int64)
+                live = row < end
+                source = tl.load(Addresses + row % WORLD).to(tl.pointer_type(tl.int32))
+                data = tl.load(source[:, None] + (row[:, None] // WORLD) * WORDS + words[None, :],
+                               mask=live[:, None] & (words[None, :] < WORDS), other=0)
+                tl.store(Output + row[:, None] * WORDS + words[None, :], data,
+                         mask=live[:, None] & (words[None, :] < WORDS))
+                first += stride * 8
+    if tl.program_id(0) == 0 and target_idx == 0:
+        tl.store(Signal + tl.arange(0, 8), 0)
+
+
+@triton.jit
+def _twohop_unpack_tail(Stage, End, Rank, Ready, Output, Signal,
+                        WORLD: tl.constexpr, ISLANDS: tl.constexpr, MAXIMUM: tl.constexpr,
+                        FAST_LIMIT: tl.constexpr, SLOT_ROWS: tl.constexpr,
+                        WORDS: tl.constexpr, BLOCK: tl.constexpr):
+    """Pure local HBM unpack of the remaining remote cross-switch slices received in Hop 2."""
+    words = tl.arange(0, BLOCK)
+    end = tl.minimum(tl.maximum(tl.load(End), 0), MAXIMUM).to(tl.int64)
+    rank = tl.load(Rank).to(tl.int64)
+    target_idx = tl.program_id(1)
+    if tl.load(Ready) == 0 and end <= FAST_LIMIT:
+        d_local = target_idx + 1
+        for c in tl.static_range(1, ISLANDS):
+            owner = rank ^ (c * 4) ^ d_local
+            owner_end = tl.maximum(end - owner + WORLD - 1, 0) // WORLD
+            slot_off = owner * SLOT_ROWS * WORDS
+            first = tl.program_id(0).to(tl.int64) * 4
+            while first < owner_end:
+                row = (first + tl.arange(0, 4)).to(tl.int64)
+                live = row < owner_end
+                data = tl.load(Stage + slot_off + row[:, None] * WORDS + words[None, :],
+                               mask=live[:, None] & (words[None, :] < WORDS), other=0)
+                grow = row * WORLD + owner
+                tl.store(Output + grow[:, None] * WORDS + words[None, :], data,
+                         mask=live[:, None] & (words[None, :] < WORDS))
+                first += tl.num_programs(0) * 4
+    if tl.program_id(0) == 0 and target_idx == 0:
+        tl.store(Signal + tl.arange(0, 8), 0)
+
+
 def validate_history(cache, table, end, rank, stage, addresses, output, signals):
     """Check transfer geometry without inspecting device values."""
     if cache.ndim != 3 or output.ndim != 2 or stage.ndim != 2:
@@ -116,17 +353,59 @@ class PreparedInterleavedHistory:
             shape, dtype = self.output_layout
             output = torch.empty(shape, dtype=dtype, device=self.cache.device)
         words = self.cache.shape[2] // 4
+        block = triton.next_power_of_2(words)
+        stage_rows = self.stage.shape[0]
+        if self.world in (8, 16) and stage_rows % self.world == 0:
+            islands = self.world // 4
+            slot_rows = stage_rows // self.world
+            blocks = min(64, max(1, triton.cdiv(slot_rows, 4)))
+            torch.library.wrap_triton(_twohop_hop1_or_pack)[(blocks, islands + 2)](
+                self.cache.view(torch.int32), table, end, self.rank, self.completed,
+                self.stage.view(torch.int32), self.addresses, output.view(torch.int32), self.packed,
+                COLUMNS=table.numel(), CACHE_PAGES=self.cache.shape[0], PAGE=self.cache.shape[1],
+                WORLD=self.world, ISLANDS=islands, MAXIMUM=self.maximum, FAST_LIMIT=stage_rows,
+                SLOT_ROWS=slot_rows, WORDS=words, BLOCK=block, num_warps=4)
+            self.publish(self.packed)
+            torch.library.wrap_triton(_twohop_hop2_or_unpack)[(blocks, 3)](
+                self.stage.view(torch.int32), self.addresses, end, self.rank, self.ready,
+                output.view(torch.int32), self.packed, WORLD=self.world, ISLANDS=islands,
+                MAXIMUM=self.maximum, FAST_LIMIT=stage_rows, SLOT_ROWS=slot_rows,
+                WORDS=words, BLOCK=block, num_warps=4)
+            self.publish(self.packed)
+            torch.library.wrap_triton(_twohop_unpack_tail)[(blocks, 3)](
+                self.stage.view(torch.int32), end, self.rank, self.ready,
+                output.view(torch.int32), self.copied, WORLD=self.world, ISLANDS=islands,
+                MAXIMUM=self.maximum, FAST_LIMIT=stage_rows, SLOT_ROWS=slot_rows,
+                WORDS=words, BLOCK=block, num_warps=4)
+            self.consume(self.copied)
+            return output
+        if self.world == 4 and stage_rows % self.world == 0:
+            slot_rows = stage_rows // self.world
+            blocks = min(64, max(1, triton.cdiv(slot_rows, 4)))
+            torch.library.wrap_triton(_push_direct_or_pack)[(blocks, 3)](
+                self.cache.view(torch.int32), table, end, self.rank, self.completed,
+                self.stage.view(torch.int32), self.addresses, output.view(torch.int32), self.packed,
+                COLUMNS=table.numel(), CACHE_PAGES=self.cache.shape[0], PAGE=self.cache.shape[1],
+                WORLD=self.world, MAXIMUM=self.maximum, FAST_LIMIT=stage_rows,
+                SLOT_ROWS=slot_rows, WORDS=words, BLOCK=block, num_warps=4)
+            self.publish(self.packed)
+            torch.library.wrap_triton(_unpack_direct_or_mrd)[(blocks, 3)](
+                self.stage.view(torch.int32), self.addresses, end, self.rank, self.ready,
+                output.view(torch.int32), self.copied, WORLD=self.world, MAXIMUM=self.maximum,
+                FAST_LIMIT=stage_rows, SLOT_ROWS=slot_rows, WORDS=words, BLOCK=block, num_warps=4)
+            self.consume(self.copied)
+            return output
         # Bound empty-CTA work by the launch grid, not the prepared history
         # capacity. Grid-stride copies stop at the device-visible prefix length.
-        torch.library.wrap_triton(_pack)[(min(1024, triton.cdiv(self.stage.shape[0], 4)),)](
+        torch.library.wrap_triton(_pack)[(min(1024, triton.cdiv(stage_rows, 4)),)](
             self.cache.view(torch.int32), table, end, self.rank, self.completed,
             self.stage.view(torch.int32), self.packed, COLUMNS=table.numel(),
             CACHE_PAGES=self.cache.shape[0], PAGE=self.cache.shape[1], WORLD=self.world,
-            MAXIMUM=self.maximum, WORDS=words, BLOCK=triton.next_power_of_2(words), num_warps=4)
+            MAXIMUM=self.maximum, WORDS=words, BLOCK=block, num_warps=4)
         self.publish(self.packed)
         torch.library.wrap_triton(_unpack)[(min(1024, triton.cdiv(self.maximum, 8)),)](
             self.addresses, end, self.ready, output.view(torch.int32), self.copied,
             WORLD=self.world, MAXIMUM=self.maximum, WORDS=words,
-            BLOCK=triton.next_power_of_2(words), num_warps=4)
+            BLOCK=block, num_warps=4)
         self.consume(self.copied)
         return output

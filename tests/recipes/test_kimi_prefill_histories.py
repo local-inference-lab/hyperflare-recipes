@@ -86,3 +86,143 @@ def test_compiled_serial_history_copies_preserve_bytes_with_changed_pages_and_ta
             assert torch.equal(forward.saved_latent.view(torch.uint8).cpu()[:count], expected_latent[:count])
     finally:
         graph.reset()
+
+
+@pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
+                    reason="requires an explicitly assigned CUDA GPU")
+@pytest.mark.parametrize("world", [4, 8, 16])
+@torch.no_grad()
+def test_multi_rank_push_and_fallback_history_kernels_match_reference_bit_exact(world):
+    """Exercise single-switch (world=4) and two-hop (world=8, 16) posted-write push and >FAST_LIMIT fallback."""
+    from hyperflare_recipes.components import interleaved_history as ih
+    from hyperflare_recipes.components import planar_index_history as pih
+    import triton
+
+    device = torch.device("cuda:0")
+    pages = 8
+    # Choose maximum so stage_rows = maximum // world is divisible by world (and >= 64 * world for planar index).
+    # For world=16: stage_pages=16 -> stage_rows=1024 -> maximum=16384; fast_limit=1024.
+    stage_pages = max(world, 16)
+    stage_rows = stage_pages * 64
+    maximum = stage_rows * world
+    cols = maximum // (world * 128)
+    slot_rows = stage_rows // world
+    slot_pages = stage_pages // world
+
+    gen = torch.Generator(device=device).manual_seed(42 + world)
+    lat_caches = [torch.randint(0, 256, (pages, 128, 576), dtype=torch.uint8, device=device, generator=gen)
+                  for _ in range(world)]
+    idx_caches = [torch.randint(0, 256, (2 * pages, 8448), dtype=torch.uint8, device=device, generator=gen)
+                  for _ in range(world)]
+    lat_stages = [torch.zeros((stage_rows, 576), dtype=torch.uint8, device=device) for _ in range(world)]
+    idx_stages = [torch.zeros((stage_pages, 8448), dtype=torch.uint8, device=device) for _ in range(world)]
+    lat_addrs = torch.tensor([t.data_ptr() for t in lat_stages], dtype=torch.int64, device=device)
+    idx_addrs = torch.tensor([t.data_ptr() for t in idx_stages], dtype=torch.int64, device=device)
+    lat_outs = [torch.empty((maximum, 576), dtype=torch.uint8, device=device) for _ in range(world)]
+    idx_outs = [torch.empty((stage_pages * world, 8448), dtype=torch.uint8, device=device) for _ in range(world)]
+    table = ((torch.arange(cols, dtype=torch.int32, device=device) * 3 + 1) % pages).to(torch.int32)
+    ranks = [torch.tensor([r], dtype=torch.int64, device=device) for r in range(world)]
+    zero_sig = torch.zeros((1, 8), dtype=torch.bfloat16, device=device)
+    sink_sig = torch.zeros((1, 8), dtype=torch.bfloat16, device=device)
+    end = torch.zeros(1, dtype=torch.int64, device=device)
+
+    lat_ref = torch.empty((maximum, 576), dtype=torch.uint8, device=device)
+    idx_ref = torch.empty((stage_pages * world, 8448), dtype=torch.uint8, device=device)
+
+    # Test edge lengths below, at, and above fast_limit (stage_rows), plus zero and full maximum.
+    counts = (0, 1, world - 1, world, 63, 64, 129, stage_rows - 1, stage_rows, stage_rows + 1, maximum)
+    words = 576 // 4
+    block = triton.next_power_of_2(words)
+    lat_blocks = min(64, max(1, triton.cdiv(slot_rows, 4)))
+    idx_blocks = min(64, max(1, slot_pages * 8))
+
+    for count in counts:
+        end.fill_(count)
+        # Reference baseline pack + unpack
+        for r in range(world):
+            ih._pack[(min(1024, triton.cdiv(stage_rows, 4)),)](
+                lat_caches[r].view(torch.int32), table, end, ranks[r], zero_sig,
+                lat_stages[r].view(torch.int32), sink_sig, COLUMNS=cols, CACHE_PAGES=pages,
+                PAGE=128, WORLD=world, MAXIMUM=maximum, WORDS=words, BLOCK=block, num_warps=4)
+            pih._pack[(min(1024, stage_pages * 16),)](
+                idx_caches[r].view(torch.int32), table, end, ranks[r], zero_sig,
+                idx_stages[r].view(torch.int32), sink_sig, COLUMNS=cols, CACHE_PAGES=2 * pages,
+                WORLD=world, MAXIMUM=maximum, num_warps=4)
+        lat_ref.fill_(173)
+        idx_ref.fill_(173)
+        ih._unpack[(min(1024, triton.cdiv(maximum, 8)),)](
+            lat_addrs, end, zero_sig, lat_ref.view(torch.int32), sink_sig,
+            WORLD=world, MAXIMUM=maximum, WORDS=words, BLOCK=block, num_warps=4)
+        pih._unpack[(min(1024, idx_ref.shape[0] * 8),)](
+            idx_addrs, end, zero_sig, idx_ref.view(torch.int32), sink_sig,
+            WORLD=world, MAXIMUM=maximum, num_warps=4)
+
+        # Candidate posted-write push / fallback across all ranks
+        for r in range(world):
+            lat_stages[r].fill_(201)
+            idx_stages[r].fill_(201)
+            lat_outs[r].fill_(173)
+            idx_outs[r].fill_(173)
+        if world == 4:
+            for r in range(world):
+                ih._push_direct_or_pack[(lat_blocks, 3)](
+                    lat_caches[r].view(torch.int32), table, end, ranks[r], zero_sig,
+                    lat_stages[r].view(torch.int32), lat_addrs, lat_outs[r].view(torch.int32), sink_sig,
+                    COLUMNS=cols, CACHE_PAGES=pages, PAGE=128, WORLD=world, MAXIMUM=maximum,
+                    FAST_LIMIT=stage_rows, SLOT_ROWS=slot_rows, WORDS=words, BLOCK=block, num_warps=4)
+                pih._push_direct_or_pack[(idx_blocks, 3)](
+                    idx_caches[r].view(torch.int32), table, end, ranks[r], zero_sig,
+                    idx_stages[r].view(torch.int32), idx_addrs, idx_outs[r].view(torch.int32), sink_sig,
+                    COLUMNS=cols, CACHE_PAGES=2 * pages, WORLD=world, MAXIMUM=maximum,
+                    FAST_LIMIT=stage_rows, SLOT_PAGES=slot_pages, num_warps=4)
+            for r in range(world):
+                ih._unpack_direct_or_mrd[(lat_blocks, 3)](
+                    lat_stages[r].view(torch.int32), lat_addrs, end, ranks[r], zero_sig,
+                    lat_outs[r].view(torch.int32), sink_sig, WORLD=world, MAXIMUM=maximum,
+                    FAST_LIMIT=stage_rows, SLOT_ROWS=slot_rows, WORDS=words, BLOCK=block, num_warps=4)
+                pih._unpack_direct_or_mrd[(idx_blocks, 3)](
+                    idx_stages[r].view(torch.int32), idx_addrs, end, ranks[r], zero_sig,
+                    idx_outs[r].view(torch.int32), sink_sig, WORLD=world, MAXIMUM=maximum,
+                    FAST_LIMIT=stage_rows, SLOT_PAGES=slot_pages, num_warps=4)
+        else:
+            islands = world // 4
+            for r in range(world):
+                ih._twohop_hop1_or_pack[(lat_blocks, islands + 2)](
+                    lat_caches[r].view(torch.int32), table, end, ranks[r], zero_sig,
+                    lat_stages[r].view(torch.int32), lat_addrs, lat_outs[r].view(torch.int32), sink_sig,
+                    COLUMNS=cols, CACHE_PAGES=pages, PAGE=128, WORLD=world, ISLANDS=islands,
+                    MAXIMUM=maximum, FAST_LIMIT=stage_rows, SLOT_ROWS=slot_rows, WORDS=words,
+                    BLOCK=block, num_warps=4)
+                pih._twohop_hop1_or_pack[(idx_blocks, islands + 2)](
+                    idx_caches[r].view(torch.int32), table, end, ranks[r], zero_sig,
+                    idx_stages[r].view(torch.int32), idx_addrs, idx_outs[r].view(torch.int32), sink_sig,
+                    COLUMNS=cols, CACHE_PAGES=2 * pages, WORLD=world, ISLANDS=islands,
+                    MAXIMUM=maximum, FAST_LIMIT=stage_rows, SLOT_PAGES=slot_pages, num_warps=4)
+            for r in range(world):
+                ih._twohop_hop2_or_unpack[(lat_blocks, 3)](
+                    lat_stages[r].view(torch.int32), lat_addrs, end, ranks[r], zero_sig,
+                    lat_outs[r].view(torch.int32), sink_sig, WORLD=world, ISLANDS=islands,
+                    MAXIMUM=maximum, FAST_LIMIT=stage_rows, SLOT_ROWS=slot_rows, WORDS=words,
+                    BLOCK=block, num_warps=4)
+                pih._twohop_hop2_or_unpack[(idx_blocks, 3)](
+                    idx_stages[r].view(torch.int32), idx_addrs, end, ranks[r], zero_sig,
+                    idx_outs[r].view(torch.int32), sink_sig, WORLD=world, ISLANDS=islands,
+                    MAXIMUM=maximum, FAST_LIMIT=stage_rows, SLOT_PAGES=slot_pages, num_warps=4)
+            for r in range(world):
+                ih._twohop_unpack_tail[(lat_blocks, 3)](
+                    lat_stages[r].view(torch.int32), end, ranks[r], zero_sig,
+                    lat_outs[r].view(torch.int32), sink_sig, WORLD=world, ISLANDS=islands,
+                    MAXIMUM=maximum, FAST_LIMIT=stage_rows, SLOT_ROWS=slot_rows, WORDS=words,
+                    BLOCK=block, num_warps=4)
+                pih._twohop_unpack_tail[(idx_blocks, 3)](
+                    idx_stages[r].view(torch.int32), end, ranks[r], zero_sig,
+                    idx_outs[r].view(torch.int32), sink_sig, WORLD=world, ISLANDS=islands,
+                    MAXIMUM=maximum, FAST_LIMIT=stage_rows, SLOT_PAGES=slot_pages, num_warps=4)
+        torch.cuda.synchronize()
+        full_pages, rem = divmod(count, 64)
+        for r in range(world):
+            assert torch.equal(lat_outs[r][:count], lat_ref[:count]), f"latent mismatch world={world} rank={r} count={count}"
+            assert torch.equal(idx_outs[r][:full_pages], idx_ref[:full_pages]), f"index page mismatch world={world} rank={r} count={count}"
+            if rem:
+                assert torch.equal(idx_outs[r][full_pages, :rem * 128], idx_ref[full_pages, :rem * 128])
+                assert torch.equal(idx_outs[r][full_pages, 8192:8192 + rem * 4], idx_ref[full_pages, 8192:8192 + rem * 4])
