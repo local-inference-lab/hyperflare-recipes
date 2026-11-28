@@ -64,6 +64,14 @@ class PreparationConfig(BasePreparationConfig):
         return self.parameters.native_dense_activations.enabled
 
     @property
+    def online_mxfp8(self) -> bool:
+        return self.parameters.online_mxfp8.enabled
+
+    @property
+    def online_mxfp8_scope(self) -> str:
+        return self.parameters.online_mxfp8.effective_scope
+
+    @property
     def drafting(self) -> bool:
         return self.parameters.speculation is not None
 
@@ -192,7 +200,7 @@ class _Softcapped:
         self.projection, self.softcap = projection, softcap
 
     def __call__(self, source):
-        return self.softcap * torch.tanh(self.projection(source) / self.softcap)
+        return self.softcap * torch.tanh(self.projection(source).float() / self.softcap)
 
 
 class InklingResume(PreparedResume):
@@ -203,7 +211,8 @@ class InklingResume(PreparedResume):
     """
 
     def __init__(self, weights, *args, **kwargs):
-        super().__init__(weights, *args, logits_dtype=torch.float32, **kwargs)
+        logits_dtype = torch.float32 if isinstance(weights.head, torch.Tensor) else torch.bfloat16
+        super().__init__(weights, *args, logits_dtype=logits_dtype, **kwargs)
         self.projection = _Softcapped(self.projection, weights.config.text.softcap)
 
 
@@ -238,7 +247,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
         weights = ModelWeights.load(manifest, device, shard=shard, layers=config.decoder_layers,
                                     progress=progress, drafting=config.drafting, vision=config.vision,
                                     draft_head_quantization=config.draft_head_quantization,
-                                    markov_head_quantization=config.markov_head_quantization)
+                                    markov_head_quantization=config.markov_head_quantization,
+                                    online_mxfp8=config.online_mxfp8,
+                                    online_mxfp8_scope=config.online_mxfp8_scope)
         weights_bytes = torch.cuda.memory_allocated(device)
     if torch.cuda.get_device_properties(device).is_integrated:
         from ignition.preparation.host_memory import release_page_cache
@@ -274,14 +285,18 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
         sequence = torch.zeros(1, dtype=torch.int64, device=device)
         width = max((w for _, w, _ in config.speculative_round_shapes), default=1)
         completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + width), device=device)
+        from .vocabulary import head_rows
         coordinator = CollectivePreparation(group) if group is not None else None
         runtime, vocabulary_runtime, sampling_runtime, logprob_runtime = _collective_runtimes(
             config, group, device, coordinator=coordinator, core_storage=core_storage,
-            hidden=text.hidden, local_vocabulary=weights.head.shape[0],
+            hidden=text.hidden, local_vocabulary=head_rows(weights.head),
             draft_block=model.draft.block)
         identity_payload = {"text": model.text.__dict__ | {"local_layers": sorted(model.text.local_layers)},
             "quantization": model.quantization, "headers": headers, "world_size": world,
             "decoder_layers": len(weights.layers), "contract": "inkling2.paged-text.v1"}
+        if config.online_mxfp8:
+            identity_payload["online_mxfp8"] = True
+            identity_payload["online_mxfp8_scope"] = config.online_mxfp8_scope
         if config.draft_head_quantization is not None:
             identity_payload["draft_head_quantization"] = config.draft_head_quantization
         if config.markov_head_quantization is not None:

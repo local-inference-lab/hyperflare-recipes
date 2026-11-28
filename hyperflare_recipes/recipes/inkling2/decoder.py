@@ -21,7 +21,7 @@ from ignition.preparation.examples import declaration_tensor
 
 from .attention import LayerCache, PreparedAttention
 from .residual import PreparedResidualMix
-from .vocabulary import PreparedLogits, embedding_rows
+from .vocabulary import PreparedLogits, embedding_rows, head_rows
 
 
 @dataclass(frozen=True)
@@ -61,7 +61,8 @@ class PreparedLayer(torch.nn.Module):
         self.attention = PreparedAttention(layer, weights.attention, text, LayerCache.of(pool, cache_layer), metadata,
             mode=mode, tokens=tokens, session=session, workspace=workspace, name=name + ".attention", examples=examples,
             tuning_page_count=((int(pool.memory_capacity[0].item()) - 1) * pool.ring_row_pages + pool.geometry.ring // 128
-                               if text.local(layer) else int(pool.memory_capacity[1].item())))
+                               if text.local(layer) else int(pool.memory_capacity[1].item())),
+            output_dtype=reduction_dtype)
         device = weights.router.device
         def example(role, shape, dtype=torch.bfloat16):
             return declaration_tensor(examples, "inkling.mlp." + role, shape, dtype, device)
@@ -149,9 +150,10 @@ class PreparedDecoder:
             session=session, workspace=workspace, name=f"{name}.layer{index}", examples=examples)
             for index, layer in enumerate(weights.layers)]
         self.logits = PreparedLogits(weights.head, text, weights.rank, tokens=samples,
-                                     session=session, name=name + ".logits", examples=examples)
-        local = example("local_logits", (samples, weights.head.shape[0]), torch.float32)
-        gathered = example("gathered_logits", (samples, weights.head.shape[0] * weights.world), torch.float32)
+                                     session=session, name=name + ".logits", workspace=workspace, examples=examples)
+        vocab_cols = head_rows(weights.head)
+        local = example("local_logits", (samples, vocab_cols), torch.float32)
+        gathered = example("gathered_logits", (samples, vocab_cols * weights.world), torch.float32)
         self.gather = PreparedAllGather(local.view(torch.bfloat16), gathered.view(torch.bfloat16),
             runtime=vocabulary_runtime, coordinator=coordinator, session=session,
             name=name + ".logit_gather").functional(session=session)

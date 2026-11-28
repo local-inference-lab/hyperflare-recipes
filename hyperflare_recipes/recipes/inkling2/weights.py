@@ -9,11 +9,45 @@ from functools import cached_property
 import torch
 
 from hyperflare_recipes.components.weights import DirectWeightLoader
-from ignition.preparation.persistent import persistent_copy, persistent_zeros
+from ignition.preparation.persistent import persistent_copy, persistent_empty, persistent_zeros
 
 from .attention import AttentionWeights, attention_weights
 from .config import ModelConfig, TEXT_PREFIX
 from ignition.preparation.rebuild_manifest import weight_container
+
+
+def _quantize_head_as_mxfp8(weight, *, chunk_rows=16384):
+    """Quantize large vocabulary head BF16 -> MXFP8 in row tiles to cap peak transient VRAM."""
+    from b12x.gemm._shared.wo_mxfp8 import (
+        MXFP8Rows,
+        pack_mxfp8_scales_for_dense_gemm,
+        quantize_mxfp8_rows_torch,
+    )
+    from b12x.gemm.blockscaled._linear import MXFP8LinearWeight
+
+    if (weight.ndim != 2 or weight.dtype != torch.bfloat16 or not weight.is_cuda
+            or min(weight.shape) <= 0 or weight.shape[1] % 32):
+        raise ValueError("MXFP8 conversion requires a BF16 CUDA matrix with 32-aligned input width")
+    rows, columns = weight.shape
+    padded = (columns + 127) // 128 * 128
+    values = persistent_empty((rows, padded), dtype=torch.float8_e4m3fn, device=weight.device)
+    scale_rows = persistent_empty((1, rows, padded // 32), dtype=torch.float8_e8m0fnu, device=weight.device)
+    for start in range(0, rows, chunk_rows):
+        stop = min(start + chunk_rows, rows)
+        tile = weight[start:stop]
+        if not bool(torch.isfinite(tile).all()):
+            raise ValueError("MXFP8 conversion requires finite BF16 weights")
+        if columns != padded:
+            tile = torch.nn.functional.pad(tile, (0, padded - columns))
+        q = quantize_mxfp8_rows_torch(tile, retain_scale_rows=True)
+        values[start:stop].copy_(q.values)
+        scale_rows[:, start:stop, :].copy_(q.scale_rows)
+        del q, tile
+    scale_mma = pack_mxfp8_scales_for_dense_gemm(
+        scale_rows, m=rows, k=padded, num_groups=1, allocate=persistent_empty
+    )
+    return MXFP8LinearWeight(MXFP8Rows(values=values, scale_rows=scale_rows, scale_mma=scale_mma),
+                             columns, padded, rows)
 
 
 def scaled_query(query, hidden):
@@ -46,7 +80,7 @@ class ModelWeights:
     embedding_norm: torch.Tensor
     final_norm: torch.Tensor
     output_query: torch.Tensor
-    unembedding: torch.Tensor
+    unembedding: object
     allocated_bytes: int
     draft: object | None = None
     vision: object | None = None
@@ -70,26 +104,31 @@ class ModelWeights:
 
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, drafting=True, vision=True, layers=None,
-             draft_head_quantization=None, markov_head_quantization=None):
+             draft_head_quantization=None, markov_head_quantization=None,
+             online_mxfp8=False, online_mxfp8_scope="attention"):
         before = torch.cuda.memory_allocated(device)
+        target_attention_mxfp8 = bool(online_mxfp8 and online_mxfp8_scope in ("attention", "all"))
+        target_head_mxfp8 = bool(online_mxfp8 and online_mxfp8_scope == "all")
         loader_type = InklingWeightLoader
         if "model.llm.embed.weight" in manifest.tensors:
             from .mini_weights import MiniWeightLoader
             loader_type = MiniWeightLoader
-        with loader_type(manifest, device, shard=shard, progress=progress, vision=vision) as loader:
+        with loader_type(manifest, device, shard=shard, progress=progress, vision=vision,
+                         online_mxfp8_attention=target_attention_mxfp8) as loader:
             c = loader.config
             count = c.text.layers if layers is None else layers
             if type(count) is not int or not 1 <= count <= c.text.layers:
                 raise ValueError("decoder layer count must fit the checkpoint")
             first, last = shard.padded_partition(c.text.vocabulary, alignment=64)
-            def vocabulary_rows(name):
-                value = persistent_zeros((last - first, c.text.hidden), dtype=torch.bfloat16, device=device)
+            def vocabulary_rows(name, *, temporary=False):
+                alloc = torch.zeros if temporary else persistent_zeros
+                value = alloc((last - first, c.text.hidden), dtype=torch.bfloat16, device=device)
                 stop = min(last, c.text.vocabulary)
                 loader._copy(value[:stop - first], loader._sources[name][first:stop])
                 loader._session.flush()
                 return value
             embedding = vocabulary_rows(TEXT_PREFIX + ".embed_tokens.weight")
-            head = vocabulary_rows("lm_head.weight")
+            head = vocabulary_rows("lm_head.weight", temporary=target_head_mxfp8)
             loaded = tuple(loader.load_layer(index) for index in range(count))
             norm = loader.load_tensor(TEXT_PREFIX + ".norm.weight")
             embed_norm = loader.load_tensor(TEXT_PREFIX + ".embed_norm.weight")
@@ -111,6 +150,10 @@ class ModelWeights:
             draft = DraftWeights.load(manifest.snapshot, c, device, shard, target_head=head, progress=progress,
                                       draft_head_quantization=draft_head_quantization,
                                       markov_head_quantization=markov_head_quantization)
+        if target_head_mxfp8:
+            head = _quantize_head_as_mxfp8(head)
+        if (target_attention_mxfp8 or target_head_mxfp8) and device.type == "cuda":
+            torch.cuda.empty_cache()
         cross_pass_queries_t = None
         if c.text.loop is not None and count >= c.text.loop.core_end:
             core = range(c.text.loop.core_start, c.text.loop.core_end)
@@ -122,11 +165,12 @@ class ModelWeights:
 
 
 class InklingWeightLoader(DirectWeightLoader):
-    def __init__(self, manifest, device, *, shard, progress=None, vision=True):
+    def __init__(self, manifest, device, *, shard, progress=None, vision=True, online_mxfp8_attention=False):
         super().__init__(manifest, device, progress=progress)
         self.config = ModelConfig.load(manifest.snapshot)
         self.config.validate_shard(shard)
         self.shard, self.vision = shard, vision
+        self.online_mxfp8_attention = bool(online_mxfp8_attention)
 
     @cached_property
     def quantization(self):
@@ -154,7 +198,8 @@ class InklingWeightLoader(DirectWeightLoader):
                                    ("relative_query", "r_proj", (q0 * c.relative_width, q1 * c.relative_width)),
                                    ("sink", "sink_proj", (q0, q1))):
             placed[role] = self.load_linear(a + "." + name, rows=extent, temporary=True)
-        placed["output"] = self.load_linear(a + ".o_proj", columns=query_rows)
+        placed["output"] = self.load_linear(a + ".o_proj", columns=query_rows,
+                                            temporary=self.online_mxfp8_attention)
         for role, name in (("query_clip_scale", "q_l2_clip.scale"),
                            ("relative_clip_scale", "rel_l2_clip.scale")):
             placed[role] = self.load_tensor(a + "." + name, extent=slice(q0, q1))
@@ -176,7 +221,8 @@ class InklingWeightLoader(DirectWeightLoader):
             norms = tuple(self.load_tensor(prefix + f".{n}_input_layernorm.weight") for n in ("q", "k", "v"))
         attention = attention_weights(placed, local=c.local(index), heads=q1 - q0, kv_heads=k1 - k0,
                                       dim=c.head_dim, width=c.convolution_width,
-                                      separate_inputs=c.loop is not None and c.loop.core_start <= index < c.loop.core_end)
+                                      separate_inputs=c.loop is not None and c.loop.core_start <= index < c.loop.core_end,
+                                      online_mxfp8=self.online_mxfp8_attention)
         attention_query = None if index == 0 else scaled_query(
             self.load_tensor(prefix + ".attention_input.query"), c.hidden)
         return LayerWeights(attention, load_experts(self, index, shard=s),

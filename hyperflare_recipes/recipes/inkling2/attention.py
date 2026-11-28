@@ -22,7 +22,7 @@ import triton.language as tl
 
 from hyperflare_recipes.components.causal_convolution import PreparedCausalConvolution
 from hyperflare_recipes.components.head_gate import PreparedHeadGate
-from hyperflare_recipes.components.linear import UnquantizedProjection
+from hyperflare_recipes.components.linear import UnquantizedProjection, prepare_projection
 from hyperflare_recipes.components.paged_attention import PreparedPagedAttention, PreparedPagedKVWriter
 from hyperflare_recipes.components.rms_norm import PreparedRMSNorm
 from ignition.preparation.persistent import persistent_empty
@@ -78,17 +78,17 @@ class AttentionWeights:
     `relative_rows` its contiguous `[extent, 16]` transpose.
     """
 
-    projections: tuple[torch.Tensor, ...]
+    projections: tuple[object, ...]
     query_clip_scale: torch.Tensor
     relative_clip_scale: torch.Tensor
     relative_projection: torch.Tensor
     relative_rows: torch.Tensor
     key_convolution: torch.Tensor
     value_convolution: torch.Tensor
-    output: torch.Tensor
+    output: object
 
 
-def fuse_projections(placed, columns: Columns, *, local):
+def fuse_projections(placed, columns: Columns, *, local, online_mxfp8=False):
     """Concatenate a rank's projection rows in `Columns` order; padding rows are zero."""
     from ignition.preparation.persistent import persistent_zeros
 
@@ -97,7 +97,11 @@ def fuse_projections(placed, columns: Columns, *, local):
     fused = []
     for stream, width in zip(columns.streams, columns.widths(), strict=True):
         hidden = placed["query"].shape[1]
-        weight = persistent_zeros((width, hidden), dtype=torch.bfloat16, device=placed["query"].device)
+        if online_mxfp8:
+            from hyperflare_recipes.components.weights import quantize_bf16_linear_as_mxfp8
+            weight = torch.zeros((width, hidden), dtype=torch.bfloat16, device=placed["query"].device)
+        else:
+            weight = persistent_zeros((width, hidden), dtype=torch.bfloat16, device=placed["query"].device)
         offset = 0
         for name, rows in stream:
             source = placed[names[name]]
@@ -105,11 +109,11 @@ def fuse_projections(placed, columns: Columns, *, local):
                 raise ValueError(f"{names[name]} has {tuple(source.shape)} rows, the fused projection requires {rows}")
             weight[offset:offset + rows].copy_(source)
             offset += rows
-        fused.append(weight)
+        fused.append(quantize_bf16_linear_as_mxfp8(weight) if online_mxfp8 else weight)
     return tuple(fused)
 
 
-def attention_weights(placed, *, local, heads, kv_heads, dim, width, separate_inputs=False):
+def attention_weights(placed, *, local, heads, kv_heads, dim, width, separate_inputs=False, online_mxfp8=False):
     """Serving attention tensors from one rank's placed checkpoint roles (`weights.checkpoint_layout`)."""
     from ignition.preparation.persistent import persistent_copy
 
@@ -119,9 +123,13 @@ def attention_weights(placed, *, local, heads, kv_heads, dim, width, separate_in
         key, value = placed["key_convolution"], placed["value_convolution"]
     else:
         key, value = placed["key_convolution_static"], placed["value_convolution_static"]
-    return AttentionWeights(fuse_projections(placed, columns, local=local), placed["query_clip_scale"],
-        placed["relative_clip_scale"], projection, persistent_copy(projection.t().contiguous()), key, value,
-        placed["output"])
+    output = placed["output"]
+    if online_mxfp8:
+        from hyperflare_recipes.components.weights import quantize_bf16_linear_as_mxfp8
+        output = quantize_bf16_linear_as_mxfp8(output)
+    return AttentionWeights(fuse_projections(placed, columns, local=local, online_mxfp8=online_mxfp8),
+        placed["query_clip_scale"], placed["relative_clip_scale"], projection,
+        persistent_copy(projection.t().contiguous()), key, value, output)
 
 
 @dataclass(frozen=True)
@@ -179,7 +187,7 @@ class PreparedAttention(torch.nn.Module):
     """A rank's attention for prefill, decode or speculative verification."""
 
     def __init__(self, layer, weights: AttentionWeights, text, cache: LayerCache, metadata, *, mode, tokens,
-                 session, workspace, name, examples=None, tuning_page_count=None):
+                 session, workspace, name, examples=None, tuning_page_count=None, output_dtype=torch.float32):
         super().__init__()
         if mode not in ("prefill", "decode", "verify"):
             raise ValueError(f"unsupported Inkling attention mode: {mode}")
@@ -194,7 +202,7 @@ class PreparedAttention(torch.nn.Module):
             dynamic_heads=0 if self.local else self.kv_heads)
         self.value_convolution = PreparedCausalConvolution(weights.value_convolution, cache.value_history,
             dynamic_heads=0 if self.local else self.kv_heads)
-        device = weights.output.device
+        device = weights.query_clip_scale.device
         examples = {} if examples is None else examples
 
         def example(role, shape, dtype=torch.bfloat16):
@@ -202,14 +210,18 @@ class PreparedAttention(torch.nn.Module):
             return declaration_tensor(examples, role, shape, dtype, device)
 
         source = example("inkling.attention.source", (tokens, text.hidden))
-        self.projections = tuple(UnquantizedProjection(source, weight,
+        self.projections = tuple(prepare_projection(source, weight,
             example(f"inkling.attention.projection{index}", (tokens, width)), session=session,
-            name=f"{name}.projection{index}").functional(session=session)
+            name=f"{name}.projection{index}", workspace=workspace).functional(session=session)
             for index, (weight, width) in enumerate(zip(weights.projections, self.columns.widths(), strict=True)))
         attended = example("inkling.attention.attended", (tokens, self.heads * self.dim))
-        self.output_projection = UnquantizedProjection(attended, weights.output,
-            example("inkling.attention.partial", (tokens, text.hidden), torch.float32),
-            session=session, name=f"{name}.output").functional(session=session)
+        proj_out_dtype = (torch.bfloat16 if (output_dtype == torch.bfloat16 or not isinstance(weights.output, torch.Tensor))
+                          else torch.float32)
+        self._upcast_output = output_dtype == torch.float32 and proj_out_dtype == torch.bfloat16
+        partial_role = "inkling.attention.partial" if proj_out_dtype == torch.float32 else "inkling.attention.partial_bf16"
+        self.output_projection = prepare_projection(attended, weights.output,
+            example(partial_role, (tokens, text.hidden), proj_out_dtype),
+            session=session, name=f"{name}.output", workspace=workspace).functional(session=session)
         query = example("inkling.attention.query", (tokens, self.heads, self.dim))
         output = example("inkling.attention.output", (tokens, self.heads, self.dim))
         sink = example("inkling.attention.sink", (tokens, self.heads), torch.float32)
@@ -336,7 +348,10 @@ class PreparedAttention(torch.nn.Module):
             attended = self._decode(values, m)
         attended = self.gate(attended.view(attended.shape[0], -1, 1),
             values["gate"].reshape(attended.shape[0], -1)).flatten(1)
-        return attended, self.output_projection(attended), values
+        partial = self.output_projection(attended)
+        if self._upcast_output:
+            partial = partial.float()
+        return attended, partial, values
 
     def forward(self, streams, metadata):
         return self.attend(streams, metadata)[1]
