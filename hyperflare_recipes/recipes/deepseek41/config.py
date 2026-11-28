@@ -77,10 +77,14 @@ class ModelConfig:
         }.items():
             if text.get(name) != value:
                 raise ValueError(f"DeepSeek V4.1 Flash {name} requires {value}, got {text.get(name)}")
-        if (quant.get("quant_method") != "fp8" or quant.get("weight_block_size") != [32, 32]
+        method = quant.get("quant_method")
+        if method == "mxfp4_csf" and (type(quant.get("format_version")) is not int
+                or quant["format_version"] != 1 or quant.get("weight_scale_encoding") != "csf"):
+            raise ValueError("DeepSeek V4.1 MXFP4-CSF requires format version 1 and CSF scale encoding")
+        if (method not in ("fp8", "mxfp4_csf") or quant.get("weight_block_size") != [32, 32]
                 or quant.get("scale_fmt") != "ue8m0" or quant.get("expert_dtype") != "fp4"
                 or quant.get("activation_scheme") != "dynamic"):
-            raise ValueError("DeepSeek V4.1 requires block-32 FP8 weights and native MXFP4 experts")
+            raise ValueError("DeepSeek V4.1 requires block-32 FP8 weights and native or lossless-CSF MXFP4 experts")
         vision = config.get("vision_config")
         if vision is not None:
             for key, expected in {"num_hidden_layers": 32, "hidden_size": 1024,

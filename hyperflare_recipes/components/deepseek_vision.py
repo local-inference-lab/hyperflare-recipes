@@ -94,6 +94,7 @@ class PreparedVision:
     def __init__(self, weights, scratch, inputs, *, session, workspace, name):
         self.inputs = inputs
         self.capacity = scratch.patches.shape[0]
+        self.position_limit = self.capacity
         tokens, device = scratch.patches.shape[0], scratch.patches.device
         self.frequencies = persistent_copy(10000 ** (-torch.arange(0, 32, 2, dtype=torch.float32, device=device) / 32))
         cu = torch.zeros(2, dtype=torch.int32, device=device)
@@ -178,11 +179,16 @@ class PreparedVision:
             residual = residual + output(attended)
             residual = residual + mlp(norm2(residual))
         normalized = self.norm(residual)
-        indices = indices.long()
-        gathered = normalized[indices.clamp(0, normalized.shape[0] - 1)]
-        gathered = torch.where(indices[:, :, None] >= 0, gathered, 0)
-        merged = gathered.transpose(1, 2).reshape(indices.shape[0], -1)
+        merged = merge_image_features(normalized, indices)
         return self.align2(F.gelu(self.align1(merged)))
+
+
+def merge_image_features(features, indices):
+    """Concatenate each spatial patch group in channel-major order."""
+    indices = indices.long()
+    gathered = features[indices.clamp(0, features.shape[0] - 1)]
+    gathered = torch.where(indices[:, :, None] >= 0, gathered, 0)
+    return gathered.transpose(1, 2).reshape(indices.shape[0], -1)
 
 
 @dataclass(frozen=True)
@@ -282,7 +288,8 @@ class PreparedVisionGeneration:
         valid &= (~patch_live[:, None] | torch.isfinite(i.vision_pixel_values[:capacity])).all()
         valid &= (
             ~patch_live[:, None]
-            | ((i.vision_position_ids[:capacity] >= 0) & (i.vision_position_ids[:capacity] < capacity))
+            | ((i.vision_position_ids[:capacity] >= 0)
+               & (i.vision_position_ids[:capacity] < e.position_limit))
         ).all()
         valid &= (s.feature_slot >= 0) & (s.feature_slot < s.arena.shape[0])
         errors = (~valid).to(torch.int32)

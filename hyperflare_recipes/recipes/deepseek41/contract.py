@@ -30,8 +30,10 @@ def prepare(signatures, buffers, pool, *, image_slots=4, page_tokens, draft_lag,
     regions = list(regions)
     for name, tensor in pool.pages.items():
         layer = int(name.split(".")[0].removeprefix("layer"))
+        ratio = (pool.geometry.layers[layer].ratio if hasattr(pool, "geometry")
+                 else pool.config.text["compress_ratios"][layer])
         regions.append(c.history_region(buffers, "cache." + name, tensor, p.PAGED_LATENT,
-            tokens_per_record=pool.config.text["compress_ratios"][layer]))
+            tokens_per_record=ratio))
     inputs = {kind: c.text_inputs(kind) for kind in {s.kind for s in signatures.values()} if kind != "vision"}
     inputs["vision"] = c.vision_inputs({field for s in signatures.values() if s.kind == "vision" for field in s.inputs})
     continuation = c.state_view("state_pool", pool.layout.row_bytes)

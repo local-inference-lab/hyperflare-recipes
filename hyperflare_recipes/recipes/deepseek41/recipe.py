@@ -39,13 +39,16 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         headroom_bytes=plan.headroom_bytes + plan.reserve_bytes, kernel_cache=kernel_cache,
         dspark=speculation is not None,
         stream_overlap=plan.stream_overlap, expert_scale_compression=plan.expert_scale_compression,
-        mla_compute_mode=plan.mla_compute_mode, **drafting)
+        mla_compute_mode=plan.mla_compute_mode, sm103=getattr(plan, "sm103", None), **drafting)
+    if plan.world_size == 1:
+        return prepare_rank(snapshot, config, rank=0, group=None, progress=progress, core_storage=core_storage)
     return prepare_group(snapshot, config, prepare_rank, progress=progress, core_storage=core_storage,
                          ranks=ranks, checkpoint=plan.checkpoint)
 
 
 def usage(prepared):
-    return tuple(RankUsage(rank["pages"], rank["free_device_bytes"]) for rank in prepared.memory_report["ranks"])
+    report = prepared.memory_report
+    return tuple(RankUsage(rank["pages"], rank["free_device_bytes"]) for rank in report.get("ranks", (report,)))
 
 
 RECIPE = Recipe(
