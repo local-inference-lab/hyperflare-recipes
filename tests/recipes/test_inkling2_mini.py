@@ -56,6 +56,11 @@ def test_mini_visits_and_cache_storage(mini_config_dir):
     assert len({r.offset for r in histories}) == 3
     assert cache.global_layers == (5, 11, 17, 23, 29, 35, 41, 47)
     assert sum(s[0] for _, s in page_specs(cache, geometry)) == 2097152
+    nvfp4_geometry = RankGeometry.of(cache, 1, kv_format="nvfp4_4o6k")
+    assert sum(s[0] for _, s in page_specs(cache, nvfp4_geometry)) == 1_179_648
+    assert sum(s[0] for _, s in page_specs(cache, nvfp4_geometry, config.draft)) == 1_703_936
+    assert continuation_layout(cache, nvfp4_geometry).row_bytes == 97_517_568
+    assert continuation_layout(cache, nvfp4_geometry, config.draft).row_bytes == 106_430_464
     assert config.draft.taps == (5, 23, 41, 48)
 
 
@@ -262,3 +267,93 @@ def test_loop_histories_snapshot_branch_restore(snapshot, endpoint, drafting):
             assert torch.equal(cache[2], tails[name])
         assert not cache[3:].count_nonzero()
     graph.reset()
+
+
+@pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="requires assigned CUDA device")
+@pytest.mark.parametrize("mode,batch,width", [("decode", 4, 1), ("verify", 2, 8), ("extend", 2, 64)])
+@torch.no_grad()
+def test_nvfp4_paged_attention_component_modes_and_inactive_rows(mini_config_dir, mode, batch, width):
+    from hyperflare_recipes.components.paged_attention import PreparedPagedAttention, PreparedPagedKVWriter
+    from hyperflare_recipes.recipes.inkling2.pool import ContinuationPool, PAGE_TOKENS, RankGeometry
+    from ignition.preparation.scratch import ScratchArena
+    from ignition.preparation.tuning import RecordedPreparationSession
+
+    device = torch.device("cuda:0")
+    torch.manual_seed(707 + batch * 11 + width)
+    config = ModelConfig.load(mini_config_dir)
+    text = config.text.cache_config
+    geometry = RankGeometry.of(text, 1, kv_format="nvfp4_4o6k")
+    pool = ContinuationPool.allocate(text, geometry, 4, 16, device, draft=config.draft)
+    layer = text.global_layers[0]
+    k_cache, k_scales = pool.cache(layer, "key"), pool.cache_scales(layer, "key")
+    v_cache, v_scales = pool.cache(layer, "value"), pool.cache_scales(layer, "value")
+    assert k_cache.shape[1:] == (PAGE_TOKENS, geometry.kv_heads, geometry.head_dim // 2)
+    assert k_scales.shape[1:] == (PAGE_TOKENS, geometry.kv_heads, geometry.head_dim // 16)
+
+    total_q = batch * width
+    q = (torch.randn(total_q, geometry.heads, geometry.head_dim, device=device) * 0.5).to(torch.bfloat16)
+    out = torch.empty_like(q)
+    pages = torch.zeros((batch, 4), dtype=torch.int32, device=device)
+    lengths = torch.zeros((batch,), dtype=torch.int32, device=device)
+    cu = torch.arange(0, total_q + 1, width, dtype=torch.int32, device=device)
+    sink = torch.randn(total_q, geometry.heads, dtype=torch.float32, device=device) * 0.5
+    key_in = (torch.randn(total_q, geometry.kv_heads, geometry.head_dim, device=device) * 0.5).to(torch.bfloat16)
+    val_in = (torch.randn(total_q, geometry.kv_heads, geometry.head_dim, device=device) * 0.5).to(torch.bfloat16)
+    slots = torch.full((total_q,), -1, dtype=torch.int64, device=device)
+
+    bias_kw = (
+        dict(
+            relative_bias_factors=(torch.randn(total_q, geometry.heads, 16, device=device) * 0.25).to(torch.bfloat16),
+            relative_bias_projection=(torch.randn(1024, 16, device=device) * 0.25).to(torch.bfloat16),
+        )
+        if mode == "extend"
+        else dict(relative_bias=(torch.randn(total_q, geometry.heads, 1024, device=device) * 0.1).to(torch.bfloat16))
+    )
+
+    arena = ScratchArena(device)
+    with RecordedPreparationSession(
+        device=device, checkpoint="test", workload_schema="inkling2", numerical_policy="default", autotune_effort="off"
+    ) as session:
+        session.register_scratch(arena)
+        attn = PreparedPagedAttention(
+            q, k_cache, v_cache, pages, lengths, cu, out, sink=sink, mode=mode, width=width,
+            kv_format="nvfp4_4o6k", k_scales=k_scales, v_scales=v_scales,
+            session=session, workspace=arena, name=f"test_nvfp4_{mode}", **bias_kw,
+        )
+        writer = PreparedPagedKVWriter(
+            key_in, val_in, k_cache, v_cache, slots, kv_format="nvfp4_4o6k",
+            k_scales=k_scales, v_scales=v_scales, attention_plan=attn.plan,
+            session=session, name=f"test_nvfp4_{mode}_write",
+        ).functional()
+        fn = attn.functional(
+            session=session, cache_seqlens=None, page_table=None, cu_seqlens_q=None, sink=None,
+            **({"relative_bias_factors": None, "relative_bias_projection": None}
+               if mode == "extend" else {"relative_bias": None}),
+        )
+        session.tune()
+        arena.release_preparation()
+
+    # Populate request 0 with >1 page; leave last request inactive (cache_seqlens=0, slots=-1).
+    seq0 = 140
+    pages[0, 0], pages[0, 1] = 0, 1
+    lengths[0] = seq0
+    lengths[-1] = 0
+    for b in range(1, batch - 1):
+        pages[b, 0] = 2 + b
+        lengths[b] = width
+    k_hist = (torch.randn(seq0, geometry.kv_heads, geometry.head_dim, device=device) * 0.5).to(torch.bfloat16)
+    v_hist = (torch.randn(seq0, geometry.kv_heads, geometry.head_dim, device=device) * 0.5).to(torch.bfloat16)
+    writer(k_hist, v_hist, torch.arange(seq0, dtype=torch.int64, device=device))
+    # Also write with -1 slots on the inactive tail rows.
+    slots[:width] = torch.arange(seq0 - width, seq0, dtype=torch.int64, device=device)
+    writer(key_in, val_in, slots)
+
+    result = fn(q, sink=sink, cache_seqlens=lengths, page_table=pages, cu_seqlens_q=cu, **bias_kw)
+    assert torch.isfinite(result[:width]).all()
+    assert result[:width].abs().max().item() > 0.0
+    # Inactive request (cache_seqlens == 0) must stay zeroed in functional output.
+    assert result[-width:].abs().max().item() == 0.0
+
+    # Partial-page snapshot/restore must preserve both data and scale regions under MTP drafting.
+    assert any(name.endswith(".key_scales") for name, _ in pool.partial_pages())
+    assert any(name.endswith(".value_scales") for name, _ in pool.partial_pages())

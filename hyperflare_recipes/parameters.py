@@ -6,7 +6,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
+from types import MappingProxyType
 from typing import Any, ClassVar
 
 from ignition.errors import UsageError
@@ -457,3 +459,38 @@ class DraftQuantizationParameters(ParameterGroup):
         if self.markov_head_quantization is not None:
             parts.append(f"markov head {self.markov_head_quantization.upper()}")
         return [", ".join(parts)] if parts else []
+
+
+@dataclass(frozen=True)
+class KvCacheFormatParameters(ParameterGroup):
+    """Optional recipe-declared paged KV cache storage format selection."""
+
+    default_group: ClassVar[str | None] = "capacity and compression"
+
+    kv_cache_format: str = param(
+        "fp8",
+        flag="--kv-cache-format",
+        metavar="FORMAT",
+        choices_attr="supported_formats",
+        enabled_fn=lambda g, _: len(g.supported_formats) > 1,
+        manifest_key="kv_cache_format",
+        dict_key="kv_cache_format",
+        scope=ParameterScope.DEPLOYMENT,
+        help="paged KV cache storage format for recipes that declare alternatives",
+        status_label=lambda v: f"kv cache format {v}",
+    )
+    supported_formats: tuple[str, ...] = ("fp8",)
+    page_bytes_by_format: Mapping[str, Mapping[int, int]] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+    plain_page_bytes_by_format: Mapping[str, Mapping[int, int]] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+
+    def adjust_rank_costs(self, costs, context: ParameterContext):
+        if self.kv_cache_format not in self.page_bytes_by_format or context.world_size is None:
+            return costs
+        spec = None if context.root is None else context.root.speculation
+        plain_map = self.plain_page_bytes_by_format.get(self.kv_cache_format)
+        pages = plain_map if (spec is None and plain_map) else self.page_bytes_by_format[self.kv_cache_format]
+        return replace(costs, page_bytes=pages[context.world_size])

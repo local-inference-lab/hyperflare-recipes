@@ -5,7 +5,7 @@
 
 import torch
 import triton
-from b12x.attention import paged, paged_decode, paged_kv_write
+from b12x.attention import paged, paged_decode, paged_kv_write, paged_nvfp4
 from b12x.preparation import PreparedCall, plan_from_handle
 
 from ignition.preparation.persistent import persistent_copy, persistent_empty
@@ -68,12 +68,47 @@ def _fake_attend(q, key, value, pages, lengths, cu, sink, output, scratch, k_des
     pass
 
 
+@torch.library.custom_op("flare::paged_nvfp4_attention", mutates_args=("output", "scratch"))
+def _attend_nvfp4(q: torch.Tensor, k_cache: torch.Tensor, k_scales: torch.Tensor,
+                  v_cache: torch.Tensor, v_scales: torch.Tensor, pages: torch.Tensor,
+                  lengths: torch.Tensor, cu: torch.Tensor, sink: torch.Tensor | None,
+                  output: torch.Tensor, scratch: list[torch.Tensor], handle: int,
+                  relative_bias: torch.Tensor | None, relative_bias_factors: torch.Tensor | None,
+                  relative_bias_projection: torch.Tensor | None) -> None:
+    plan = plan_from_handle(handle)
+    paged_nvfp4.run(paged_nvfp4.bind(
+        plan, scratch=scratch, q=q, k_cache=k_cache, k_scales=k_scales,
+        v_cache=v_cache, v_scales=v_scales, output=output, page_table=pages,
+        cache_seqlens=lengths, cu_seqlens_q=cu, attention_sink_bias=sink,
+        relative_attention_bias=relative_bias, relative_bias_factors=relative_bias_factors,
+        relative_bias_projection=relative_bias_projection))
+
+
+@_attend_nvfp4.register_fake
+def _fake_attend_nvfp4(q, k_cache, k_scales, v_cache, v_scales, pages, lengths, cu, sink, output, scratch, handle, relative_bias, relative_bias_factors, relative_bias_projection):
+    pass
+
+
+@torch.library.custom_op("flare::paged_nvfp4_write_kv", mutates_args=("k_cache", "k_scales", "v_cache", "v_scales"))
+def _write_nvfp4(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
+                 k_scales: torch.Tensor, v_cache: torch.Tensor, v_scales: torch.Tensor,
+                 slots: torch.Tensor, handle: int) -> None:
+    paged_nvfp4.write_kv(plan_from_handle(handle), key=key, value=value, k_cache=k_cache,
+                         k_scales=k_scales, v_cache=v_cache, v_scales=v_scales, slot_mapping=slots)
+
+
+@_write_nvfp4.register_fake
+def _fake_write_nvfp4(key, value, k_cache, k_scales, v_cache, v_scales, slots, handle):
+    pass
+
+
 class PreparedPagedAttention:
     def __init__(self, q, key, value, pages, lengths, cu, output, *, sink=None, mode,
                  window=-1, width=1, causal=True, k_descale=None, v_descale=None,
                  selected_blocks=None, session, workspace, name, schedules=None, tuning_page_count=None, output_gate=None,
                  caller_owned_placeholders=False, relative_bias=None, relative_bias_factors=None,
-                 relative_bias_projection=None, tail_key=None, tail_value=None):
+                 relative_bias_projection=None, tail_key=None, tail_value=None,
+                 kv_format="fp8", k_scales=None, v_scales=None):
         if (tail_key is None) != (tail_value is None):
             raise ValueError("private tail key and value must be supplied together")
         tail_pages = 0
@@ -99,7 +134,33 @@ class PreparedPagedAttention:
 
         self.tma = None
         self.output_gate = None
-        if (mode in ("prefill", "extend") and causal and window == -1 and sink is None
+        self.nvfp4 = kv_format != "fp8"
+        if self.nvfp4:
+            if kv_format != "nvfp4_4o6k" or k_scales is None or v_scales is None:
+                raise ValueError("NVFP4 paged attention requires kv_format='nvfp4_4o6k' with k_scales and v_scales")
+            if selected_blocks is not None or tail_key is not None or not causal or output_gate is not None:
+                raise ValueError("NVFP4 paged attention requires causal GQA without selected blocks, tail pages, or output gate")
+            nvfp4_mode = "prefill" if mode == "extend" else mode
+            self.schedule_storage, self.schedule_slot = None, -1
+            self.selected_blocks = None
+            self.decode = nvfp4_mode in ("decode", "verify")
+            self.compact_decode = None
+            self.window, self.workspace = window, workspace
+            self.arguments = dict(q=q, k_cache=key, k_scales=k_scales, v_cache=value, v_scales=v_scales,
+                page_table=pages, cache_seqlens=lengths, cu_seqlens_q=cu, output=output, attention_sink_bias=sink,
+                relative_attention_bias=relative_bias, relative_bias_factors=relative_bias_factors,
+                relative_bias_projection=relative_bias_projection)
+            self.plan = paged_nvfp4.plan(paged_nvfp4.Caps(
+                device=q.device, mode=nvfp4_mode, kv_format=kv_format,
+                num_q_heads=q.shape[1], num_kv_heads=key.shape[2], head_dim_qk=q.shape[2], head_dim_vo=q.shape[2],
+                page_size=key.shape[1], max_batch=pages.shape[0],
+                max_q_per_req=q.shape[0] if nvfp4_mode == "prefill" else width,
+                window_left=window, causal=True, has_sinks=sink is not None,
+                sink_layout="row" if sink is not None and sink.ndim == 2 else "head",
+                has_relative_bias=relative_bias is not None,
+                has_factored_relative_bias=relative_bias_factors is not None,
+                caller_owned_placeholders=caller_owned_placeholders))
+        elif (mode in ("prefill", "extend") and causal and window == -1 and sink is None
                 and selected_blocks is None and k_descale is None and v_descale is None
                 and relative_bias is None and relative_bias_factors is None
                 and supports(q, key, value, pages, cu, output)):
@@ -108,102 +169,108 @@ class PreparedPagedAttention:
             self.output_gate = output_gate
             self.plan = self.tma.plan
             return
-        self.schedule_storage, self.schedule_slot = None, -1
-        if key.dtype == torch.float8_e4m3fn:
-            if k_descale is None:
-                k_descale = persistent_empty((1,), torch.float32, key.device).fill_(1)
-            if v_descale is None:
-                v_descale = persistent_empty((1,), torch.float32, value.device).fill_(1)
-        self.selected_blocks = selected_blocks
-        if selected_blocks is not None:
-            if (selected_blocks.shape != (key.shape[2], q.shape[0], 16)
-                    or selected_blocks.dtype != torch.int32 or not selected_blocks.is_contiguous()):
-                raise ValueError("selected blocks must be contiguous int32 [kv_heads, query_capacity, 16]")
-            if not causal or window != -1 or sink is not None or relative_bias is not None or relative_bias_factors is not None:
-                raise ValueError("selected-block attention requires causal full-context GQA without sinks")
-            if mode in ("decode", "verify"):
-                mode = "decode" if width == 1 else "verify"
-            else:
-                mode = "extend"
-        self.decode = selected_blocks is None and mode in ("decode", "verify") and paged_decode.supports(
-            num_q_heads=q.shape[1], num_kv_heads=key.shape[2], head_dim_qk=q.shape[2],
-            head_dim_vo=value.shape[3], page_size=key.shape[1], kv_dtype=key.dtype,
-            max_q_per_req=width, window_left=window, causal=causal, has_sinks=sink is not None,
-            has_relative_bias=relative_bias is not None, sink_layout="row" if sink is not None and sink.ndim == 2 else "head",
-            tail_pages_per_request=tail_pages)
-        if tail_key is not None and not self.decode:
-            raise ValueError("private tail pages require a supported paged-decode geometry")
-        if not causal and not self.decode:
-            raise ValueError("noncausal paged attention requires a supported paged-decode geometry")
-        self.compact_decode = None
-        if not self.decode and mode == "decode":
-            # The GQA decode schedule has one physical query row per request.
-            # Recurrent batches pack active queries, including holes between live requests.
-            self.compact_decode = (q, output, cu, selected_blocks)
-            q, output = torch.zeros_like(q), torch.zeros_like(output)
-            cu = torch.arange(pages.shape[0] + 1, dtype=torch.int32, device=q.device)
+        if not self.nvfp4:
+            self.schedule_storage, self.schedule_slot = None, -1
+            if key.dtype == torch.float8_e4m3fn:
+                if k_descale is None:
+                    k_descale = persistent_empty((1,), torch.float32, key.device).fill_(1)
+                if v_descale is None:
+                    v_descale = persistent_empty((1,), torch.float32, value.device).fill_(1)
+            self.selected_blocks = selected_blocks
             if selected_blocks is not None:
-                selected_blocks = torch.full_like(selected_blocks, -1)
-                self.selected_blocks = selected_blocks
-        self.window, self.workspace = window, workspace
-        self.arguments = dict(q=q, k_cache=key, v_cache=value, page_table=pages,
-            cache_seqlens=lengths, cu_seqlens_q=cu, output=output, attention_sink_bias=sink,
-            k_descale=k_descale, v_descale=v_descale, relative_attention_bias=relative_bias)
-        if self.decode:
-            self.arguments.update(tail_k_cache=tail_key, tail_v_cache=tail_value)
-        else:
-            self.arguments.update(relative_bias_factors=relative_bias_factors, relative_bias_projection=relative_bias_projection)
-        if selected_blocks is not None:
-            self.arguments["q2k_indices"] = selected_blocks
-        if self.decode:
-            self.plan = paged_decode.plan(paged_decode.Caps(device=q.device, num_q_heads=q.shape[1],
-                num_kv_heads=key.shape[2], head_dim_qk=q.shape[2], head_dim_vo=value.shape[3],
-                page_size=key.shape[1], max_batch=pages.shape[0], max_q_per_req=width,
-                window_left=window, has_sinks=sink is not None, causal=causal, kv_dtype=key.dtype,
-                caller_owned_placeholders=caller_owned_placeholders, has_relative_bias=relative_bias is not None,
-                sink_layout="row" if sink is not None and sink.ndim == 2 else "head",
-                tail_pages_per_request=tail_pages))
-        else:
-            geometry = dict(device=q.device, q_dtype=q.dtype, kv_dtype=key.dtype,
+                if (selected_blocks.shape != (key.shape[2], q.shape[0], 16)
+                        or selected_blocks.dtype != torch.int32 or not selected_blocks.is_contiguous()):
+                    raise ValueError("selected blocks must be contiguous int32 [kv_heads, query_capacity, 16]")
+                if not causal or window != -1 or sink is not None or relative_bias is not None or relative_bias_factors is not None:
+                    raise ValueError("selected-block attention requires causal full-context GQA without sinks")
+                if mode in ("decode", "verify"):
+                    mode = "decode" if width == 1 else "verify"
+                else:
+                    mode = "extend"
+            self.decode = selected_blocks is None and mode in ("decode", "verify") and paged_decode.supports(
                 num_q_heads=q.shape[1], num_kv_heads=key.shape[2], head_dim_qk=q.shape[2],
-                head_dim_vo=value.shape[3], page_size=key.shape[1], batch=pages.shape[0],
-                max_cache_page_count=pages.shape[1], window_left=window)
-            if mode == "decode":
-                capacity = paged.decode_graph_capacity(**geometry)
-            elif mode == "verify":
-                capacity = paged.verify_graph_capacity(**geometry, query_len=width)
+                head_dim_vo=value.shape[3], page_size=key.shape[1], kv_dtype=key.dtype,
+                max_q_per_req=width, window_left=window, causal=causal, has_sinks=sink is not None,
+                has_relative_bias=relative_bias is not None, sink_layout="row" if sink is not None and sink.ndim == 2 else "head",
+                tail_pages_per_request=tail_pages)
+            if tail_key is not None and not self.decode:
+                raise ValueError("private tail pages require a supported paged-decode geometry")
+            if not causal and not self.decode:
+                raise ValueError("noncausal paged attention requires a supported paged-decode geometry")
+            self.compact_decode = None
+            if not self.decode and mode == "decode":
+                # The GQA decode schedule has one physical query row per request.
+                # Recurrent batches pack active queries, including holes between live requests.
+                self.compact_decode = (q, output, cu, selected_blocks)
+                q, output = torch.zeros_like(q), torch.zeros_like(output)
+                cu = torch.arange(pages.shape[0] + 1, dtype=torch.int32, device=q.device)
+                if selected_blocks is not None:
+                    selected_blocks = torch.full_like(selected_blocks, -1)
+                    self.selected_blocks = selected_blocks
+            self.window, self.workspace = window, workspace
+            self.arguments = dict(q=q, k_cache=key, v_cache=value, page_table=pages,
+                cache_seqlens=lengths, cu_seqlens_q=cu, output=output, attention_sink_bias=sink,
+                k_descale=k_descale, v_descale=v_descale, relative_attention_bias=relative_bias)
+            if self.decode:
+                self.arguments.update(tail_k_cache=tail_key, tail_v_cache=tail_value)
             else:
-                capacity = paged.extend_graph_capacity(**geometry, total_q_capacity=q.shape[0])
-            # Verify replay reserves a schedule for W queries per request;
-            # live cumulative lengths still index the P-row query/output tensors.
-            schedule_rows = pages.shape[0] * width if mode == "verify" else q.shape[0]
-            caps = paged.Caps(device=q.device, mode=mode if mode in ("decode", "verify") else "extend",
-                dtype=q.dtype, kv_dtype=key.dtype,
-                num_q_heads=q.shape[1], num_kv_heads=key.shape[2], head_dim_qk=q.shape[2],
-                head_dim_vo=value.shape[3], page_size=key.shape[1], max_total_q=schedule_rows,
-                max_batch=pages.shape[0], max_page_table_width=pages.shape[1], num_cache_pages=key.shape[0],
-                max_work_items=max(capacity.max_work_items, schedule_rows * 32) if selected_blocks is not None and mode in ("decode", "verify") else capacity.max_work_items,
-                max_partial_rows=max(getattr(capacity, "max_partial_rows", 0), schedule_rows * 32) if selected_blocks is not None and mode in ("decode", "verify") else getattr(capacity, "max_partial_rows", 0),
-                use_cuda_graph=True,
-                copy_runtime_metadata=not all(t.dtype == torch.int32 and t.is_contiguous()
-                                              for t in (pages, lengths, cu)),
-                msa_block_sparse=selected_blocks is not None,
-                msa_union_tile=selected_blocks is not None and mode == "extend")
-            invocation = dict(paged.invocation_from_tensors(caps, **self.arguments), window_left=window)
-            if mode == "verify":
-                invocation["query_len"] = width
-            if selected_blocks is not None and mode in ("decode", "verify"):
-                invocation["force_split_kv"] = True
-            self.plan = paged.plan(caps, invocation=invocation)
-            if schedules is not None and mode in ("verify", "extend"):
-                schedules.register(self, caps)
+                self.arguments.update(relative_bias_factors=relative_bias_factors, relative_bias_projection=relative_bias_projection)
+            if selected_blocks is not None:
+                self.arguments["q2k_indices"] = selected_blocks
+            if self.decode:
+                self.plan = paged_decode.plan(paged_decode.Caps(device=q.device, num_q_heads=q.shape[1],
+                    num_kv_heads=key.shape[2], head_dim_qk=q.shape[2], head_dim_vo=value.shape[3],
+                    page_size=key.shape[1], max_batch=pages.shape[0], max_q_per_req=width,
+                    window_left=window, has_sinks=sink is not None, causal=causal, kv_dtype=key.dtype,
+                    caller_owned_placeholders=caller_owned_placeholders, has_relative_bias=relative_bias is not None,
+                    sink_layout="row" if sink is not None and sink.ndim == 2 else "head",
+                    tail_pages_per_request=tail_pages))
+            else:
+                geometry = dict(device=q.device, q_dtype=q.dtype, kv_dtype=key.dtype,
+                    num_q_heads=q.shape[1], num_kv_heads=key.shape[2], head_dim_qk=q.shape[2],
+                    head_dim_vo=value.shape[3], page_size=key.shape[1], batch=pages.shape[0],
+                    max_cache_page_count=pages.shape[1], window_left=window)
+                if mode == "decode":
+                    capacity = paged.decode_graph_capacity(**geometry)
+                elif mode == "verify":
+                    capacity = paged.verify_graph_capacity(**geometry, query_len=width)
+                else:
+                    capacity = paged.extend_graph_capacity(**geometry, total_q_capacity=q.shape[0])
+                # Verify replay reserves a schedule for W queries per request;
+                # live cumulative lengths still index the P-row query/output tensors.
+                schedule_rows = pages.shape[0] * width if mode == "verify" else q.shape[0]
+                caps = paged.Caps(device=q.device, mode=mode if mode in ("decode", "verify") else "extend",
+                    dtype=q.dtype, kv_dtype=key.dtype,
+                    num_q_heads=q.shape[1], num_kv_heads=key.shape[2], head_dim_qk=q.shape[2],
+                    head_dim_vo=value.shape[3], page_size=key.shape[1], max_total_q=schedule_rows,
+                    max_batch=pages.shape[0], max_page_table_width=pages.shape[1], num_cache_pages=key.shape[0],
+                    max_work_items=max(capacity.max_work_items, schedule_rows * 32) if selected_blocks is not None and mode in ("decode", "verify") else capacity.max_work_items,
+                    max_partial_rows=max(getattr(capacity, "max_partial_rows", 0), schedule_rows * 32) if selected_blocks is not None and mode in ("decode", "verify") else getattr(capacity, "max_partial_rows", 0),
+                    use_cuda_graph=True,
+                    copy_runtime_metadata=not all(t.dtype == torch.int32 and t.is_contiguous()
+                                                  for t in (pages, lengths, cu)),
+                    msa_block_sparse=selected_blocks is not None,
+                    msa_union_tile=selected_blocks is not None and mode == "extend")
+                invocation = dict(paged.invocation_from_tensors(caps, **self.arguments), window_left=window)
+                if mode == "verify":
+                    invocation["query_len"] = width
+                if selected_blocks is not None and mode in ("decode", "verify"):
+                    invocation["force_split_kv"] = True
+                self.plan = paged.plan(caps, invocation=invocation)
+                if schedules is not None and mode in ("verify", "extend"):
+                    schedules.register(self, caps)
 
         def prepared_call(state, arguments):
             from b12x.attention.paged_decode._preparation import scratch_specs
 
-            specs = scratch_specs(state.query, state.config, q.device) if self.decode else state.scratch_plan.scratch_specs()
+            if self.nvfp4:
+                specs = state.scratch_specs()
+            elif self.decode:
+                specs = scratch_specs(state.query, state.config, q.device)
+            else:
+                specs = state.scratch_plan.scratch_specs()
             scratch = _scratch(specs, workspace)
-            kwargs = {"plan": self.plan} if self.decode else {"window_left": window}
+            kwargs = {"plan": self.plan} if (self.decode or self.nvfp4) else {"window_left": window}
             binding = state.bind(scratch=scratch, **arguments, **kwargs)
             return PreparedCall(run=lambda: state.run(binding),
                                 produce=lambda: state.bind(scratch=scratch, **arguments, **kwargs),
@@ -253,10 +320,11 @@ class PreparedPagedAttention:
 
     def rebind(self):
         self.scratch = _scratch(self.plan.scratch_specs(), self.workspace)
-        if not self.decode:
+        if not self.decode and not self.nvfp4:
             paged.bind(self.plan, scratch=self.scratch, **self.arguments, window_left=self.window)
 
     def functional(self, *, session, k_cache=_BOUND_OPERAND, v_cache=_BOUND_OPERAND,
+                   k_scales=_BOUND_OPERAND, v_scales=_BOUND_OPERAND,
                    cache_seqlens=_BOUND_OPERAND, page_table=_BOUND_OPERAND, cu_seqlens_q=_BOUND_OPERAND,
                    selected_blocks=_BOUND_OPERAND, schedule_storage=_BOUND_OPERAND, sink=_BOUND_OPERAND,
                    relative_bias=_BOUND_OPERAND, relative_bias_factors=_BOUND_OPERAND, relative_bias_projection=_BOUND_OPERAND,
@@ -267,7 +335,8 @@ class PreparedPagedAttention:
         to require it at invocation without retaining its preparation tensor.
         """
         operation = _FunctionalPagedAttention(self)
-        for name, value in (("k_cache", k_cache), ("v_cache", v_cache), ("cache_seqlens", cache_seqlens),
+        for name, value in (("k_cache", k_cache), ("v_cache", v_cache), ("k_scales", k_scales), ("v_scales", v_scales),
+                            ("cache_seqlens", cache_seqlens),
                             ("page_table", page_table), ("cu_seqlens_q", cu_seqlens_q),
                             ("attention_sink_bias", sink), ("relative_attention_bias", relative_bias),
                             ("relative_bias_factors", relative_bias_factors), ("relative_bias_projection", relative_bias_projection),
@@ -290,7 +359,7 @@ class PreparedPagedAttention:
             self.schedules.components[:] = [operation if component is self else component
                                            for component in self.schedules.components]
         register_finalizer(session, operation.bind)
-        if not operation.tma and not operation.decode:
+        if not operation.tma and not operation.decode and not operation.nvfp4:
             self.workspace.register_preparation_release(operation.release_metadata)
         return operation
 
@@ -301,6 +370,12 @@ class PreparedPagedAttention:
                 None, None, None, self.plan.handle, False, -1, None, -1, self.output_gate, [], [], None, None, None, None, None, None)
             return output
         a = self.arguments
+        if self.nvfp4:
+            _attend_nvfp4(a["q"], a["k_cache"], a["k_scales"], a["v_cache"], a["v_scales"],
+                          a["page_table"], a["cache_seqlens"], a["cu_seqlens_q"], a["attention_sink_bias"],
+                          a["output"], self.scratch, self.plan.handle, a["relative_attention_bias"],
+                          a.get("relative_bias_factors"), a.get("relative_bias_projection"))
+            return a["output"]
         if self.compact_decode is not None:
             source, destination, cu, selected = self.compact_decode
             indices = cu[:-1].long().clamp(0, source.shape[0] - 1)
@@ -326,6 +401,7 @@ class _FunctionalPagedAttention:
     def __init__(self, prepared):
         self.plan = prepared.plan
         self.tma = prepared.tma is not None
+        self.nvfp4 = prepared.nvfp4
         if self.tma:
             q, key, value, pages, lengths, cu, output = prepared.tma.arguments
             kernel_output = output
@@ -363,7 +439,7 @@ class _FunctionalPagedAttention:
 
     def bind(self):
         self.scratch_layout = tuple((tuple(spec.shape), spec.dtype) for spec in self.plan.scratch_specs())
-        if not self.tma and not self.decode:
+        if not self.tma and not self.decode and not self.nvfp4:
             metadata = paged.replay_metadata(self.plan)
             self.metadata_seeds = metadata.tensors
             self.chunk_pages_lut = metadata.chunk_pages_lut
@@ -375,9 +451,10 @@ class _FunctionalPagedAttention:
             self.chunk_pages_lut = persistent_copy(self.chunk_pages_lut)
         paged.release_replay_metadata(self.plan)
 
-    def __call__(self, q, *, output_gate=None, k_cache=None, v_cache=None, cache_seqlens=None,
-                 page_table=None, cu_seqlens_q=None, selected_blocks=None, schedule_storage=None, sink=None,
-                 relative_bias=None, relative_bias_factors=None, relative_bias_projection=None, tail_key=None, tail_value=None):
+    def __call__(self, q, *, output_gate=None, k_cache=None, v_cache=None, k_scales=None, v_scales=None,
+                 cache_seqlens=None, page_table=None, cu_seqlens_q=None, selected_blocks=None, schedule_storage=None,
+                 sink=None, relative_bias=None, relative_bias_factors=None, relative_bias_projection=None,
+                 tail_key=None, tail_value=None):
         if self.scratch_layout is None:
             raise RuntimeError("functional paged attention requires finalized preparation")
         if tuple(q.shape) != self.query_shape or q.dtype != self.query_dtype:
@@ -427,6 +504,15 @@ class _FunctionalPagedAttention:
             q = torch.where(active[:, None, None], q[indices], 0)
             if selected is not None:
                 selected = torch.where(active[None, :, None], selected[:, indices], -1)
+        if self.nvfp4:
+            ks = a.get("k_scales") if k_scales is None else k_scales
+            vs = a.get("v_scales") if v_scales is None else v_scales
+            if ks is None or vs is None:
+                raise ValueError("functional NVFP4 paged attention requires k_scales and v_scales at invocation")
+            _attend_nvfp4(q, key, ks, value, vs, pages, lengths, cu, optional_operands["attention_sink_bias"],
+                          output, scratch, self.plan.handle, optional_operands["relative_attention_bias"],
+                          optional_operands["relative_bias_factors"], optional_operands["relative_bias_projection"])
+            return output
         live_metadata = [value.clone() for value in self.metadata_seeds] if self.live_metadata else []
         _attend(q, key, value, pages, lengths,
             cu, optional_operands["attention_sink_bias"], output, scratch,
@@ -444,7 +530,26 @@ class _FunctionalPagedAttention:
 
 class PreparedPagedKVWriter:
     def __init__(self, key, value, key_cache, value_cache, slots, *, session, name, k_scale=None, v_scale=None,
-                 caller_owned_placeholders=False):
+                 caller_owned_placeholders=False, kv_format="fp8", k_scales=None, v_scales=None,
+                 attention_plan=None):
+        self.nvfp4 = kv_format != "fp8"
+        if self.nvfp4:
+            if kv_format != "nvfp4_4o6k" or k_scales is None or v_scales is None:
+                raise ValueError("NVFP4 KV writer requires kv_format='nvfp4_4o6k' with k_scales and v_scales")
+            self.arguments = dict(key=key, value=value, k_cache=key_cache, k_scales=k_scales,
+                                  v_cache=value_cache, v_scales=v_scales, slot_mapping=slots)
+            if attention_plan is not None:
+                self.plan = attention_plan
+            else:
+                self.plan = paged_nvfp4.plan(paged_nvfp4.Caps(
+                    device=key.device, mode="decode", kv_format=kv_format,
+                    num_q_heads=key.shape[1], num_kv_heads=key.shape[1],
+                    head_dim_qk=key.shape[2], head_dim_vo=value.shape[2],
+                    page_size=key_cache.shape[1], max_batch=1, max_q_per_req=1,
+                    caller_owned_placeholders=caller_owned_placeholders))
+                declare(session, (self.plan.request(name=name, prepare_call=lambda state: PreparedCall(
+                    run=lambda: state.write_kv(**self.arguments))),))
+            return
         if key_cache.dtype == torch.float8_e4m3fn:
             if k_scale is None:
                 k_scale = persistent_empty((1,), torch.float32, key.device).fill_(1)
@@ -461,12 +566,18 @@ class PreparedPagedKVWriter:
             run=lambda: state.run(**self.arguments))),))
 
     def __call__(self):
+        if self.nvfp4:
+            a = self.arguments
+            _write_nvfp4(a["key"], a["value"], a["k_cache"], a["k_scales"],
+                         a["v_cache"], a["v_scales"], a["slot_mapping"], self.plan.handle)
+            return
         paged_kv_write.run(self.plan, **self.arguments)
 
-    def functional(self, *, k_cache=_BOUND_OPERAND, v_cache=_BOUND_OPERAND):
+    def functional(self, *, k_cache=_BOUND_OPERAND, v_cache=_BOUND_OPERAND,
+                   k_scales=_BOUND_OPERAND, v_scales=_BOUND_OPERAND):
         """Accept projected rows, slots, and explicitly unbound caches at invocation."""
         operation = _FunctionalPagedKVWriter(self)
-        for name, value in (("k_cache", k_cache), ("v_cache", v_cache)):
+        for name, value in (("k_cache", k_cache), ("v_cache", v_cache), ("k_scales", k_scales), ("v_scales", v_scales)):
             if value is not _BOUND_OPERAND:
                 operation.arguments[name] = value
         return operation
@@ -475,16 +586,28 @@ class PreparedPagedKVWriter:
 class _FunctionalPagedKVWriter:
     def __init__(self, prepared):
         self.plan = prepared.plan
+        self.nvfp4 = prepared.nvfp4
         self.arguments = {name: value for name, value in prepared.arguments.items()
                           if name not in ("key", "value", "slot_mapping", "dummy_scale")}
         self.caller_owned_placeholders = "dummy_scale" in prepared.arguments
 
-    def __call__(self, key, value, slots, *, k_cache=None, v_cache=None):
+    def __call__(self, key, value, slots, *, k_cache=None, v_cache=None, k_scales=None, v_scales=None):
         arguments = dict(self.arguments)
         if k_cache is not None:
             arguments["k_cache"] = k_cache
         if v_cache is not None:
             arguments["v_cache"] = v_cache
+        if self.nvfp4:
+            if k_scales is not None:
+                arguments["k_scales"] = k_scales
+            if v_scales is not None:
+                arguments["v_scales"] = v_scales
+            if (arguments.get("k_cache") is None or arguments.get("v_cache") is None
+                    or arguments.get("k_scales") is None or arguments.get("v_scales") is None):
+                raise ValueError("functional NVFP4 cache writing requires cache and scale tensors at invocation")
+            _write_nvfp4(key, value, arguments["k_cache"], arguments["k_scales"],
+                         arguments["v_cache"], arguments["v_scales"], slots, self.plan.handle)
+            return
         if arguments["k_cache"] is None or arguments["v_cache"] is None:
             raise ValueError("functional cache writing requires cache tensors at invocation")
         dummy_scale = (torch.empty((1,), dtype=torch.float32, device=key.device)

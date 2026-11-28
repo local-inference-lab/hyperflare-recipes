@@ -40,7 +40,7 @@ from .config import ModelConfig
 from .contract import prepare as prepare_contract
 from .decoder import PreparedDecoder, Scratch
 from .weights import ModelWeights
-from .pool import PAGE_TOKENS, ContinuationPool, RankGeometry, continuation_layout, page_specs
+from .pool import KV_FORMATS, PAGE_TOKENS, ContinuationPool, RankGeometry, continuation_layout, page_specs
 from .recipe import Inkling2Parameters, RECIPE
 from ignition.preparation.bootstrap import BasePreparationConfig, validate_host_topology
 
@@ -76,6 +76,12 @@ class PreparationConfig(BasePreparationConfig):
         if self.parameters.draft_quantization is None:
             return None
         return self.parameters.draft_quantization.draft_head_quantization
+
+    @property
+    def kv_cache_format(self) -> str:
+        if self.parameters.kv_cache_format is None:
+            return 'fp8'
+        return self.parameters.kv_cache_format.kv_cache_format
 
     @property
     def markov_head_quantization(self) -> str | None:
@@ -117,6 +123,8 @@ class PreparationConfig(BasePreparationConfig):
             raise ValueError(f"unsupported DSpark Markov head quantization: {self.markov_head_quantization!r}")
         if (self.draft_head_quantization is not None or self.markov_head_quantization is not None) and not self.drafting:
             raise ValueError("DSpark proposal head quantization requires drafting")
+        if self.kv_cache_format not in KV_FORMATS:
+            raise ValueError(f'unsupported Inkling KV cache format: {self.kv_cache_format!r}')
         if self.snapshot_budget_bytes <= 0 or self.headroom_bytes < 0:
             raise ValueError("snapshot budget must be positive and headroom nonnegative")
         if self.vision:
@@ -230,6 +238,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
         if model.text.loop is not None:
             from .mini_decoder import PreparedLoopDecoder
             decoder_type = PreparedLoopDecoder
+        elif config.kv_cache_format != 'fp8':
+            raise ValueError(f'KV cache format {config.kv_cache_format!r} is only supported for Inkling-2-Mini')
     # Continuation rows and pages hold the prepared layers only.
     text = (model.text if config.decoder_layers is None else model.text.prefix(config.decoder_layers)).cache_config
     if not text.global_layers:
@@ -249,7 +259,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
     release_unused()
     transient = contextlib.ExitStack()
     transient.enter_context(core_storage.transient())
-    geometry = RankGeometry.of(text, world)
+    geometry = RankGeometry.of(text, world, kv_format=config.kv_cache_format)
     draft = model.draft if config.drafting else None
     layout = continuation_layout(text, geometry, draft)
     page_bytes = sum(shape[0] for _, shape in page_specs(text, geometry, draft))
@@ -286,6 +296,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
             identity_payload["draft_head_quantization"] = config.draft_head_quantization
         if config.markov_head_quantization is not None:
             identity_payload["markov_head_quantization"] = config.markov_head_quantization
+        if config.kv_cache_format != "fp8":
+            identity_payload["kv_cache_format"] = config.kv_cache_format
         identity = hashlib.sha256(json.dumps(identity_payload, sort_keys=True, default=str).encode()).hexdigest()
         session = RecordedPreparationSession(compile_workers=config.compile_workers,
             native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
