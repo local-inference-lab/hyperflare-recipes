@@ -42,7 +42,8 @@ class MoeScratch:
 class PreparedGlmMoe:
     """One rank's intermediate-sharded expert contribution before all-reduce."""
 
-    def __init__(self, module, source, weights, scratch: MoeScratch, *, session, name, workspace, prefill=False):
+    def __init__(self, module, source, weights, scratch: MoeScratch, *, session, name, workspace, prefill=False,
+                 reserve_sms: int = 0):
         gate = module.gate
         if (gate.num_group != 1 or gate.topk_group != 1 or gate.top_k != 8 or gate.num_experts != 288
                 or not gate.norm_topk_prob or gate.routed_scaling_factor != 2.5):
@@ -66,7 +67,8 @@ class PreparedGlmMoe:
         self.experts = PreparedRoutedExperts(source, weights.experts, scratch.router.ids,
             scratch.router.weights, scratch.routed, session=session, name=f"{name}.experts", workspace=workspace,
             router_plan=self.routing.plan,
-            a4_prefill=prefill and weights.experts_a4_prefill)
+            a4_prefill=prefill and weights.experts_a4_prefill,
+            reserve_sms=reserve_sms)
         self.concurrent_shared = None
         if source.shape[0] <= 256 and workspace.overlap:
             self.concurrent_shared = ConcurrentSharedExpert(self.shared,

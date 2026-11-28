@@ -88,7 +88,7 @@ class PreparedKDACommit:
 class SpeculativePreparation:
     def __init__(self, weights, pool, requests, inputs, scratch, prefill_scratch, *, session,
                  workspace, completion, frame, sequence, runtime, vocabulary_runtime, coordinator, max_cache_pages=None,
-                 prefill_tokens=None, decode_tokens=None, context=None):
+                 prefill_tokens=None, decode_tokens=None, context=None, prefill_runtime=None):
         self.weights, self.pool, self.requests, self.inputs = weights, pool, requests, inputs
         self.max_cache_pages, self.context = max_cache_pages, context
         self.shards = ContextShards() if context is None else context.shards
@@ -103,6 +103,7 @@ class SpeculativePreparation:
         self.scratch, self.session, self.workspace = scratch, session, workspace
         self.completion, self.frame, self.sequence = completion, frame, sequence
         self.collectives = dict(runtime=runtime, vocabulary_runtime=vocabulary_runtime, coordinator=coordinator)
+        self.prefill_runtime = prefill_runtime
         self.rng = SpeculativeRngState.allocate(pool.backing.device, capacity=requests.capacity)
         self.draft_tables = torch.full_like(inputs.page_tables, -1)
         self.draft_generation = torch.zeros_like(requests.generation)
@@ -126,12 +127,13 @@ class SpeculativePreparation:
         planes = [torch.zeros(shape, dtype=dtype, device=device) for shape, dtype in self.record_layouts]
         return KDARecords(self.record_layers, *planes, *self.record_weights)
 
-    def draft(self, metadata, name, *, cache_only=False, mode="decode"):
+    def draft(self, metadata, name, *, cache_only=False, mode="decode", row_shard_runtime=None):
         shared = self.draft_scratch.get(mode)
         scratch = None if shared is None else shared.rows(metadata.token_ids.numel(), mode)
         return PreparedMTP(self.weights, self.pool.draft, metadata, mode=mode,
             session=self.session, name=name, workspace=self.workspace, cache_only=cache_only,
-            max_cache_pages=self.max_cache_pages, scratch=scratch, context=self.context, **self.collectives)
+            max_cache_pages=self.max_cache_pages, scratch=scratch, context=self.context,
+            row_shard_runtime=row_shard_runtime, **self.collectives)
 
 
 class PreparedPrefill:
@@ -140,9 +142,15 @@ class PreparedPrefill:
     def __init__(self, owner, generation, name):
         self.owner, self.generation = owner, generation
         self.tokens = generation.batch.tokens
+        device = owner.inputs.token_ids.device
         metadata = DraftMetadata(self.tokens, 1, owner.inputs.page_tables.shape[1],
-                                 owner.inputs.token_ids.device, shards=owner.shards)
-        self.absorb = owner.draft(metadata, f"{name}.absorb", cache_only=True, mode="prefill")
+                                 device, shards=owner.shards)
+        sharded = getattr(generation.decoder, "sharded_final_norm", False)
+        self.absorb = owner.draft(metadata, f"{name}.absorb", cache_only=True, mode="prefill",
+                                  row_shard_runtime=owner.prefill_runtime if sharded else None)
+        if sharded and not self.absorb.row_shard:
+            raise ValueError("sharded decoder final norm requires row-sharded MTP absorption")
+        self.rank_index = generation.decoder.rank_index if sharded else None
         self.absorb.functional(session=owner.session)
 
     def rebind_pages(self, pages):
@@ -159,12 +167,49 @@ class PreparedPrefill:
         target_metadata, feedback = target.metadata, target.feedback
         length = target_metadata.recurrent.num_tokens.long()
         skip = (before == 0).long()
+        draft_length = (length - skip).clamp_min(0)
+        start_pos = (before - 1).clamp_min(0)
+        if self.absorb.row_shard:
+            from .indexer import IndexMetadata
+
+            norm_sh, rank_tails = feedback
+            device = slot.device
+            s_rows = norm_sh.shape[0]
+            base = self.rank_index[0] * s_rows
+            g_rows = base + torch.arange(s_rows, device=device)
+            active_sh = (g_rows < draft_length[0]) & (draft_length[0] > 0)
+            prev_rank = (self.rank_index - 1).clamp_min(0)
+            prev_boundary = torch.where(self.rank_index[0] == 0, previous,
+                                        torch.index_select(rank_tails, 0, prev_rank))
+            shifted_sh = torch.cat((prev_boundary, norm_sh[:-1]), dim=0)
+            hidden_sh = torch.where(before[0] > 0, shifted_sh, norm_sh)
+            hidden_sh = hidden_sh.masked_fill(~active_sh[:, None], 0)
+            indices_sh = (g_rows + skip[0]).clamp_max(self.tokens - 1)
+            token_ids_sh = torch.index_select(target_metadata.token_ids, 0, indices_sh)
+            positions_sh = torch.where(active_sh, start_pos[0] + g_rows, -1).to(torch.int32)
+            num_tokens_sh = (draft_length - base).clamp(0, s_rows).to(torch.int32)
+
+            blocks = o.draft_tables.shape[1]
+            indexed = IndexMetadata.allocate(self.tokens, 1, blocks, device)
+            indexed.query_start_loc[0].zero_()
+            indexed.query_start_loc[1:].copy_(draft_length.to(torch.int32))
+            indexed.state_slots.copy_(torch.where(
+                draft_length > 0, o.inputs.request_state_rows[slot, 0], -1).to(torch.int32))
+            all_rows = torch.arange(self.tokens, device=device)
+            active_all = (all_rows < draft_length[0]) & (draft_length[0] > 0)
+            pos_all = start_pos[0] + all_rows
+            indexed.positions.copy_(torch.where(active_all, pos_all, -1).to(torch.int32))
+            indexed.block_table.copy_(o.draft_tables[slot])
+            indexed.token_slots.copy_(torch.where(
+                active_all, o.shards.token_slots(pos_all, indexed.block_table.expand(self.tokens, -1)), -1).to(torch.int32))
+            self.absorb.absorb_sharded(indexed, token_ids_sh, positions_sh, hidden_sh, num_tokens_sh)
+            return
         rows = torch.arange(self.tokens, device=slot.device)
         indices = (rows + skip[0]).clamp_max(self.tokens - 1)
         hidden = feedback[(indices - 1).clamp_min(0)]
         hidden = torch.where(((rows == 0) & (before[0] > 0))[:, None], previous, hidden)
-        metadata = DraftMetadata.pack(o.inputs.row_slot_ids[:1], (length - skip).clamp_min(0),
-            (before - 1).clamp_min(0), target_metadata.token_ids[indices], hidden,
+        metadata = DraftMetadata.pack(o.inputs.row_slot_ids[:1], draft_length,
+            start_pos, target_metadata.token_ids[indices], hidden,
             o.draft_tables, state_rows=o.inputs.request_state_rows, capacity=self.tokens, shards=o.shards)
         self.absorb(metadata)
 
