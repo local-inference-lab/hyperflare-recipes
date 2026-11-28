@@ -366,3 +366,42 @@ def test_merge_image_features_concatenates_valid_groups_and_zeroes_padding():
         [3.0, 0.0, 1.0, 4.0, 0.0, 2.0],
     ])
     assert torch.equal(merged, expected)
+
+
+@pytest.mark.parametrize(
+    ("filename", "early_hbm", "late_hbm", "host_per_tiered"),
+    [
+        ("sm103-gb300-384-315-301.json", 315, 301, 216),
+        ("sm103-gb300-largekvc-384-296-294.json", 296, 294, 216),
+    ],
+)
+def test_bundled_sm103_gb300_placement_assets_load_and_validate(
+    model, filename, early_hbm, late_hbm, host_per_tiered
+):
+    from pathlib import Path
+
+    assets_dir = Path(__file__).resolve().parents[2] / "hyperflare_recipes/recipes/deepseek41/assets"
+    loaded = SM103Config.load(assets_dir / filename)
+    loaded.validate_model(model, dspark=True)
+    assert loaded.execution == "reference"
+    assert loaded.context == 1048576
+    assert loaded.host_lane_clusters == 4
+    assert loaded.prefill_staging == PrefillExpertStaging(min_rows=1024, min_cold_experts=8)
+    assert loaded.dynamic_mover is not None
+    assert loaded.dynamic_mover.spare_slots == 1
+
+    placements = dict(loaded.placements)
+    assert len(placements["layers.0.ffn"].hbm) == 384
+    assert len(placements["layers.0.ffn"].host) == 0
+    for layer_idx in range(1, 20):
+        placement = placements[f"layers.{layer_idx}.ffn"]
+        assert len(placement.hbm) == early_hbm
+        assert len(placement.host) == host_per_tiered
+    for layer_idx in range(20, 40):
+        placement = placements[f"layers.{layer_idx}.ffn"]
+        assert len(placement.hbm) == late_hbm
+        assert len(placement.host) == host_per_tiered
+    for mtp_idx in range(3):
+        placement = placements[f"mtp.{mtp_idx}.ffn"]
+        assert len(placement.hbm) == 128
+        assert len(placement.host) == 0
