@@ -539,3 +539,33 @@ def test_parallel_recipe_defaults_capture_ragged_rows_at_declared_width(alias, o
     assert all(batch <= packed <= min(128, batch * width) for batch, width, packed in shapes)
     assert config.decode_tokens == 128
     assert config.decode_samples == 32 * (selected.draft_tokens + 1)
+
+
+@pytest.mark.parametrize("factor", [4, 2])
+def test_qwen_yarn_variants_extend_the_declared_serving_context(monkeypatch, tmp_path, factor):
+    from hyperflare_recipes.recipes.qwen38.bootstrap import PreparationConfig
+
+    native = resolve("qwen3.8-flash")
+    scaled = resolve(f"qwen3.8-flash-yarn{factor}")
+    assert scaled.recipe is native.recipe
+    assert scaled.checkpoint.rope_scaling.original_max_position_embeddings == native.recipe.context
+    assert scaled.checkpoint.context == native.recipe.context * factor
+    # Repository resolution names the native declaration first.
+    assert resolve(scaled.checkpoint.repository).checkpoint is native.checkpoint
+
+    plain = fitted(native, 1)
+    extended = fitted(scaled, 1)
+    assert plain.declared_context == native.recipe.context == 262_144
+    assert extended.declared_context == 262_144 * factor and extended.recipe.context == 262_144
+    assert extended.demand_pages == factor * plain.demand_pages
+    assert extended.to_dict()["rope_scaling"]["factor"] == float(factor)
+    with pytest.raises(planning.UsageError, match=f"64 through {262_144 * factor:,}"):
+        fitted(scaled, 1, prefill_chunk=262_144 * factor + 64)
+
+    seen = []
+    monkeypatch.setattr("hyperflare_recipes.recipes.qwen38.bootstrap.prepare_model",
+                        lambda snapshot, config, *, progress, compile_decoder: seen.append(config))
+    scaled.recipe.prepare(tmp_path, extended, compile_forwards=True, kernel_cache=None, progress=None)
+    config = seen.pop()
+    assert isinstance(config, PreparationConfig)
+    assert config.context == 262_144 * factor and config.rope_scaling is scaled.checkpoint.rope_scaling

@@ -385,3 +385,48 @@ def test_checkpoint_qsa_chunked_prefill_native_decode(manifest, compiled):
                 assert state.raw_interval_start_positions[1] == -1
         finally:
             worker.close()
+
+
+def _reference_interpolation(theta, pairs, factor, original, beta_fast, beta_slow):
+    import math
+
+    dims = torch.arange(pairs, dtype=torch.float32)
+    frequencies = 1 / theta ** (dims / pairs)
+
+    def boundary(rotations):
+        return (2 * pairs) * math.log(original / (rotations * 2 * math.pi)) / (2 * math.log(theta))
+
+    low = max(math.floor(boundary(beta_fast)), 0)
+    high = min(math.ceil(boundary(beta_slow)), pairs - 1)
+    smooth = 1 - ((dims - low) / max(high - low, 1e-3)).clamp(0, 1)
+    return frequencies / factor * (1 - smooth) + frequencies * smooth
+
+
+def _text_config(max_position_embeddings=262144):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(head_dim=256, max_position_embeddings=max_position_embeddings,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000000, "partial_rotary_factor": .25,
+                         "mrope_section": [11, 11, 10], "mrope_interleaved": True})
+
+
+@pytest.mark.parametrize("factor", [4, 2])
+def test_rotary_tables_interpolate_declared_rope_scaling(factor):
+    from ignition.declaration import RopeScaling
+
+    scaling = RopeScaling(float(factor), 262144)
+    config = _text_config()
+    tables = RotaryTables.allocate(config, scaling.context, torch.device("cpu"), scaling=scaling)
+    inverse = _reference_interpolation(10000000, 32, float(factor), 262144, 32., 1.)
+    positions = torch.arange(262144)
+    expected = (positions[:, None].float() * inverse).cos()
+    torch.testing.assert_close(tables.cos[positions, 0], expected[:, 0], atol=0, rtol=0)
+    torch.testing.assert_close(tables.sin[positions, 0], (positions[:, None].float() * inverse).sin()[:, 0],
+                               atol=0, rtol=0)
+    assert scaling is tables.scaling and tables.axes.shape == (32,)
+
+    # The interpolation anchors at the checkpoint's declared context and covers the table.
+    with pytest.raises(ValueError, match="extend the checkpoint's declared context"):
+        RotaryTables.allocate(_text_config(131072), scaling.context, torch.device("cpu"), scaling=scaling)
+    with pytest.raises(ValueError, match="extend the checkpoint's declared context"):
+        RotaryTables.allocate(config, 262144, torch.device("cpu"), scaling=scaling)

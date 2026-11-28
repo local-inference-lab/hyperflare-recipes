@@ -15,6 +15,7 @@ from b12x.attention import paged_kv_write, qsa
 from b12x.preparation import PreparationSession, PreparedCall
 
 from hyperflare_recipes.components import sm103
+from hyperflare_recipes.components.rotary import interpolated_frequencies
 from hyperflare_recipes.components.head_norm_rope import qk_head_norm_mrope
 from hyperflare_recipes.components.sm103_sparse_attention import PARTIAL_ROWS, SPLIT_ROWS, PreparedSparseAttention
 from hyperflare_recipes.components.linear import ParallelProjections, QuantizedProjection, UnquantizedProjection
@@ -25,6 +26,7 @@ from ignition.preparation.tuning import declare, register_finalizer
 from .attention_overlap import ConcurrentAttention, FunctionalQSA
 from .qsa_sharded import PreparedShardedQSA
 from ignition.preparation.persistent import persistent_copy, persistent_empty, persistent_zeros
+from ignition.declaration import RopeScaling
 
 
 # b12x attends at most this many rows with its split schedule: it splits each row's selected
@@ -38,9 +40,10 @@ class RotaryTables:
     cos: torch.Tensor
     sin: torch.Tensor
     axes: torch.Tensor
+    scaling: RopeScaling | None = None
 
     @classmethod
-    def allocate(cls, config, capacity: int, device: torch.device) -> RotaryTables:
+    def allocate(cls, config, capacity: int, device: torch.device, scaling=None) -> RotaryTables:
         if capacity <= 0:
             raise ValueError("rotary position capacity must be positive")
         rope = config.rope_parameters
@@ -48,7 +51,14 @@ class RotaryTables:
                 or tuple(rope["mrope_section"]) != (11, 11, 10)
                 or rope["rope_theta"] != 10000000):
             raise ValueError("Qwen rotary geometry differs from the checkpoint contract")
-        inverse = (1.0 / (rope["rope_theta"] ** (torch.arange(0, 64, 2, dtype=torch.float32) / 64))).to(device)
+        if scaling is not None:
+            if (scaling.original_max_position_embeddings != config.max_position_embeddings
+                    or not scaling.original_max_position_embeddings < capacity <= scaling.context):
+                raise ValueError("rope scaling must extend the checkpoint's declared context")
+            inverse = interpolated_frequencies(rope["rope_theta"], 32, scaling.factor,
+                scaling.original_max_position_embeddings, scaling.beta_fast, scaling.beta_slow, device)
+        else:
+            inverse = (1.0 / (rope["rope_theta"] ** (torch.arange(0, 64, 2, dtype=torch.float32) / 64))).to(device)
         frequency = torch.arange(capacity, device=device, dtype=torch.float32)[:, None] * inverse
         axes = persistent_zeros((32,), dtype=torch.int64, device=device)
         axes[1:33:3] = 1
@@ -57,7 +67,7 @@ class RotaryTables:
         sin = persistent_empty(frequency.shape, dtype=torch.float32, device=device)
         torch.cos(frequency, out=cos)
         torch.sin(frequency, out=sin)
-        return cls(cos, sin, axes)
+        return cls(cos, sin, axes, scaling)
 
     def gather(self, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # Negative metadata marks inactive rows; their arithmetic uses position zero.
@@ -259,10 +269,13 @@ class PreparedAttention:
         # When selection runs through PreparedShardedQSA, self.plan only performs cache_only
         # updates and sparse GQA, so it keeps the default 128 MiB score workspace. Unsharded
         # SM103 sizes score_workspace_bytes to cover the full context; unsharded SM120 keeps
-        # b12x's default 128 MiB score workspace.
+        # b12x's default 128 MiB score workspace. Scaled contexts keep the native single-pass
+        # budget; selection chunks over the remaining groups within the same plan.
+        workspace_context = context if rotary.scaling is None \
+            else min(context, rotary.scaling.original_max_position_embeddings)
         score_workspace = (
             None if use_sharded
-            else max(self.tokens * (context // 4) * 4, 128 << 20) if sm103.is_sm103(source.device)
+            else max(self.tokens * (workspace_context // 4) * 4, 128 << 20) if sm103.is_sm103(source.device)
             else None
         )
         caps = qsa.Caps(device=source.device, max_batch=batch, kv_dtype=state.main_k_cache.dtype,

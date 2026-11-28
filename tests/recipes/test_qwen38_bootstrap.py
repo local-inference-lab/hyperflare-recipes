@@ -954,3 +954,37 @@ def test_qwen38_prefill_dma_all_reduce_coexists_with_ple_readiness_barrier_tp2()
     errors = ctx.Queue()
     mp.spawn(_tp2_dma_and_barrier_worker, args=(2, port, errors), nprocs=2, join=True)
     assert errors.empty(), errors.get()
+
+
+def test_context_bound_requires_declared_rope_scaling_beyond_the_native_context():
+    from ignition.declaration import RopeScaling
+    from hyperflare_recipes.recipes.qwen38.bootstrap import PreparationConfig
+
+    PreparationConfig(context=262144)
+    with pytest.raises(ValueError, match=r"64-aligned in \[64,262,144\]"):
+        PreparationConfig(context=262208)
+    scaling = RopeScaling(4., 262144)
+    with pytest.raises(ValueError, match="extending the 262,144-token checkpoint"):
+        PreparationConfig(context=262144, rope_scaling=scaling)
+    with pytest.raises(ValueError, match="anchor at the checkpoint's 262,144-token context"):
+        PreparationConfig(context=524_288, rope_scaling=RopeScaling(4., 131072))
+    with pytest.raises(ValueError, match=r"64-aligned in \[64,524,288\]"):
+        PreparationConfig(context=1_048_576, rope_scaling=RopeScaling(2., 262144))
+    config = PreparationConfig(context=1_048_576, rope_scaling=scaling)
+    assert config.context == 1_048_576 and config.rope_scaling is scaling
+
+
+def test_identity_separates_rope_scaling_preparations():
+    from ignition.declaration import RopeScaling
+    from hyperflare_recipes.recipes.qwen38.bootstrap import _identity
+
+    manifest = SimpleNamespace(headers_sha256="headers", metadata_sha256={"config.json": "config"})
+    native = _identity(manifest)
+    assert _identity(manifest, rope_scaling=None) == native
+    identities = {
+        native,
+        _identity(manifest, rope_scaling=RopeScaling(4., 262144)),
+        _identity(manifest, rope_scaling=RopeScaling(2., 262144)),
+        _identity(manifest, rope_scaling=RopeScaling(8., 262144)),
+    }
+    assert len(identities) == 4
