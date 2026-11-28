@@ -15,6 +15,7 @@ from ignition.declaration import (
     RankCosts,
     RankUsage,
     Recipe,
+    RopeScaling,
     SamplingDefaults,
     SamplingRange,
     SpeculativeMethod,
@@ -48,6 +49,27 @@ _TARGET_PAGE_LAYERS = 12
 # the CUDA context. They serve every speculation setting.
 _GRAPH_BYTES = {1: 7168 << 20, 2: 8000 << 20, 4: 8576 << 20}
 _MOE_DECODE_A16_INTERMEDIATE_WIDTH = 640
+
+# The pinned checkpoint's stored tensors, shared by every qualified variant.
+_CHECKPOINT = dict(repository=MODEL_ID, revision=REVISION, architecture=ARCHITECTURE,
+    stored_bytes=102_329_644_144,
+    # Decoder, vision, and draft tensors; PLE rows are delivered through compact inputs.
+    device_bytes=73_529_505_900,
+    # The MTP module's tensors.
+    draft_bytes=1_596_720_640,
+    # Routed-expert block scales expand at load from 4,156,604,564 CSF bytes to
+    # 48 layers x 512 experts x 307,200 bytes.
+    expansion_bytes=3_393_142_636)
+
+
+def _yarn_checkpoint(factor):
+    """A serving variant of the pinned checkpoint whose rope interpolation extends its context.
+
+    Frequency-only interpolation, without YaRN's attention temperature, matching the DeepSeek
+    path; sparse selection chunks beyond the native single-pass score workspace.
+    """
+    return Checkpoint(alias=f"qwen3.8-flash-yarn{factor}", **_CHECKPOINT,
+        context=262_144 * factor, rope_scaling=RopeScaling(float(factor), 262_144))
 
 
 def _costs(state_row_bytes, page_layer_bytes, graph_bytes, *, speculating):
@@ -133,6 +155,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         devices=tuple(range(plan.world_size)) if ranks is None else (0,) * plan.world_size,
         hosts=None if ranks is None else ranks.hosts,
         draft_snapshot=draft_snapshot,
+        rope_scaling=plan.checkpoint.rope_scaling,
     )
     if plan.world_size == 1:
         storage = {} if core_storage is None else {"core_storage": core_storage}
@@ -161,17 +184,9 @@ RECIPE = Recipe(
                 "presence_penalty": SamplingRange(0., 2.)},
     ),
     checkpoints=(
-        Checkpoint(
-            alias="qwen3.8-flash", repository=MODEL_ID, revision=REVISION, architecture=ARCHITECTURE,
-            stored_bytes=102_329_644_144,
-            # Decoder, vision, and draft tensors; PLE rows are delivered through compact inputs.
-            device_bytes=73_529_505_900,
-            # The MTP module's tensors.
-            draft_bytes=1_596_720_640,
-            # Routed-expert block scales expand at load from 4,156,604,564 CSF bytes to
-            # 48 layers x 512 experts x 307,200 bytes.
-            expansion_bytes=3_393_142_636,
-        ),
+        Checkpoint(alias="qwen3.8-flash", **_CHECKPOINT),
+        _yarn_checkpoint(4),
+        _yarn_checkpoint(2),
     ),
     context=262144,
     page_tokens=64,
