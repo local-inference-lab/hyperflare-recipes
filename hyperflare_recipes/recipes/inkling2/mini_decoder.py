@@ -72,7 +72,8 @@ class PreparedLoopLayer(PreparedLayer):
                 streams = tuple(gate(dest, n0, n1, probs)
                                 for gate, dest in zip(self.gates[:3], dests, strict=True))
         _, attention_partial, attention_values = self.attention.attend(streams, m)
-        attention_raw = self.reduction(attention_partial.to(self.reduction_dtype)).to(torch.bfloat16)
+        attention_raw = (attention_partial.to(torch.bfloat16) if self.reduction is None
+                         else self.reduction(attention_partial.to(self.reduction_dtype)).to(torch.bfloat16))
         attention, attention_previous = self.attention_convolution(attention_raw, m)
         sources = (*state.blocks, state.partial, attention) if self.layer % t.residual_block == 0 else (*state.blocks, state.partial)
         options = {} if self.layer % t.residual_block == 0 else dict(addend=attention)
@@ -83,7 +84,8 @@ class PreparedLoopLayer(PreparedLayer):
             mlp_input = self.gates[3](self.mlp_mix.mix(sources, **options)[0], n0, n1, probs)
         routes = self.router(self.router_projection(mlp_input.to(self.router_dtype)), num_valid_tokens=m.live_counts[:1])
         expert_partial = self.experts(mlp_input, routes.ids, routes.weights)
-        mlp_raw = self.reduction(expert_partial.to(self.reduction_dtype)).to(torch.bfloat16)
+        mlp_raw = (expert_partial.to(torch.bfloat16) if self.reduction is None
+                   else self.reduction(expert_partial.to(self.reduction_dtype)).to(torch.bfloat16))
         mlp, mlp_previous = self.mlp_convolution(mlp_raw, m)
         if self.mode != "verify":
             self.attention_convolution.commit(attention_previous, attention_raw, m)
@@ -110,9 +112,12 @@ class PreparedLoopDecoder(PreparedDecoder):
             return declaration_tensor(examples, "inkling.decoder." + role, shape, dtype, device)
         # Traced forwards read this attribute, never the runtime, which compile workers see as a placeholder.
         self.reduction_dtype = reduction_dtype(runtime)
-        partial = example("partial", (tokens, text.hidden), self.reduction_dtype)
-        self.reduce = PreparedChunkedAllReduce(partial, example("reduced", partial.shape, self.reduction_dtype),
-            runtime=runtime, coordinator=coordinator, session=session, name=name + ".reduction").functional(session=session)
+        if runtime is None:
+            self.reduce = None
+        else:
+            partial = example("partial", (tokens, text.hidden), self.reduction_dtype)
+            self.reduce = PreparedChunkedAllReduce(partial, example("reduced", partial.shape, self.reduction_dtype),
+                runtime=runtime, coordinator=coordinator, session=session, name=name + ".reduction").functional(session=session)
         self.visits = text.visits
         core_start, core_end = text.loop.core_start, text.loop.core_end
         bank_sources = (core_end - core_start) // text.residual_block
@@ -135,11 +140,14 @@ class PreparedLoopDecoder(PreparedDecoder):
             for visit, (index, pass_index) in enumerate(self.visits)]
         self.logits = PreparedLogits(weights.head, text, weights.rank, tokens=samples,
                                      session=session, name=name + ".logits", examples=examples)
-        local = example("local_logits", (samples, weights.head.shape[0]), torch.float32)
-        gathered = example("gathered_logits", (samples, weights.head.shape[0] * weights.world), torch.float32)
-        self.gather = PreparedAllGather(local.view(torch.bfloat16), gathered.view(torch.bfloat16),
-            runtime=vocabulary_runtime, coordinator=coordinator, session=session,
-            name=name + ".logit_gather").functional(session=session)
+        if vocabulary_runtime is None and weights.world == 1:
+            self.gather = None
+        else:
+            local = example("local_logits", (samples, weights.head.shape[0]), torch.float32)
+            gathered = example("gathered_logits", (samples, weights.head.shape[0] * weights.world), torch.float32)
+            self.gather = PreparedAllGather(local.view(torch.bfloat16), gathered.view(torch.bfloat16),
+                runtime=vocabulary_runtime, coordinator=coordinator, session=session,
+                name=name + ".logit_gather").functional(session=session)
         self.head = SimpleNamespace(gather=SimpleNamespace(runtime=vocabulary_runtime))
         self.first_token = torch.full((1,), weights.rank * weights.embedding.shape[0], dtype=torch.int64, device=device)
         self.auxiliary = (example("auxiliary", (tokens, len(weights.config.draft.taps), text.hidden))
@@ -155,7 +163,8 @@ class PreparedLoopDecoder(PreparedDecoder):
     def __call__(self, metadata):
         w, t, m = self.weights, self.weights.config.text, metadata
         embedded = embedding_rows(w.embedding, m.token_ids, self.first_token)
-        hidden = self.reduce(embedded.to(self.reduction_dtype)).to(torch.bfloat16)
+        hidden = (embedded.to(torch.bfloat16) if self.reduce is None
+                  else self.reduce(embedded.to(self.reduction_dtype)).to(torch.bfloat16))
         hidden = self.embedding_norm(hidden)
         if self.vision_state is not None and self.mode == "prefill":
             self.vision_state.inject(m, hidden)
@@ -181,6 +190,11 @@ class PreparedLoopDecoder(PreparedDecoder):
             taps.append(normalized)
         sampled_hidden = normalized[m.sample_indices]
         local = self.logits(sampled_hidden)
-        logits = local if self.vocabulary_parallel else self.gather(local.view(torch.bfloat16)).view(torch.float32)[:, :t.valid_vocabulary].contiguous()
+        if self.vocabulary_parallel:
+            logits = local
+        elif self.gather is None:
+            logits = local[:, :t.valid_vocabulary].contiguous()
+        else:
+            logits = self.gather(local.view(torch.bfloat16)).view(torch.float32)[:, :t.valid_vocabulary].contiguous()
         auxiliary = torch.stack(taps, dim=1) if taps else None
         return sampled_hidden, logits, auxiliary, tuple(records)
