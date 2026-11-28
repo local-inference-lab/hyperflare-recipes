@@ -48,7 +48,20 @@ class RotaryTables:
                 or tuple(rope["mrope_section"]) != (11, 11, 10)
                 or rope["rope_theta"] != 10000000):
             raise ValueError("Qwen rotary geometry differs from the checkpoint contract")
-        inverse = (1.0 / (rope["rope_theta"] ** (torch.arange(0, 64, 2, dtype=torch.float32) / 64))).to(device)
+        kind, scale = rope.get("rope_type", "default"), None
+        if kind == "default":
+            inverse = (1.0 / (rope["rope_theta"] ** (torch.arange(0, 64, 2, dtype=torch.float32) / 64))).to(device)
+        elif kind == "yarn":
+            from transformers import PretrainedConfig
+            from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+            canonical = PretrainedConfig(
+                rope_parameters={key: value for key, value in rope.items() if not key.startswith("mrope_")},
+                head_dim=config.head_dim,
+                hidden_size=config.head_dim, num_attention_heads=1, max_position_embeddings=rope["original_max_position_embeddings"])
+            inverse, scale = ROPE_INIT_FUNCTIONS["yarn"](canonical, device=device)
+        else:
+            raise ValueError(f"Qwen rotary tables do not implement rope_type {kind!r}")
         frequency = torch.arange(capacity, device=device, dtype=torch.float32)[:, None] * inverse
         axes = persistent_zeros((32,), dtype=torch.int64, device=device)
         axes[1:33:3] = 1
@@ -57,6 +70,10 @@ class RotaryTables:
         sin = persistent_empty(frequency.shape, dtype=torch.float32, device=device)
         torch.cos(frequency, out=cos)
         torch.sin(frequency, out=sin)
+        if scale is not None:
+            # YaRN's attention factor multiplies both tables, as the reference rotary embedding applies it.
+            cos.mul_(scale)
+            sin.mul_(scale)
         return cls(cos, sin, axes)
 
     def gather(self, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

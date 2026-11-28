@@ -10,6 +10,7 @@ from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 import hashlib
+import math
 from pathlib import Path
 from types import MappingProxyType
 
@@ -110,6 +111,38 @@ class CheckpointManifest(IndexedCheckpoint):
         }
 
 
+def serving_context(text: dict) -> int:
+    """The context a text configuration's rotary parameters serve: native, or YaRN `factor` times native."""
+    native = qwen38.TEXT_GEOMETRY["max_position_embeddings"]
+    rope = text.get("rope_parameters")
+    if not isinstance(rope, dict):
+        raise CheckpointError("text_config.rope_parameters: missing")
+    for field, value in qwen38.ROPE_GEOMETRY.items():
+        if rope.get(field) != value:
+            raise CheckpointError(f"text_config.rope_parameters.{field}: expected {value!r}, got {rope.get(field)!r}")
+    kind = rope.get("rope_type")
+    scaling = set(rope) - set(qwen38.ROPE_GEOMETRY) - {"rope_type"}
+    if kind == "default":
+        if scaling:
+            raise CheckpointError(f"text_config.rope_parameters.{min(scaling)}: not a default rope parameter")
+        return native
+    if kind != "yarn":
+        raise CheckpointError(f"text_config.rope_parameters.rope_type: expected 'default' or 'yarn', got {kind!r}")
+    if scaling - qwen38.YARN_KEYS:
+        raise CheckpointError(
+            f"text_config.rope_parameters.{min(scaling - qwen38.YARN_KEYS)}: not a YaRN rope parameter")
+    if rope.get("original_max_position_embeddings") != native:
+        raise CheckpointError("text_config.rope_parameters.original_max_position_embeddings: expected "
+                              f"{native!r}, got {rope.get('original_max_position_embeddings')!r}")
+    factor = rope.get("factor")
+    context = factor * native if type(factor) in (int, float) and math.isfinite(factor) else 0
+    if context != int(context) or context % 64 or not native < context <= qwen38.MAX_SCALED_CONTEXT:
+        raise CheckpointError(
+            f"text_config.rope_parameters.factor: {factor!r} must extend {native:,} tokens to a 64-aligned"
+            f" context of at most {qwen38.MAX_SCALED_CONTEXT:,}")
+    return int(context)
+
+
 def _validate_config(config: dict) -> None:
     if (
         config.get("architectures") != [qwen38.ARCHITECTURE]
@@ -127,6 +160,7 @@ def _validate_config(config: dict) -> None:
                 raise CheckpointError(
                     f"{section}.{field}: expected {value!r}, got {actual.get(field)!r}"
                 )
+    serving_context(config["text_config"])
     expected_layers = ["full_attention" if i % 4 == 3 else "linear_attention" for i in range(48)]
     if config["text_config"].get("layer_types") != expected_layers:
         raise CheckpointError(

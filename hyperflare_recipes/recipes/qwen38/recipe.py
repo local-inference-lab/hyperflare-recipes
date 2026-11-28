@@ -6,7 +6,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, fields
+import json
 from pathlib import Path
 from types import MappingProxyType
 
@@ -38,7 +40,7 @@ from hyperflare_recipes.parameters import (
     OnlineMXFP8Parameters,
     StreamOverlapParameters,
 )
-from .checkpoint_schema import ARCHITECTURE, MODEL_ID, REVISION
+from .checkpoint_schema import ARCHITECTURE, MODEL_ID, REVISION, TEXT_GEOMETRY
 from .draft_config import WEIGHT_BYTES
 
 # Twelve target sparse-attention layers each store one page; learned drafts add the draft layer's.
@@ -53,6 +55,13 @@ _MOE_DECODE_A16_INTERMEDIATE_WIDTH = 640
 def _costs(state_row_bytes, page_layer_bytes, graph_bytes, *, speculating):
     layers = _TARGET_PAGE_LAYERS + int(speculating)
     return RankCosts(state_row_bytes, layers * page_layer_bytes, graph_bytes)
+
+
+@dataclass(frozen=True)
+class Qwen38Checkpoint(Checkpoint):
+    """Qwen3.8 checkpoint carrying the checkpoint configuration's validated rotary parameters."""
+
+    rope_parameters: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -87,6 +96,10 @@ class Qwen38Parameters(RecipeParameters):
 
     def validate(self, context: ParameterContext) -> None:
         super().validate(context)
+        if (context.checkpoint is not None and context.checkpoint.context is not None
+                and context.checkpoint.context > TEXT_GEOMETRY["max_position_embeddings"]
+                and any(gpu.capability == (10, 3) for gpu in context.gpus)):
+            raise UsageError("a rope-scaled context is not measured on SM103")
         if self.force_moe_decode_a16:
             if any(gpu.capability not in ((12, 0), (12, 1)) for gpu in context.gpus):
                 raise UsageError("--force-moe-decode-a16 requires SM120/121 packed NVFP4 experts")
@@ -105,6 +118,13 @@ class Qwen38Parameters(RecipeParameters):
             or self.draft_quantization.draft_head_quantization is not None
         ) and (self.speculation is None or self.speculation.method != "dflash2"):
             raise UsageError("Flash Next online MXFP8 and draft head conversion require --speculative-method dflash2")
+
+    def to_dict(self, context: ParameterContext | None = None) -> dict:
+        result = super().to_dict(context)
+        checkpoint = None if context is None else context.checkpoint
+        if isinstance(checkpoint, Qwen38Checkpoint) and checkpoint.rope_parameters is not None:
+            result["rope_parameters"] = dict(checkpoint.rope_parameters)
+        return result
 
 
 def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False, core_storage=None,
@@ -144,6 +164,24 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
                          ranks=ranks, checkpoint=plan.checkpoint)
 
 
+def inspect_replacement(metadata, replacement):
+    """Serve the context the checkpoint directory's own rotary configuration declares."""
+    from .checkpoint import CheckpointError, serving_context
+
+    text = json.loads((metadata / "config.json").read_text()).get("text_config")
+    if not isinstance(text, dict) or "rope_parameters" not in text:
+        return None  # Preparation validates the whole configuration.
+    try:
+        context = serving_context(text)
+    except CheckpointError as error:
+        raise UsageError(str(error)) from error
+    if context == TEXT_GEOMETRY["max_position_embeddings"]:
+        return None
+    values = {item.name: getattr(replacement, item.name) for item in fields(Checkpoint)}
+    values["context"] = context
+    return Qwen38Checkpoint(**values, rope_parameters=MappingProxyType(dict(text["rope_parameters"])))
+
+
 def usage(prepared):
     report = prepared.memory_report
     return tuple(RankUsage(rank["pages"], rank["free_device_bytes"]) for rank in report.get("ranks", (report,)))
@@ -154,6 +192,7 @@ RECIPE = Recipe(
     served_model_name="Qwen3.8-Flash-Next",
     prepare=prepare,
     usage=usage,
+    inspect_replacement=inspect_replacement,
     # Thinking defaults; bounds span thinking/instruct presets: https://huggingface.co/Qwen/Qwen3.8-Flash-Next#best-practices.
     sampling_defaults=SamplingDefaults(
         temperature=1., top_p=.95, top_k=20,

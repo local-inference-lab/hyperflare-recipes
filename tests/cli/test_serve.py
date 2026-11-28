@@ -186,7 +186,8 @@ def test_export_server_options_match_core_contract(tmp_path, budget):
 
     model = resolve("qwen3.8-flash")
     plan = types.SimpleNamespace(recipe=model.recipe, checkpoint=model.checkpoint, reserve_bytes=0,
-                                 concurrency=model.recipe.concurrency, max_images=model.recipe.max_images)
+                                 concurrency=model.recipe.concurrency, max_images=model.recipe.max_images,
+                                 declared_context=model.recipe.declared_context(model.checkpoint))
     config = tmp_path / "config.toml"
     config.write_text("" if budget is None else f"[server]\nthinking_token_budget = {budget}\n")
     options = serve._server_options(Configuration.load(config), model, plan)
@@ -217,7 +218,8 @@ def test_server_options_advertise_canonical_names_independently_of_checkpoint_so
     directory = tmp_path / "custom-checkpoint" if local else None
     model = ResolvedModel(recipe, checkpoint, directory)
     plan = types.SimpleNamespace(recipe=recipe, checkpoint=checkpoint, reserve_bytes=0,
-                                 concurrency=recipe.concurrency, max_images=recipe.max_images)
+                                 concurrency=recipe.concurrency, max_images=recipe.max_images,
+                                 declared_context=recipe.declared_context(checkpoint))
     config = tmp_path / "config.toml"
     config.write_text("")
     options = serve._server_options(Configuration.load(config), model, plan)
